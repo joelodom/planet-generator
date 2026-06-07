@@ -43,7 +43,8 @@ If macOS Gatekeeper ever complains, right-click the app → **Open**, or run
 | R | Teleport to a random spot on the surface |
 | P | Print current location & seed to stdout |
 | G | Toggle wireframe |
-| Esc | Quit |
+| Esc | Toggle the help overlay (key bindings + build version) |
+| Cmd-Q / Ctrl-Q | Quit (or close the window) |
 
 ## How it works
 

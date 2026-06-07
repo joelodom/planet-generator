@@ -17,10 +17,12 @@
 //! which is what makes adding animals, NPCs, weather, etc. later tractable.
 
 mod camera;
+mod font8x8;
 mod gfx;
 mod lod;
 mod logging;
 mod mesh;
+mod overlay;
 mod planet;
 #[cfg(test)]
 mod tests;
@@ -36,7 +38,7 @@ use tracing::{debug, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 const SUN_AMBIENT: f32 = 0.32;
@@ -46,6 +48,16 @@ const MAX_REQUESTS_PER_FRAME: usize = 48;
 const CHUNK_CACHE_LIMIT: usize = 1800;
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!(
+            "planet-explorer {} ({}) built {}",
+            env!("CARGO_PKG_VERSION"),
+            env!("GIT_HASH"),
+            env!("BUILD_DATE")
+        );
+        return Ok(());
+    }
+
     let log_path = logging::init();
     let seed = parse_seed();
     let planet = Arc::new(Planet::new(seed));
@@ -122,6 +134,7 @@ struct App {
     last: Instant,
     title_timer: f32,
     grabbed: bool,
+    mods: ModifiersState,
 
     // Performance sampling (aggregated, logged at DEBUG every couple seconds).
     perf_accum: f32,
@@ -147,6 +160,7 @@ impl App {
             last: Instant::now(),
             title_timer: 0.0,
             grabbed: false,
+            mods: ModifiersState::empty(),
             perf_accum: 0.0,
             perf_frames: 0,
             frame_ms_max: 0.0,
@@ -324,6 +338,7 @@ impl ApplicationHandler for App {
 
         let mut renderer = pollster::block_on(Renderer::new(window.clone())).expect("renderer init");
         self.camera.set_aspect(renderer.size.0, renderer.size.1);
+        renderer.set_overlay_lines(overlay::help_lines());
 
         // Generate the six root chunks up front so there's always a planet to see.
         for root in lod::ChunkKey::roots() {
@@ -379,6 +394,7 @@ impl ApplicationHandler for App {
                     _ => {}
                 }
             }
+            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::KeyboardInput { event, .. } => self.handle_key(event_loop, event),
             _ => {}
         }
@@ -422,10 +438,21 @@ impl App {
         if !pressed || ev.repeat {
             return;
         }
+
+        // Quit: Cmd+Q (macOS) or Ctrl+Q (Windows/Linux). The window close button
+        // and the app menu's Quit also work everywhere.
+        if code == KeyCode::KeyQ && (self.mods.super_key() || self.mods.control_key()) {
+            info!("quit shortcut; exiting");
+            event_loop.exit();
+            return;
+        }
+
         match code {
             KeyCode::Escape => {
-                info!("escape pressed; exiting");
-                event_loop.exit();
+                debug!(action = "help", "toggled help overlay");
+                if let Some(r) = &mut self.renderer {
+                    r.toggle_overlay();
+                }
             }
             KeyCode::KeyR => {
                 self.camera.teleport(&self.planet, random_unit());

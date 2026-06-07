@@ -8,6 +8,7 @@
 
 use crate::lod::ChunkKey;
 use crate::mesh::{self, CpuChunk, InstanceRaw, Vertex};
+use crate::overlay::{self, OverlayInstance};
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -99,6 +100,29 @@ fn instance_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
+// Screen-space overlay (help panel) — a unit quad instanced per colored rect.
+const OVERLAY_CORNERS: [[f32; 2]; 6] =
+    [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
+const OVERLAY_CORNER_ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x2];
+const OVERLAY_INST_ATTRS: [wgpu::VertexAttribute; 2] =
+    wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4];
+
+fn overlay_corner_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<[f32; 2]>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &OVERLAY_CORNER_ATTRS,
+    }
+}
+
+fn overlay_instance_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<OverlayInstance>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &OVERLAY_INST_ATTRS,
+    }
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -121,6 +145,12 @@ pub struct Renderer {
     shrub_mesh: GpuMesh,
     water_mesh: GpuMesh,
 
+    overlay_pipeline: wgpu::RenderPipeline,
+    overlay_quad: wgpu::Buffer,
+    overlay_instances: Option<(wgpu::Buffer, u32)>,
+    overlay_lines: Vec<String>,
+    pub overlay_visible: bool,
+
     chunks: HashMap<ChunkKey, GpuChunk>,
     pub wireframe: bool,
     pub supports_wireframe: bool,
@@ -132,7 +162,12 @@ impl Renderer {
         let size = (size.width.max(1), size.height.max(1));
 
         let mut idesc = wgpu::InstanceDescriptor::new_without_display_handle();
-        idesc.backends = wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::GL;
+        // Cross-platform: Metal (macOS), DX12/Vulkan (Windows, incl. the planned
+        // RTX 5090 box), Vulkan/GL (Linux).
+        idesc.backends = wgpu::Backends::METAL
+            | wgpu::Backends::DX12
+            | wgpu::Backends::VULKAN
+            | wgpu::Backends::GL;
         let instance = wgpu::Instance::new(idesc);
         let surface = instance.create_surface(window.clone())?;
 
@@ -249,6 +284,28 @@ impl Renderer {
         let veg_pipeline = make_pipeline(&device, &pipeline_layout, &veg_sh, &[vertex_layout(), instance_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
         let water_pipeline = make_pipeline(&device, &pipeline_layout, &water_sh, &[vertex_layout()], format, PassKind::Water, wgpu::PolygonMode::Fill);
 
+        // Overlay pipeline: no bind groups (pure screen-space), alpha blended.
+        let overlay_sh = shader(&device, "overlay", include_str!("shaders/overlay.wgsl"));
+        let overlay_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("overlay-layout"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+        let overlay_pipeline = make_pipeline(
+            &device,
+            &overlay_layout,
+            &overlay_sh,
+            &[overlay_corner_layout(), overlay_instance_layout()],
+            format,
+            PassKind::Overlay,
+            wgpu::PolygonMode::Fill,
+        );
+        let overlay_quad = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("overlay-quad"),
+            contents: bytemuck::cast_slice(&OVERLAY_CORNERS),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
         let tm = mesh::tree_mesh();
         let sm = mesh::shrub_mesh();
         let wm = mesh::water_sphere(96, 160);
@@ -273,6 +330,11 @@ impl Renderer {
             tree_mesh,
             shrub_mesh,
             water_mesh,
+            overlay_pipeline,
+            overlay_quad,
+            overlay_instances: None,
+            overlay_lines: Vec::new(),
+            overlay_visible: false,
             chunks: HashMap::new(),
             wireframe: false,
             supports_wireframe,
@@ -288,6 +350,39 @@ impl Renderer {
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
         self.depth_view = create_depth(&self.device, w, h);
+        if self.overlay_visible {
+            self.rebuild_overlay();
+        }
+    }
+
+    /// Set the help overlay's text (built once at startup).
+    pub fn set_overlay_lines(&mut self, lines: Vec<String>) {
+        self.overlay_lines = lines;
+        if self.overlay_visible {
+            self.rebuild_overlay();
+        }
+    }
+
+    /// Show/hide the help overlay, rebuilding its geometry when shown.
+    pub fn toggle_overlay(&mut self) {
+        self.overlay_visible = !self.overlay_visible;
+        if self.overlay_visible {
+            self.rebuild_overlay();
+        }
+    }
+
+    fn rebuild_overlay(&mut self) {
+        let inst = overlay::layout(&self.overlay_lines, self.size.0, self.size.1);
+        self.overlay_instances = if inst.is_empty() {
+            None
+        } else {
+            let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("overlay-instances"),
+                contents: bytemuck::cast_slice(&inst),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            Some((buf, inst.len() as u32))
+        };
     }
 
     pub fn has_chunk(&self, key: ChunkKey) -> bool {
@@ -399,11 +494,21 @@ impl Renderer {
                 }
             }
 
-            // Water last (transparent, depth-tested but no write).
+            // Water (transparent, depth-tested but no write).
             pass.set_pipeline(&self.water_pipeline);
             pass.set_vertex_buffer(0, self.water_mesh.vbuf.slice(..));
             pass.set_index_buffer(self.water_mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..self.water_mesh.count, 0, 0..1);
+
+            // Help overlay on top of everything (screen-space).
+            if self.overlay_visible {
+                if let Some((buf, count)) = &self.overlay_instances {
+                    pass.set_pipeline(&self.overlay_pipeline);
+                    pass.set_vertex_buffer(0, self.overlay_quad.slice(..));
+                    pass.set_vertex_buffer(1, buf.slice(..));
+                    pass.draw(0..6, 0..*count);
+                }
+            }
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -442,9 +547,10 @@ fn shader(device: &wgpu::Device, label: &str, src: &str) -> wgpu::ShaderModule {
 /// How a pipeline interacts with the shared depth buffer and blending.
 #[derive(Clone, Copy)]
 enum PassKind {
-    Sky,    // depth always, no write, opaque
-    Opaque, // depth less, write, opaque
-    Water,  // depth less, no write, alpha blend
+    Sky,     // depth always, no write, opaque
+    Opaque,  // depth less, write, opaque
+    Water,   // depth less, no write, alpha blend
+    Overlay, // depth always, no write, alpha blend (screen-space UI on top)
 }
 
 fn make_pipeline(
@@ -457,12 +563,12 @@ fn make_pipeline(
     polygon_mode: wgpu::PolygonMode,
 ) -> wgpu::RenderPipeline {
     let (depth_write, depth_compare) = match kind {
-        PassKind::Sky => (false, wgpu::CompareFunction::Always),
+        PassKind::Sky | PassKind::Overlay => (false, wgpu::CompareFunction::Always),
         PassKind::Opaque => (true, wgpu::CompareFunction::Less),
         PassKind::Water => (false, wgpu::CompareFunction::Less),
     };
     let blend = match kind {
-        PassKind::Water => Some(wgpu::BlendState::ALPHA_BLENDING),
+        PassKind::Water | PassKind::Overlay => Some(wgpu::BlendState::ALPHA_BLENDING),
         _ => Some(wgpu::BlendState::REPLACE),
     };
 
@@ -521,7 +627,12 @@ mod smoke {
     #[test]
     fn offscreen_pipeline_validates() {
         let mut idesc = wgpu::InstanceDescriptor::new_without_display_handle();
-        idesc.backends = wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::GL;
+        // Cross-platform: Metal (macOS), DX12/Vulkan (Windows, incl. the planned
+        // RTX 5090 box), Vulkan/GL (Linux).
+        idesc.backends = wgpu::Backends::METAL
+            | wgpu::Backends::DX12
+            | wgpu::Backends::VULKAN
+            | wgpu::Backends::GL;
         let instance = wgpu::Instance::new(idesc);
         let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -549,7 +660,8 @@ mod smoke {
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-        let (w, h) = (256u32, 256u32);
+        // Sized so the help overlay text is legible in the dumped PNG.
+        let (w, h) = (900u32, 600u32);
 
         // Globals (mirrors Renderer::new).
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -591,6 +703,28 @@ mod smoke {
         let terrain_p = make_pipeline(&device, &layout, &terrain_sh, &[vertex_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
         let veg_p = make_pipeline(&device, &layout, &veg_sh, &[vertex_layout(), instance_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
         let water_p = make_pipeline(&device, &layout, &water_sh, &[vertex_layout()], format, PassKind::Water, wgpu::PolygonMode::Fill);
+
+        // Overlay pipeline (no bind groups) + its geometry.
+        let overlay_sh = shader(&device, "overlay", include_str!("shaders/overlay.wgsl"));
+        let overlay_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+        let overlay_p = make_pipeline(&device, &overlay_layout, &overlay_sh, &[overlay_corner_layout(), overlay_instance_layout()], format, PassKind::Overlay, wgpu::PolygonMode::Fill);
+        let overlay_quad = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&OVERLAY_CORNERS),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let overlay_inst = overlay::layout(&overlay::help_lines(), w, h);
+        assert!(!overlay_inst.is_empty());
+        let overlay_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&overlay_inst),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let overlay_count = overlay_inst.len() as u32;
 
         // One real chunk + base meshes.
         let planet = Planet::new(7);
@@ -635,7 +769,9 @@ mod smoke {
         let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
         let depth_view = create_depth(&device, w, h);
 
-        let row_bytes = w * 4; // 256*4 = 1024, already 256-aligned
+        // copy_texture_to_buffer requires bytes_per_row to be 256-aligned.
+        let unpadded = w * 4;
+        let row_bytes = unpadded.div_ceil(256) * 256;
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: (row_bytes * h) as u64,
@@ -677,6 +813,11 @@ mod smoke {
             pass.set_vertex_buffer(0, water_mesh.vbuf.slice(..));
             pass.set_index_buffer(water_mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..water_mesh.count, 0, 0..1);
+            // Overlay on top — validates the overlay shader/pipeline/layout.
+            pass.set_pipeline(&overlay_p);
+            pass.set_vertex_buffer(0, overlay_quad.slice(..));
+            pass.set_vertex_buffer(1, overlay_buf.slice(..));
+            pass.draw(0..6, 0..overlay_count);
         }
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -708,8 +849,16 @@ mod smoke {
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         let data = slice.get_mapped_range();
+
+        // Drop row padding into tight RGBA rows for analysis + PNG.
+        let mut rgba = Vec::with_capacity((unpadded * h) as usize);
+        for row in 0..h {
+            let start = (row * row_bytes) as usize;
+            rgba.extend_from_slice(&data[start..start + unpadded as usize]);
+        }
+
         let (mut bright, mut total, mut maxl, mut minl) = (0u32, 0u32, 0.0f32, 1.0f32);
-        for px in data.chunks_exact(4) {
+        for px in rgba.chunks_exact(4) {
             let lum = (px[0] as f32 * 0.299 + px[1] as f32 * 0.587 + px[2] as f32 * 0.114) / 255.0;
             maxl = maxl.max(lum);
             minl = minl.min(lum);
@@ -721,5 +870,14 @@ mod smoke {
         let frac = bright as f32 / total as f32;
         assert!(maxl - minl > 0.1, "frame is nearly uniform (max {maxl:.3} min {minl:.3}) — nothing drew");
         assert!(frac > 0.05, "too few lit pixels ({:.1}%) — terrain likely not visible", frac * 100.0);
+
+        // Dump a PNG so the scene + help overlay can be eyeballed without a window.
+        let path = std::env::temp_dir().join("planet_overlay.png");
+        let file = std::fs::File::create(&path).expect("create png");
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header().unwrap().write_image_data(&rgba).expect("write png");
+        eprintln!("wrote framebuffer to {}", path.display());
     }
 }

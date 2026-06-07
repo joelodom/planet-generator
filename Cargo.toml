@@ -14,3 +14,6 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 wgpu = "29.0.3"
 winit = "0.30.13"
+
+[dev-dependencies]
+png = "0.18.1"

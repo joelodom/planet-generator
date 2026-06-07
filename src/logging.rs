@@ -86,9 +86,22 @@ fn log_path() -> PathBuf {
     if let Ok(p) = std::env::var("PLANET_LOG") {
         return PathBuf::from(p);
     }
-    let dir = std::env::var("PLANET_LOG_DIR")
-        .unwrap_or_else(|_| "/Users/Shared/planet-explorer".to_string());
+    let dir = std::env::var("PLANET_LOG_DIR").unwrap_or_else(|_| default_log_dir());
     Path::new(&dir).join("planet-explorer.log")
+}
+
+/// Default log directory, per platform. On macOS we use the shared folder so a
+/// second account can read the log; elsewhere (incl. the planned Windows box) we
+/// fall back to the OS temp dir, which is always writable.
+fn default_log_dir() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        "/Users/Shared/planet-explorer".to_string()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::temp_dir().join("planet-explorer").to_string_lossy().into_owned()
+    }
 }
 
 #[cfg(unix)]

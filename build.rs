@@ -30,6 +30,8 @@ fn main() {
         .unwrap_or_default();
     println!("cargo:rustc-env=BUILD_DATE={date}");
 
-    // Rebuild the stamp when HEAD moves (new commit / checkout).
-    println!("cargo:rerun-if-changed=.git/HEAD");
+    // Force this script to re-run on EVERY build so BUILD_DATE/GIT_HASH reflect
+    // the actual build, not just the last commit. Referencing a path that never
+    // exists makes Cargo treat the script as dirty each build.
+    println!("cargo:rerun-if-changed=.always-rerun-build-stamp");
 }

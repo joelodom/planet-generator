@@ -1,5 +1,27 @@
 # planet-generator
 
+## Target platforms — IMPORTANT
+
+Developed on **macOS / Apple Silicon (Metal)**, but **will soon also run on
+Windows with an RTX 5090 (DX12/Vulkan)**. Keep everything cross-platform as you
+build:
+
+- **GPU:** the wgpu instance enables `METAL | DX12 | VULKAN | GL` — don't assume
+  Metal. The RTX 5090 has huge headroom, so LOD/draw budgets that are tuned for
+  the Mac can be cranked up there later (gate aggressive defaults behind config,
+  not hardcoded assumptions).
+- **OS-specific bits must be `cfg`-gated.** Already done: the quit shortcut
+  (Cmd-Q on macOS, Ctrl-Q elsewhere — see `main.rs`/`overlay.rs`) and the
+  default log directory (`/Users/Shared/...` on macOS, OS temp dir elsewhere —
+  see `logging.rs`). Never hardcode a `/Users/...` path in portable code.
+- **Text rendering is intentionally engine-free and portable:** an embedded
+  public-domain 8x8 bitmap font (`font8x8.rs`) drawn as instanced screen-space
+  quads (`overlay.rs` + `shaders/overlay.wgsl`). No OS font APIs, no font files —
+  it renders identically on every backend. Reuse this for any future on-screen
+  text/HUD rather than pulling in a platform font stack.
+- When adding features, prefer winit/wgpu abstractions over native calls; if you
+  must go native, `cfg`-gate and provide a path for both macOS and Windows.
+
 <!-- ct-code-intelligence-start -->
 ## Code Intelligence — ct
 
