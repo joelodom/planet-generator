@@ -171,9 +171,11 @@ impl Streamer {
         });
         let (tx, results) = channel();
         let mut handles = Vec::new();
-        for _ in 0..threads.max(1) {
-            handles.push(spawn_worker(queue.clone(), planet.clone(), tx.clone()));
+        let n = threads.max(1);
+        for i in 0..n {
+            handles.push(spawn_worker(i, queue.clone(), planet.clone(), tx.clone()));
         }
+        tracing::info!(workers = n, "chunk meshing pool started");
         Self { queue, results, pending: HashSet::new(), handles }
     }
 
@@ -219,24 +221,27 @@ impl Drop for Streamer {
     }
 }
 
-fn spawn_worker(queue: Arc<Queue>, planet: Arc<Planet>, tx: Sender<(ChunkKey, CpuChunk)>) -> JoinHandle<()> {
-    std::thread::spawn(move || loop {
-        let key = {
-            let mut inner = queue.inner.lock().unwrap();
-            loop {
-                if inner.shutdown {
-                    return;
+fn spawn_worker(id: usize, queue: Arc<Queue>, planet: Arc<Planet>, tx: Sender<(ChunkKey, CpuChunk)>) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name(format!("chunk-worker-{id}"))
+        .spawn(move || loop {
+            let key = {
+                let mut inner = queue.inner.lock().unwrap();
+                loop {
+                    if inner.shutdown {
+                        return;
+                    }
+                    if let Some(k) = inner.jobs.pop_front() {
+                        inner.queued.remove(&k);
+                        break k;
+                    }
+                    inner = queue.cv.wait(inner).unwrap();
                 }
-                if let Some(k) = inner.jobs.pop_front() {
-                    inner.queued.remove(&k);
-                    break k;
-                }
-                inner = queue.cv.wait(inner).unwrap();
+            };
+            let chunk = CpuChunk::build(&planet, key);
+            if tx.send((key, chunk)).is_err() {
+                return; // main thread gone
             }
-        };
-        let chunk = CpuChunk::build(&planet, key);
-        if tx.send((key, chunk)).is_err() {
-            return; // main thread gone
-        }
-    })
+        })
+        .expect("spawn chunk worker")
 }

@@ -19,6 +19,7 @@
 mod camera;
 mod gfx;
 mod lod;
+mod logging;
 mod mesh;
 mod planet;
 #[cfg(test)]
@@ -31,6 +32,7 @@ use lod::Streamer;
 use planet::Planet;
 use std::sync::Arc;
 use std::time::Instant;
+use tracing::{debug, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -44,15 +46,31 @@ const MAX_REQUESTS_PER_FRAME: usize = 48;
 const CHUNK_CACHE_LIMIT: usize = 1800;
 
 fn main() -> anyhow::Result<()> {
+    let log_path = logging::init();
     let seed = parse_seed();
     let planet = Arc::new(Planet::new(seed));
 
-    println!("planet-explorer");
+    // Console banner (handy when launched from a terminal; invisible under
+    // Finder — the log file is the durable record).
+    println!("planet-explorer {} ({})", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
     println!("  seed       : {seed}");
     let (sx, sy, sz) = (planet.sun_dir.x, planet.sun_dir.y, planet.sun_dir.z);
     println!("  sun        : ({sx:.2}, {sy:.2}, {sz:.2})");
     println!("  reproduce  : cargo run -- --seed {seed}");
+    println!("  log        : {}", log_path.display());
     print_controls();
+
+    info!(
+        seed,
+        sun = ?planet.sun_dir,
+        version = env!("CARGO_PKG_VERSION"),
+        commit = env!("GIT_HASH"),
+        built = env!("BUILD_DATE"),
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        log = %log_path.display(),
+        "planet-explorer starting"
+    );
 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -104,6 +122,13 @@ struct App {
     last: Instant,
     title_timer: f32,
     grabbed: bool,
+
+    // Performance sampling (aggregated, logged at DEBUG every couple seconds).
+    perf_accum: f32,
+    perf_frames: u32,
+    frame_ms_max: f32,
+    uploads_period: u32,
+    last_hitch: f32,
 }
 
 impl App {
@@ -122,6 +147,11 @@ impl App {
             last: Instant::now(),
             title_timer: 0.0,
             grabbed: false,
+            perf_accum: 0.0,
+            perf_frames: 0,
+            frame_ms_max: 0.0,
+            uploads_period: 0,
+            last_hitch: 0.0,
         }
     }
 
@@ -158,12 +188,16 @@ impl App {
         // Advance the camera, then stream around its new position.
         self.camera.update(dt, &self.planet);
 
-        for (key, cpu) in streamer.poll() {
+        let polled = streamer.poll();
+        let uploads = polled.len();
+        for (key, cpu) in polled {
+            tracing::trace!(?key, verts = cpu.vertices.len(), trees = cpu.trees.len(), "chunk uploaded");
             renderer.upload_chunk(key, cpu);
         }
 
         let cam_pos = self.camera.position(&self.planet);
         let sel = lod::select(&self.planet, cam_pos, &|k| renderer.has_chunk(k));
+        let draw_count = sel.draw.len();
 
         // Request the nearest wanted chunks first.
         let mut want = sel.want;
@@ -194,6 +228,55 @@ impl App {
 
         renderer.render(&sel.draw);
 
+        // --- performance sampling -----------------------------------------
+        let frame_ms = dt * 1000.0;
+        self.perf_frames += 1;
+        self.perf_accum += dt;
+        self.frame_ms_max = self.frame_ms_max.max(frame_ms);
+        self.uploads_period += uploads as u32;
+
+        // A single slow frame is worth flagging immediately (rate-limited), so a
+        // stutter during testing is easy to find in the log.
+        if frame_ms > 120.0 && time - self.last_hitch > 1.0 {
+            self.last_hitch = time;
+            warn!(
+                target: "perf",
+                frame_ms = round1(frame_ms),
+                draw = draw_count,
+                uploads,
+                pending = streamer.pending_count(),
+                alt = self.camera.altitude() as i32,
+                "frame hitch"
+            );
+        }
+
+        // Aggregate sample every ~2s at DEBUG: the spine of perf analysis.
+        if self.perf_accum >= 2.0 {
+            let fps = self.perf_frames as f32 / self.perf_accum;
+            let avg_ms = self.perf_accum * 1000.0 / self.perf_frames as f32;
+            let (lat, lon) = self.camera.lat_lon();
+            let biome = biome_name(self.planet.sample(self.camera.anchor).biome);
+            debug!(
+                target: "perf",
+                fps = round1(fps),
+                avg_ms = round1(avg_ms),
+                max_ms = round1(self.frame_ms_max),
+                alt = self.camera.altitude() as i32,
+                lat = round1(lat),
+                lon = round1(lon),
+                biome,
+                chunks = renderer.chunk_count(),
+                draw = draw_count,
+                pending = streamer.pending_count(),
+                uploads = self.uploads_period,
+                "perf"
+            );
+            self.perf_accum = 0.0;
+            self.perf_frames = 0;
+            self.frame_ms_max = 0.0;
+            self.uploads_period = 0;
+        }
+
         // Throttled window-title HUD.
         self.title_timer += dt;
         if self.title_timer > 0.4 {
@@ -216,6 +299,15 @@ impl App {
         println!(
             "location: seed {} | lat {:.3}° lon {:.3}° | altitude {:.1} | terrain {:.1} | biome {}",
             self.seed, lat, lon, self.camera.altitude(), s.height, biome_name(s.biome)
+        );
+        info!(
+            seed = self.seed,
+            lat = round1(lat),
+            lon = round1(lon),
+            altitude = self.camera.altitude() as i32,
+            terrain = round1(s.height),
+            biome = biome_name(s.biome),
+            "location"
         );
     }
 }
@@ -242,6 +334,13 @@ impl ApplicationHandler for App {
         let threads = std::thread::available_parallelism().map(|n| n.get().saturating_sub(1)).unwrap_or(3).max(1);
         let streamer = Streamer::new(self.planet.clone(), threads);
 
+        info!(
+            window_size = ?(renderer.size.0, renderer.size.1),
+            worker_threads = threads,
+            wireframe_supported = renderer.supports_wireframe,
+            "renderer ready; entering main loop"
+        );
+
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.streamer = Some(streamer);
@@ -250,8 +349,12 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                info!("close requested; exiting");
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
+                debug!(w = size.width, h = size.height, "resized");
                 if let Some(r) = &mut self.renderer {
                     r.resize(size.width, size.height);
                 }
@@ -320,9 +423,14 @@ impl App {
             return;
         }
         match code {
-            KeyCode::Escape => event_loop.exit(),
+            KeyCode::Escape => {
+                info!("escape pressed; exiting");
+                event_loop.exit();
+            }
             KeyCode::KeyR => {
                 self.camera.teleport(&self.planet, random_unit());
+                let (lat, lon) = self.camera.lat_lon();
+                info!(action = "teleport", lat = round1(lat), lon = round1(lon), "teleported to random surface point");
                 self.print_location();
             }
             KeyCode::KeyP => self.print_location(),
@@ -330,20 +438,34 @@ impl App {
                 if let Some(r) = &mut self.renderer {
                     if r.supports_wireframe {
                         r.wireframe = !r.wireframe;
+                        debug!(action = "wireframe", on = r.wireframe, "wireframe toggled");
                     } else {
+                        debug!(action = "wireframe", "wireframe unsupported on this adapter");
                         println!("wireframe not supported on this adapter");
                     }
                 }
             }
             KeyCode::KeyF => {
                 self.camera.toggle_free_look();
+                debug!(action = "free_look", on = self.camera.free_look, "free-look toggled");
                 self.set_grab(self.camera.free_look);
             }
-            KeyCode::Equal | KeyCode::NumpadAdd => self.camera.adjust_speed(1.3),
-            KeyCode::Minus | KeyCode::NumpadSubtract => self.camera.adjust_speed(1.0 / 1.3),
+            KeyCode::Equal | KeyCode::NumpadAdd => {
+                self.camera.adjust_speed(1.3);
+                debug!(action = "speed", change = "faster", "movement speed adjusted");
+            }
+            KeyCode::Minus | KeyCode::NumpadSubtract => {
+                self.camera.adjust_speed(1.0 / 1.3);
+                debug!(action = "speed", change = "slower", "movement speed adjusted");
+            }
             _ => {}
         }
     }
+}
+
+/// Round to one decimal place for tidy log fields.
+fn round1(x: f32) -> f32 {
+    (x * 10.0).round() / 10.0
 }
 
 fn random_unit() -> Vec3 {

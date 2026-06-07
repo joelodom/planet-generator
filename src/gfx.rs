@@ -144,6 +144,15 @@ impl Renderer {
             })
             .await?;
 
+        let info = adapter.get_info();
+        tracing::info!(
+            name = %info.name,
+            backend = ?info.backend,
+            device_type = ?info.device_type,
+            driver = %info.driver,
+            "gpu adapter selected"
+        );
+
         let supports_wireframe = adapter.features().contains(wgpu::Features::POLYGON_MODE_LINE);
         let required_features = if supports_wireframe {
             wgpu::Features::POLYGON_MODE_LINE
@@ -180,6 +189,13 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
+        tracing::debug!(
+            format = ?format,
+            present_mode = ?config.present_mode,
+            size = ?(size.0, size.1),
+            supports_wireframe,
+            "surface configured"
+        );
 
         let depth_view = create_depth(&device, size.0, size.1);
 
@@ -309,11 +325,15 @@ impl Renderer {
         let frame = match self.surface.get_current_texture() {
             Cst::Success(f) | Cst::Suboptimal(f) => f,
             Cst::Outdated | Cst::Lost => {
+                tracing::debug!("surface lost/outdated; reconfiguring");
                 self.surface.configure(&self.device, &self.config);
                 return;
             }
-            // Timeout / Occluded / Validation: skip this frame.
-            _ => return,
+            other => {
+                // Timeout / Occluded / Validation: skip this frame.
+                tracing::trace!(status = ?std::mem::discriminant(&other), "surface frame skipped");
+                return;
+            }
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });

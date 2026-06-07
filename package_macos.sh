@@ -11,7 +11,10 @@ cd "$(dirname "$0")"
 APP_NAME="Planet Explorer"
 BIN_NAME="planet-explorer"
 BUNDLE_ID="com.joelodom.planet-explorer"
-VERSION="1.0.0"
+# Single source of truth: the crate version in Cargo.toml, plus the git commit.
+VERSION="$(sed -n 's/^version *= *"\(.*\)".*/\1/p' Cargo.toml | head -1)"
+GIT_HASH="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+BUILD_VERSION="${VERSION}+${GIT_HASH}"
 
 echo ">> building release binary"
 cargo build --release
@@ -44,7 +47,7 @@ cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleVersion</key>
-    <string>${VERSION}</string>
+    <string>${BUILD_VERSION}</string>
     <key>CFBundleShortVersionString</key>
     <string>${VERSION}</string>
     <key>LSMinimumSystemVersion</key>
