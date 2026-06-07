@@ -22,6 +22,23 @@ build:
 - When adding features, prefer winit/wgpu abstractions over native calls; if you
   must go native, `cfg`-gate and provide a path for both macOS and Windows.
 
+### Assets & audio
+
+- Binary assets live in `assets/` and are **embedded** via `include_bytes!`
+  (`assets/planet.png`, `assets/soundtrack.mp3`) so the app is self-contained and
+  copyable between accounts. They're committed to the repo.
+- **Audio** (`src/audio.rs`): `rodio` (cpal backend per-OS + pure-Rust symphonia
+  decoders — cross-platform) loops `soundtrack.mp3` for the app's lifetime. Keep
+  the `Audio` handle alive in `App`; audio failures are non-fatal (runs silent).
+- **planet.png** is also decoded (via `png`, pure Rust) into a texture and shown
+  as a circular disc in the ESC help overlay (`shaders/image.wgsl`).
+- **App icon:** `make_icon.py` (Pillow) builds a macOS squircle from planet.png;
+  `package_macos.sh` copies `assets/AppIcon.icns` into the bundle. macOS-only —
+  **a Windows build will need a `.ico`** (build script + `winresource`); track
+  that when Windows lands.
+- New crates must be cross-platform (rodio, png are). Verify before adding — the
+  RTX 5090 / Windows target is coming.
+
 <!-- ct-code-intelligence-start -->
 ## Code Intelligence — ct
 

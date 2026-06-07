@@ -84,7 +84,12 @@ will grow.
 
 ## Tech
 
-Rust (stable) · wgpu 29 · winit 0.30 · glam · noise-rs · bytemuck · pollster
+Rust (stable) · wgpu 29 · winit 0.30 · glam · noise-rs · rodio (looping
+soundtrack) · png · bytemuck · pollster
+
+The planet artwork and soundtrack are embedded in the binary (`assets/`), so the
+app is self-contained. The soundtrack loops while the app is open, and the planet
+image appears on the ESC help overlay. The macOS app icon is built from it too.
 
 ## Tests
 

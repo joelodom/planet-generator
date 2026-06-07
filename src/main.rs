@@ -16,6 +16,7 @@
 //! Each system queries `Planet` for ground truth without touching the others,
 //! which is what makes adding animals, NPCs, weather, etc. later tractable.
 
+mod audio;
 mod camera;
 mod font8x8;
 mod gfx;
@@ -134,6 +135,7 @@ struct App {
     last: Instant,
     title_timer: f32,
     mods: ModifiersState,
+    audio: Option<audio::Audio>,
 
     // Performance sampling (aggregated, logged at DEBUG every couple seconds).
     perf_accum: f32,
@@ -159,6 +161,7 @@ impl App {
             last: Instant::now(),
             title_timer: 0.0,
             mods: ModifiersState::empty(),
+            audio: None,
             perf_accum: 0.0,
             perf_frames: 0,
             frame_ms_max: 0.0,
@@ -332,6 +335,11 @@ impl ApplicationHandler for App {
             wireframe_supported = renderer.supports_wireframe,
             "renderer ready; entering main loop"
         );
+
+        // Start the looping soundtrack (non-fatal if there's no audio device).
+        if self.audio.is_none() {
+            self.audio = audio::Audio::start(0.5);
+        }
 
         self.window = Some(window);
         self.renderer = Some(renderer);

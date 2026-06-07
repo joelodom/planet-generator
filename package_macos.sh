@@ -29,6 +29,15 @@ mkdir -p "${MACOS_DIR}" "${RES_DIR}"
 cp "target/release/${BIN_NAME}" "${MACOS_DIR}/${BIN_NAME}"
 chmod 755 "${MACOS_DIR}/${BIN_NAME}"
 
+# App icon (prebuilt from planet.png; regenerate with ./make_icon.py + iconutil).
+# NOTE: this .icns is macOS-only; a Windows build will need a .ico instead.
+ICON_LINE=""
+if [ -f assets/AppIcon.icns ]; then
+    cp assets/AppIcon.icns "${RES_DIR}/AppIcon.icns"
+    ICON_LINE="    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>"
+fi
+
 cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -40,6 +49,7 @@ cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
     <string>${APP_NAME}</string>
     <key>CFBundleExecutable</key>
     <string>${BIN_NAME}</string>
+${ICON_LINE}
     <key>CFBundleIdentifier</key>
     <string>${BUNDLE_ID}</string>
     <key>CFBundlePackageType</key>

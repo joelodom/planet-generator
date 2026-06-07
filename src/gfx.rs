@@ -151,6 +151,11 @@ pub struct Renderer {
     overlay_lines: Vec<String>,
     pub overlay_visible: bool,
 
+    // Planet image shown in the help overlay.
+    image_pipeline: wgpu::RenderPipeline,
+    planet_bind: wgpu::BindGroup,
+    image_instance: Option<wgpu::Buffer>,
+
     chunks: HashMap<ChunkKey, GpuChunk>,
     pub wireframe: bool,
     pub supports_wireframe: bool,
@@ -306,6 +311,53 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
+        // Planet image (embedded PNG) → texture, sampler, bind group, pipeline.
+        let (planet_view, planet_sampler) = load_planet_texture(&device, &queue);
+        let planet_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("planet-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let planet_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("planet-bind"),
+            layout: &planet_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&planet_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&planet_sampler) },
+            ],
+        });
+        let image_sh = shader(&device, "image", include_str!("shaders/image.wgsl"));
+        let image_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("image-layout"),
+            bind_group_layouts: &[Some(&planet_bgl)],
+            immediate_size: 0,
+        });
+        let image_pipeline = make_pipeline(
+            &device,
+            &image_layout,
+            &image_sh,
+            &[overlay_corner_layout(), overlay_instance_layout()],
+            format,
+            PassKind::Overlay,
+            wgpu::PolygonMode::Fill,
+        );
+
         let tm = mesh::tree_mesh();
         let sm = mesh::shrub_mesh();
         let wm = mesh::water_sphere(96, 160);
@@ -335,6 +387,9 @@ impl Renderer {
             overlay_instances: None,
             overlay_lines: Vec::new(),
             overlay_visible: false,
+            image_pipeline,
+            planet_bind,
+            image_instance: None,
             chunks: HashMap::new(),
             wireframe: false,
             supports_wireframe,
@@ -372,17 +427,22 @@ impl Renderer {
     }
 
     fn rebuild_overlay(&mut self) {
-        let inst = overlay::layout(&self.overlay_lines, self.size.0, self.size.1);
-        self.overlay_instances = if inst.is_empty() {
+        let geo = overlay::layout(&self.overlay_lines, self.size.0, self.size.1);
+        self.overlay_instances = if geo.quads.is_empty() {
             None
         } else {
             let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("overlay-instances"),
-                contents: bytemuck::cast_slice(&inst),
+                contents: bytemuck::cast_slice(&geo.quads),
                 usage: wgpu::BufferUsages::VERTEX,
             });
-            Some((buf, inst.len() as u32))
+            Some((buf, geo.quads.len() as u32))
         };
+        self.image_instance = Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("overlay-image"),
+            contents: bytemuck::bytes_of(&geo.image),
+            usage: wgpu::BufferUsages::VERTEX,
+        }));
     }
 
     pub fn has_chunk(&self, key: ChunkKey) -> bool {
@@ -508,6 +568,13 @@ impl Renderer {
                     pass.set_vertex_buffer(1, buf.slice(..));
                     pass.draw(0..6, 0..*count);
                 }
+                if let Some(img) = &self.image_instance {
+                    pass.set_pipeline(&self.image_pipeline);
+                    pass.set_bind_group(0, &self.planet_bind, &[]);
+                    pass.set_vertex_buffer(0, self.overlay_quad.slice(..));
+                    pass.set_vertex_buffer(1, img.slice(..));
+                    pass.draw(0..6, 0..1);
+                }
             }
         }
 
@@ -521,6 +588,66 @@ fn draw_instanced<'a>(pass: &mut wgpu::RenderPass<'a>, base: &'a GpuMesh, inst: 
     pass.set_vertex_buffer(1, inst.buf.slice(..));
     pass.set_index_buffer(base.ibuf.slice(..), wgpu::IndexFormat::Uint32);
     pass.draw_indexed(0..base.count, 0, 0..inst.count);
+}
+
+/// Planet image shown in the help overlay, baked into the binary.
+const PLANET_PNG: &[u8] = include_bytes!("../assets/planet.png");
+
+/// Decode the embedded planet PNG and upload it as an sRGB texture.
+fn load_planet_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::TextureView, wgpu::Sampler) {
+    let (rgba, w, h) = decode_png(PLANET_PNG);
+    let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("planet-image"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &rgba,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+        size,
+    );
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("planet-sampler"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    (view, sampler)
+}
+
+/// Decode a PNG to tightly-packed RGBA8. Handles RGB and RGBA sources.
+fn decode_png(bytes: &[u8]) -> (Vec<u8>, u32, u32) {
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().expect("planet.png header");
+    let mut buf = vec![0u8; reader.output_buffer_size().expect("planet.png buffer size")];
+    let info = reader.next_frame(&mut buf).expect("planet.png frame");
+    let (w, h) = (info.width, info.height);
+    let used = &buf[..info.buffer_size()];
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => used.to_vec(),
+        png::ColorType::Rgb => {
+            let mut v = Vec::with_capacity((w * h * 4) as usize);
+            for px in used.chunks_exact(3) {
+                v.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+            v
+        }
+        other => panic!("unsupported planet.png color type {other:?}"),
+    };
+    (rgba, w, h)
 }
 
 fn create_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
@@ -660,8 +787,8 @@ mod smoke {
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-        // Sized so the help overlay text is legible in the dumped PNG.
-        let (w, h) = (900u32, 600u32);
+        // Sized so the full help overlay (text + planet image) fits legibly.
+        let (w, h) = (1280u32, 720u32);
 
         // Globals (mirrors Renderer::new).
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -717,14 +844,58 @@ mod smoke {
             contents: bytemuck::cast_slice(&OVERLAY_CORNERS),
             usage: wgpu::BufferUsages::VERTEX,
         });
-        let overlay_inst = overlay::layout(&overlay::help_lines(), w, h);
-        assert!(!overlay_inst.is_empty());
-        let overlay_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        // Planet image pipeline + texture (validates image.wgsl and shows in the PNG).
+        let (planet_view, planet_sampler) = load_planet_texture(&device, &queue);
+        let planet_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
-            contents: bytemuck::cast_slice(&overlay_inst),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let planet_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &planet_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&planet_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&planet_sampler) },
+            ],
+        });
+        let image_sh = shader(&device, "image", include_str!("shaders/image.wgsl"));
+        let image_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&planet_bgl)],
+            immediate_size: 0,
+        });
+        let image_p = make_pipeline(&device, &image_pl, &image_sh, &[overlay_corner_layout(), overlay_instance_layout()], format, PassKind::Overlay, wgpu::PolygonMode::Fill);
+
+        let overlay_geo = overlay::layout(&overlay::help_lines(), w, h);
+        assert!(!overlay_geo.quads.is_empty());
+        let image_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&overlay_geo.image),
             usage: wgpu::BufferUsages::VERTEX,
         });
-        let overlay_count = overlay_inst.len() as u32;
+        let overlay_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&overlay_geo.quads),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let overlay_count = overlay_geo.quads.len() as u32;
 
         // One real chunk + base meshes.
         let planet = Planet::new(7);
@@ -818,6 +989,12 @@ mod smoke {
             pass.set_vertex_buffer(0, overlay_quad.slice(..));
             pass.set_vertex_buffer(1, overlay_buf.slice(..));
             pass.draw(0..6, 0..overlay_count);
+            // Planet image — validates image.wgsl + texture bind group.
+            pass.set_pipeline(&image_p);
+            pass.set_bind_group(0, &planet_bind, &[]);
+            pass.set_vertex_buffer(0, overlay_quad.slice(..));
+            pass.set_vertex_buffer(1, image_buf.slice(..));
+            pass.draw(0..6, 0..1);
         }
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {

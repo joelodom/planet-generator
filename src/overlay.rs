@@ -51,24 +51,31 @@ pub fn help_lines() -> Vec<String> {
     ]
 }
 
-const PIXEL: f32 = 1.0; // font cell columns are drawn 1:1 then scaled
+/// Result of laying out the help overlay: solid-color quads (backdrop, panel,
+/// text) plus the rectangle where the planet image should be drawn.
+pub struct OverlayGeometry {
+    pub quads: Vec<OverlayInstance>,
+    /// NDC rect for the planet image (textured separately by the renderer).
+    pub image: OverlayInstance,
+}
 
-/// Lay out `lines` centered on a `screen_w` x `screen_h` surface, returning the
-/// quads for a dim backdrop, a bordered panel, and the text.
-pub fn layout(lines: &[String], screen_w: u32, screen_h: u32) -> Vec<OverlayInstance> {
+/// Lay out `lines` centered on a `screen_w` x `screen_h` surface, with the planet
+/// image to the right of the text inside one bordered panel.
+pub fn layout(lines: &[String], screen_w: u32, screen_h: u32) -> OverlayGeometry {
     let sw = screen_w.max(1) as f32;
     let sh = screen_h.max(1) as f32;
 
     let cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(1) as f32;
     let rows = lines.len().max(1) as f32;
 
-    // Pick the largest integer pixel scale (2..=6) that fits with margins, so the
-    // overlay stays crisp and readable on both small and HiDPI surfaces.
-    let mut scale = 6.0f32;
+    // The group is [ text block | gap | square planet image (~ text height) ].
+    // Pick the largest pixel scale (2..=5) that fits the whole group with margins.
+    // Capped at 5 (one notch smaller than before) to leave room for the image.
+    let gap_cells = 3.0; // gap between text and image, in glyph cells
+    let group_cells_w = cols * 8.0 + gap_cells * 8.0 + rows * 10.0; // image ≈ block_h square
+    let mut scale = 5.0f32;
     while scale > 2.0 {
-        let bw = cols * 8.0 * scale;
-        let bh = rows * 10.0 * scale;
-        if bw <= sw * 0.88 && bh <= sh * 0.88 {
+        if group_cells_w * scale <= sw * 0.9 && rows * 10.0 * scale <= sh * 0.9 {
             break;
         }
         scale -= 1.0;
@@ -78,16 +85,22 @@ pub fn layout(lines: &[String], screen_w: u32, screen_h: u32) -> Vec<OverlayInst
     let line_h = 10.0 * scale; // 8px glyph + 2px gap
     let block_w = cols * char_adv;
     let block_h = rows * line_h;
-    let ox = ((sw - block_w) * 0.5).round();
+    let img = block_h * 0.94; // planet disc, a touch shorter than the text block
+    let gap = gap_cells * char_adv;
+    let group_w = block_w + gap + img;
+
+    let ox = ((sw - group_w) * 0.5).round(); // text origin
     let oy = ((sh - block_h) * 0.5).round();
+    let img_x = ox + block_w + gap;
+    let img_y = oy + (block_h - img) * 0.5;
     let pad = 7.0 * scale;
 
-    let mut out = Vec::new();
-    let mut push = |x, y, w, h, c| out.push(OverlayInstance::px(x, y, w, h, c, sw, sh));
+    let mut quads = Vec::new();
+    let mut push = |x, y, w, h, c| quads.push(OverlayInstance::px(x, y, w, h, c, sw, sh));
 
-    // Dim the whole scene, then a bordered panel behind the text.
+    // Dim the whole scene, then a bordered panel behind the group.
     push(0.0, 0.0, sw, sh, [0.0, 0.0, 0.0, 0.55]);
-    let (px0, py0, pw, ph) = (ox - pad, oy - pad, block_w + 2.0 * pad, block_h + 2.0 * pad);
+    let (px0, py0, pw, ph) = (ox - pad, oy - pad, group_w + 2.0 * pad, block_h + 2.0 * pad);
     push(px0 - 2.0, py0 - 2.0, pw + 4.0, ph + 4.0, [0.30, 0.52, 0.74, 0.95]); // border
     push(px0, py0, pw, ph, [0.05, 0.07, 0.12, 0.94]); // panel
 
@@ -110,7 +123,7 @@ pub fn layout(lines: &[String], screen_w: u32, screen_h: u32) -> Vec<OverlayInst
                 }
                 for col in 0..8u32 {
                     if bits & (1 << col) != 0 {
-                        let x = cx + col as f32 * scale * PIXEL;
+                        let x = cx + col as f32 * scale;
                         let y = base_y + row as f32 * scale;
                         push(x, y, scale, scale, color);
                     }
@@ -118,7 +131,9 @@ pub fn layout(lines: &[String], screen_w: u32, screen_h: u32) -> Vec<OverlayInst
             }
         }
     }
-    out
+
+    let image = OverlayInstance::px(img_x, img_y, img, img, [1.0, 1.0, 1.0, 1.0], sw, sh);
+    OverlayGeometry { quads, image }
 }
 
 #[cfg(test)]
@@ -128,10 +143,10 @@ mod tests {
     #[test]
     fn layout_is_nonempty_and_in_ndc() {
         let lines = help_lines();
-        let inst = layout(&lines, 1280, 800);
+        let geo = layout(&lines, 1280, 800);
         // Backdrop + border + panel + many glyph pixels.
-        assert!(inst.len() > 1000, "expected substantial text geometry, got {}", inst.len());
-        for q in &inst {
+        assert!(geo.quads.len() > 1000, "expected substantial text geometry, got {}", geo.quads.len());
+        for q in geo.quads.iter().chain(std::iter::once(&geo.image)) {
             for c in q.rect {
                 assert!(c.is_finite());
             }
@@ -145,7 +160,7 @@ mod tests {
     fn scales_down_for_tiny_windows() {
         // A tiny surface must still produce geometry without panicking.
         let lines = help_lines();
-        let inst = layout(&lines, 320, 240);
-        assert!(!inst.is_empty());
+        let geo = layout(&lines, 320, 240);
+        assert!(!geo.quads.is_empty());
     }
 }
