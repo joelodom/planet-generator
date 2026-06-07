@@ -16,8 +16,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 /// Deepest quadtree subdivision. Level 0 is one chunk per cube face; each level
-/// quarters the area. Level 9 gives sub-metre-ish detail near the ground.
-pub const MAX_LEVEL: u32 = 9;
+/// quarters the area. On the Earth-sized planet, level 16 brings quads down to
+/// ~8 m — about the f32 precision floor for absolute-coordinate rendering.
+pub const MAX_LEVEL: u32 = 16;
 
 /// How eagerly chunks subdivide. A node splits when the camera is within
 /// `SPLIT_FACTOR * node_world_size` of it. Higher = more detail, more chunks.

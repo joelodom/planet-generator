@@ -25,6 +25,7 @@ mod logging;
 mod mesh;
 mod overlay;
 mod planet;
+mod units;
 #[cfg(test)]
 mod tests;
 
@@ -61,6 +62,7 @@ fn main() -> anyhow::Result<()> {
 
     let log_path = logging::init();
     let seed = parse_seed();
+    let unit_system = parse_units();
     let planet = Arc::new(Planet::new(seed));
 
     // Console banner (handy when launched from a terminal; invisible under
@@ -70,6 +72,7 @@ fn main() -> anyhow::Result<()> {
     let (sx, sy, sz) = (planet.sun_dir.x, planet.sun_dir.y, planet.sun_dir.z);
     println!("  sun        : ({sx:.2}, {sy:.2}, {sz:.2})");
     println!("  reproduce  : cargo run -- --seed {seed}");
+    println!("  units      : {} (use --units us for imperial)", unit_system.label());
     println!("  log        : {}", log_path.display());
     print_controls();
 
@@ -87,9 +90,28 @@ fn main() -> anyhow::Result<()> {
 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(seed, planet);
+    let mut app = App::new(seed, planet, unit_system);
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+/// Parse `--units <metric|us>` (also `--imperial`); defaults to metric.
+fn parse_units() -> units::Units {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--imperial" {
+            return units::Units::Us;
+        }
+        if a == "--units" {
+            if let Some(v) = args.next() {
+                if let Some(u) = units::Units::parse(&v) {
+                    return u;
+                }
+                eprintln!("warning: unknown --units '{v}', using metric");
+            }
+        }
+    }
+    units::Units::Metric
 }
 
 fn parse_seed() -> u64 {
@@ -136,6 +158,7 @@ struct App {
     title_timer: f32,
     mods: ModifiersState,
     audio: Option<audio::Audio>,
+    units: units::Units,
 
     // Performance sampling (aggregated, logged at DEBUG every couple seconds).
     perf_accum: f32,
@@ -146,7 +169,7 @@ struct App {
 }
 
 impl App {
-    fn new(seed: u64, planet: Arc<Planet>) -> Self {
+    fn new(seed: u64, planet: Arc<Planet>, units: units::Units) -> Self {
         // Start in orbit above a pleasant mid-latitude.
         let anchor = Vec3::new(0.4, 0.5, 0.77).normalize();
         let camera = Camera::new(&planet, anchor);
@@ -162,6 +185,7 @@ impl App {
             title_timer: 0.0,
             mods: ModifiersState::empty(),
             audio: None,
+            units,
             perf_accum: 0.0,
             perf_frames: 0,
             frame_ms_max: 0.0,
@@ -179,7 +203,10 @@ impl App {
         self.last = now;
         let time = (now - self.start).as_secs_f32();
 
-        // Advance the camera, then stream around its new position.
+        // Advance the playlist (reshuffles when a round finishes) and the camera.
+        if let Some(audio) = &mut self.audio {
+            audio.tick();
+        }
         self.camera.update(dt, &self.planet);
 
         let polled = streamer.poll();
@@ -239,7 +266,7 @@ impl App {
                 draw = draw_count,
                 uploads,
                 pending = streamer.pending_count(),
-                alt = self.camera.altitude() as i32,
+                alt = units::distance(self.camera.altitude(), self.units),
                 "frame hitch"
             );
         }
@@ -255,7 +282,7 @@ impl App {
                 fps = round1(fps),
                 avg_ms = round1(avg_ms),
                 max_ms = round1(self.frame_ms_max),
-                alt = self.camera.altitude() as i32,
+                alt = units::distance(self.camera.altitude(), self.units),
                 lat = round1(lat),
                 lon = round1(lon),
                 biome,
@@ -280,8 +307,11 @@ impl App {
             let fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
             if let Some(w) = &self.window {
                 w.set_title(&format!(
-                    "planet-explorer — seed {} | {:.0} fps | alt {:.0} | {:.1}°,{:.1}° | {} | chunks {}",
-                    self.seed, fps, self.camera.altitude(), lat, lon, biome, renderer.chunk_count()
+                    "planet-explorer — seed {} | {:.0} fps | alt {} | {:.1}°,{:.1}° | {} | chunks {}",
+                    self.seed,
+                    fps,
+                    units::distance(self.camera.altitude(), self.units),
+                    lat, lon, biome, renderer.chunk_count()
                 ));
             }
         }
@@ -290,16 +320,18 @@ impl App {
     fn print_location(&self) {
         let (lat, lon) = self.camera.lat_lon();
         let s = self.planet.sample(self.camera.focus);
+        let alt = units::distance(self.camera.altitude(), self.units);
+        let terrain = units::elevation(s.height, self.units);
         println!(
-            "location: seed {} | lat {:.3}° lon {:.3}° | altitude {:.1} | terrain {:.1} | biome {}",
-            self.seed, lat, lon, self.camera.altitude(), s.height, biome_name(s.biome)
+            "location: seed {} | lat {:.3}° lon {:.3}° | altitude {} | terrain {} | biome {}",
+            self.seed, lat, lon, alt, terrain, biome_name(s.biome)
         );
         info!(
             seed = self.seed,
             lat = round1(lat),
             lon = round1(lon),
-            altitude = self.camera.altitude() as i32,
-            terrain = round1(s.height),
+            altitude = alt,
+            terrain = terrain,
             biome = biome_name(s.biome),
             "location"
         );

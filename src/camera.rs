@@ -11,11 +11,13 @@
 //! Everything is keyboard driven and scale-aware (panning/zooming speed grows
 //! with distance), so it feels the same from orbit down to street level.
 
-use crate::planet::{self, Planet, PLANET_RADIUS};
+use crate::planet::{self, Planet, HEIGHT_SCALE, PLANET_RADIUS};
 use glam::{Mat4, Quat, Vec3};
 
+// Distances are in render units (10 m each). Min ~15 m off the deck, max well
+// outside the planet so you can see the full globe.
 const MIN_DIST: f32 = 1.5;
-const MAX_DIST: f32 = 9000.0;
+const MAX_DIST: f32 = 3.0 * PLANET_RADIUS;
 const MAX_TILT: f32 = 1.30; // ~74.5°, keeps the eye comfortably above the ground
 
 const ZOOM_RATE: f32 = 1.6; // e-folds per second
@@ -56,7 +58,7 @@ impl Camera {
     pub fn new(_planet: &Planet, focus: Vec3) -> Self {
         Self {
             focus: focus.normalize(),
-            distance: 5500.0, // start with a globe view
+            distance: PLANET_RADIUS * 2.2, // start with a full-globe view
             heading: 0.0,
             tilt: 0.0,
             aspect: 1.0,
@@ -180,7 +182,7 @@ impl Camera {
             if dir.length_squared() > 1e-6 {
                 dir = dir.normalize();
                 // Pan speed grows with zoom but is capped so far-out panning is sane.
-                let pan_world = (self.distance * 0.6).clamp(3.0, 1200.0) * boost;
+                let pan_world = (self.distance * 0.6).clamp(3.0, PLANET_RADIUS * 0.4) * boost;
                 let ang = pan_world / PLANET_RADIUS * dt;
                 let axis = self.focus.cross(dir).normalize_or_zero();
                 if axis != Vec3::ZERO {
@@ -193,24 +195,34 @@ impl Camera {
 
     // --- matrices -----------------------------------------------------------
 
-    pub fn near_far(&self) -> (f32, f32) {
-        let near = (self.distance * 0.05).clamp(0.05, 100.0);
-        let far = self.distance + PLANET_RADIUS * 2.2 + 4000.0;
+    /// Near/far planes tuned per frame from the eye's horizon. On an Earth-sized
+    /// planet a fixed far plane would either clip the globe or destroy depth
+    /// precision near the ground, so far tracks the visible horizon (plus the
+    /// distance mountains can poke above it) and near tracks the focus distance.
+    fn near_far(&self, eye: Vec3) -> (f32, f32) {
+        let r = PLANET_RADIUS;
+        let eye_r = eye.length();
+        let horizon = if eye_r > r { (eye_r * eye_r - r * r).max(0.0).sqrt() } else { 0.0 };
+        // Peaks beyond the geometric horizon are still visible.
+        let mtn = (2.0 * r * HEIGHT_SCALE * 1.4).sqrt();
+        let far = horizon + mtn + self.distance + r * 0.01 + 100.0;
+        // Nothing is closer than ~the focus point, which is `distance` away.
+        let near = (self.distance * 0.25).clamp(0.1, far * 0.4);
         (near, far)
     }
 
     pub fn view_proj(&self, planet: &Planet) -> (Mat4, Mat4, Vec3) {
         let (eye, look_dir, up_vec) = self.view(planet);
         let view = Mat4::look_to_rh(eye, look_dir, up_vec);
-        let (near, far) = self.near_far();
+        let (near, far) = self.near_far(eye);
         let proj = Mat4::perspective_rh(self.fov_y, self.aspect, near, far);
         (proj * view, view, eye)
     }
 
-    /// Fog thickens near the ground (hides LOD pop-in) and vanishes from orbit.
+    /// Fog thickens near the ground (hides far LOD pop-in) and vanishes from orbit.
     pub fn fog_density(&self) -> f32 {
-        let t = (1.0 - (self.distance / 600.0)).clamp(0.0, 1.0);
-        t * t * (1.0 / 450.0)
+        let t = (1.0 - self.distance / 3000.0).clamp(0.0, 1.0);
+        t * t * (1.0 / 4000.0)
     }
 
     pub fn lat_lon(&self) -> (f32, f32) {

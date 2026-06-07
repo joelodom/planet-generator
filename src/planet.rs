@@ -15,24 +15,31 @@ use glam::{Quat, Vec3};
 use noise::{Fbm, MultiFractal, NoiseFn, Perlin, RidgedMulti};
 use std::f32::consts::PI;
 
-/// Base radius of the planet in world units. Not real metres — chosen so that
-/// `f32` precision stays comfortable from orbit down to ground level (the LOD
-/// system is what makes it feel planet-sized, per the design).
-pub const PLANET_RADIUS: f32 = 1000.0;
+/// One render unit in metres. The render world is kept ~10x smaller than real
+/// metres so `f32` precision stays comfortable (≈0.75 m at the surface) while the
+/// planet is still Earth-sized: `PLANET_RADIUS * METERS_PER_UNIT` = 6,371,000 m.
+pub const METERS_PER_UNIT: f32 = 10.0;
 
-/// Vertical scale applied to the normalised height field, in world units.
-/// Terrain spans roughly `[-HEIGHT_SCALE*0.6, +HEIGHT_SCALE*1.1]` around sea level.
-pub const HEIGHT_SCALE: f32 = 110.0;
+/// Base radius of the planet in render units. At 10 m/unit this is Earth's radius
+/// (6,371 km). Large enough that flying/curvature feel planetary, small enough to
+/// avoid the f32 precision wall (no camera-relative rendering needed).
+pub const PLANET_RADIUS: f32 = 637_100.0;
+
+/// Vertical scale applied to the normalised height field, in render units. Tuned
+/// so peaks reach ~+8.6 km and ocean floors ~-4.4 km — an Earth-like elevation
+/// envelope. Crucially the height:radius ratio (~0.0014) matches Earth, so
+/// mountains look proportionate rather than absurdly tall.
+pub const HEIGHT_SCALE: f32 = 640.0;
 
 /// Sea level sits exactly at `PLANET_RADIUS`; anything below is underwater.
 pub const SEA_LEVEL: f32 = PLANET_RADIUS;
 
-/// Vertices below this many metres of terrain height are ocean floor.
+/// Terrain height (render units) below which a vertex is ocean floor.
 pub const SHORE: f32 = 0.0;
 
-/// Above this terrain height, exposed rock gives way to permanent snow
-/// (modulated by temperature so poles are snowy at sea level).
-pub const SNOW_BASE: f32 = 78.0;
+/// Base permanent-snow elevation (render units ≈ 4 km), raised toward the equator
+/// by temperature in `classify`.
+pub const SNOW_BASE: f32 = 400.0;
 
 /// The six faces of the cube that we inflate into a sphere. Each face is a unit
 /// square parameterised by (u, v) in [-1, 1], embedded in 3D by an origin axis
@@ -209,7 +216,8 @@ impl Planet {
         // a little noise so biome bands aren't perfect latitude rings.
         let lat = d.y.clamp(-1.0, 1.0).asin().abs() / (PI * 0.5); // 0 equator .. 1 pole
         let tvar = self.temp_var.get(p) as f32 * 0.10;
-        let temp = (1.0 - lat - (height.max(0.0) / 240.0) + tvar).clamp(0.0, 1.0);
+        // Altitude cooling: ~0.5 cooler at the highest peaks (in render units).
+        let temp = (1.0 - lat - (height.max(0.0) / 1800.0) + tvar).clamp(0.0, 1.0);
 
         let biome = classify(height, temp, moisture, steepness);
         let color = biome_color(biome, height, temp, moisture, self.detail.get([p[0] * 40.0, p[1] * 40.0, p[2] * 40.0]) as f32);
@@ -256,16 +264,17 @@ fn classify(height: f32, temp: f32, moisture: f32, steep: f32) -> Biome {
     if height < SHORE {
         return Biome::Ocean;
     }
-    if height < 2.5 && temp > 0.25 {
+    if height < 4.0 && temp > 0.25 {
         return Biome::Beach;
     }
-    // Snow: cold poles at any altitude, or cold-enough high ground.
-    let snow_line = SNOW_BASE + temp * 150.0;
+    // Snow: cold poles at any altitude, or cold-enough high ground. Snow line
+    // rises toward the warm equator (render units: ~4 km at poles, ~8.5 km warm).
+    let snow_line = SNOW_BASE + temp * 450.0;
     if temp < 0.08 || height > snow_line {
         return Biome::Snow;
     }
     // Steep high rock reads as mountain regardless of biome band.
-    if steep > 0.55 && height > 40.0 {
+    if steep > 0.55 && height > 250.0 {
         return Biome::Mountain;
     }
     if temp < 0.18 {

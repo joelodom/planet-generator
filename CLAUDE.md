@@ -22,14 +22,38 @@ build:
 - When adding features, prefer winit/wgpu abstractions over native calls; if you
   must go native, `cfg`-gate and provide a path for both macOS and Windows.
 
+### Scale & precision — IMPORTANT
+
+The planet is **Earth-sized**: `PLANET_RADIUS = 637_100` render units at
+`METERS_PER_UNIT = 10` → 6,371 km. We render in "units" (10 m each), not real
+metres, on purpose: it keeps absolute coordinates inside `f32`'s comfortable
+range (~0.75 m precision at the surface) so the renderer needs **no
+camera-relative / f64 path**. Heights are tuned to an Earth-like envelope
+(~+8.6 km peaks) and, importantly, an Earth-like height:radius ratio (~0.0014)
+so mountains look proportionate.
+
+Consequences to respect when changing things:
+- Display real-world values via `src/units.rs` (`--units us` flag), never raw
+  units, in any user-facing text (HUD title, `P` printout, perf log).
+- Depth: a fixed far plane either clips the globe or z-fights near the ground, so
+  `Camera::near_far` derives near/far from the eye's **horizon** each frame. Keep
+  that if you touch projection.
+- LOD floor: `MAX_LEVEL = 16` (~8 m quads) is about the f32 absolute-coordinate
+  limit. Going finer (true sub-metre ground detail) would require camera-relative
+  rendering (per-chunk origin + f64 chunk centers) — a deliberate future step,
+  not a constant bump.
+
 ### Assets & audio
 
 - Binary assets live in `assets/` and are **embedded** via `include_bytes!`
   (`assets/planet.png`, `assets/soundtrack.mp3`) so the app is self-contained and
   copyable between accounts. They're committed to the repo.
 - **Audio** (`src/audio.rs`): `rodio` (cpal backend per-OS + pure-Rust symphonia
-  decoders — cross-platform) loops `soundtrack.mp3` for the app's lifetime. Keep
-  the `Audio` handle alive in `App`; audio failures are non-fatal (runs silent).
+  decoders — cross-platform) plays an embedded **playlist** (`TRACKS`) — shuffled,
+  played through, then reshuffled (never restarting on the just-played track).
+  `App` calls `Audio::tick()` each frame to advance/reshuffle, and keeps the
+  `Audio` handle alive. Add a song: drop an mp3 in `assets/` + one `TRACKS` line.
+  Audio failures are non-fatal (runs silent).
 - **planet.png** is also decoded (via `png`, pure Rust) into a texture and shown
   as a circular disc in the ESC help overlay (`shaders/image.wgsl`).
 - **App icon:** `make_icon.py` (Pillow) builds a macOS squircle from planet.png;

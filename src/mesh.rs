@@ -48,7 +48,9 @@ pub const GRID: usize = 20;
 
 /// Below this quadtree level, chunks are too coarse / too far to bother placing
 /// individual plants on.
-pub const VEG_MIN_LEVEL: u32 = 6;
+// Vegetation only appears on the finest chunks (≈ sub-km) — at coarser levels an
+// Earth-sized chunk spans tens of km and individual plants would be invisible.
+pub const VEG_MIN_LEVEL: u32 = 13;
 
 impl CpuChunk {
     /// Build the terrain mesh and vegetation for one quadtree node.
@@ -197,7 +199,7 @@ fn place_vegetation(
         let ground = PLANET_RADIUS + s.height;
         let roll = rng.random::<f32>();
         if roll < tree_p {
-            let scale = rng.random_range(2.2..5.5);
+            let scale = rng.random_range(0.8..2.6); // ~8–26 m trees (render units)
             let yaw = rng.random_range(0.0..std::f32::consts::TAU);
             let pos = up * ground;
             let model = Mat4::from_scale_rotation_translation(
@@ -208,7 +210,7 @@ fn place_vegetation(
             let var = (rng.random::<f32>() - 0.5) * 0.08;
             trees.push(InstanceRaw::new(model, (tint + Vec3::splat(var)).clamp(Vec3::ZERO, Vec3::ONE)));
         } else if roll < tree_p + shrub_p {
-            let scale = rng.random_range(0.6..1.6);
+            let scale = rng.random_range(0.25..0.8); // ~2.5–8 m shrubs
             let yaw = rng.random_range(0.0..std::f32::consts::TAU);
             let pos = up * ground;
             let model = Mat4::from_scale_rotation_translation(

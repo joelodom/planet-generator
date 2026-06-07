@@ -899,7 +899,7 @@ mod smoke {
 
         // One real chunk + base meshes.
         let planet = Planet::new(7);
-        let key = ChunkKey { face: 2, level: 4, i: 8, j: 8 };
+        let key = ChunkKey { face: 2, level: 8, i: 128, j: 128 };
         let cpu = CpuChunk::build(&planet, key);
         let terrain = GpuMesh::upload(&device, &cpu.vertices, &cpu.indices);
         let trees = InstanceBuf::upload(&device, &cpu.trees);
@@ -908,14 +908,15 @@ mod smoke {
         let wm = mesh::water_sphere(24, 32);
         let water_mesh = GpuMesh::upload(&device, &wm.vertices, &wm.indices);
 
-        // Camera looking at the chunk from above.
+        // Camera looking at the chunk from above. Sit well clear of any peak
+        // (terrain reaches ~+860 units) so the eye is never underground.
         let center = key.center_dir() * planet.surface_radius(key.center_dir());
-        let eye = center.normalize() * (crate::planet::PLANET_RADIUS + 400.0);
+        let eye = center.normalize() * (crate::planet::PLANET_RADIUS + 4000.0);
         // Looking straight down the radial, so up must be a tangent (matches the
         // real camera's handling of the near-vertical look case).
         let up = crate::planet::tangent_basis(center.normalize()).0;
         let view = Mat4::look_to_rh(eye, (center - eye).normalize(), up);
-        let proj = Mat4::perspective_rh(60f32.to_radians(), w as f32 / h as f32, 0.5, 8000.0);
+        let proj = Mat4::perspective_rh(60f32.to_radians(), w as f32 / h as f32, 2.0, 20000.0);
         let vp = proj * view;
         let g = Globals {
             view_proj: vp.to_cols_array_2d(),

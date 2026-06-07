@@ -31,29 +31,33 @@ If macOS Gatekeeper ever complains, right-click the app → **Open**, or run
 
 ## Controls
 
-**Keyboard only.** Twin-stick style: **WASD moves, the arrow keys look around.**
+The planet is **Earth-sized** (6,371 km radius), with Earth-like elevations and
+real-world units in the HUD — metric by default, or `--units us` for imperial.
+
+**Keyboard only.** Google Earth–style navigation.
 
 | Input | Action |
 |-------|--------|
-| WASD | Move / strafe |
-| Arrow keys | Look around (turn / pitch) |
-| Space / C | Ascend / descend (zoom orbit ↔ surface; drives LOD) |
-| Shift | Sprint (move faster) |
-| + / − | Adjust movement speed |
+| Arrow keys | Pan across the surface |
+| W / S (or + / −) | Zoom in / out (drives LOD) |
+| A / D | Rotate (spin) the view |
+| Q / E | Tilt (top-down ↔ horizon) |
+| Shift | Move faster (hold) |
 | R | Teleport to a random spot on the surface |
-| P | Print current location & seed to stdout |
+| P | Print current location & seed (real units) |
 | G | Toggle wireframe |
 | Esc | Toggle the help overlay (key bindings + build version) |
 | Cmd-Q / Ctrl-Q | Quit (or close the window) |
 
 ## How it works
 
-The camera is a single continuum — there are no hard "orbit" vs "surface" modes.
-It stores an *anchor direction* (the lat/long it's above) and an *altitude*;
-position is always `anchor · (surface_radius + altitude)`. Zooming just shrinks
-the altitude, and the controls reinterpret the same state as you descend, so the
-transition from space to ground is perfectly continuous and you can never end up
-underground.
+The camera works like Google Earth: it **orbits a focus point on the surface**,
+parameterized by `focus` (the lat/long you're looking at), `distance` (zoom),
+`heading` (spin), and `tilt` (top-down ↔ horizon). Pan/zoom speeds scale with
+distance, so it feels the same from orbit down to ground level. The planet is
+Earth-sized (6,371 km); the world is rendered in 10 m "units" to stay within f32
+precision without a camera-relative renderer, and near/far planes track the
+visible horizon each frame so the globe never clips and the ground never z-fights.
 
 The planet is a **cube-sphere**: six faces, each a quadtree that subdivides as
 the camera nears and merges as it recedes. Chunks are meshed on a background
