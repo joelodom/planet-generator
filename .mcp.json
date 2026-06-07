@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "ct": {
+      "args": [
+        "mcp-serve"
+      ],
+      "command": "ct"
+    }
+  }
+}
