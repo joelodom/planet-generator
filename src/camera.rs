@@ -126,6 +126,24 @@ impl Camera {
         self.distance
     }
 
+    // Read-out + direct control of the view state, used by the guided tour.
+    pub fn distance(&self) -> f32 {
+        self.distance
+    }
+    pub fn heading(&self) -> f32 {
+        self.heading
+    }
+    pub fn tilt(&self) -> f32 {
+        self.tilt
+    }
+    /// Set the whole view at once (the tour animates these four values).
+    pub fn set_view(&mut self, focus: Vec3, distance: f32, heading: f32, tilt: f32) {
+        self.focus = focus.normalize();
+        self.distance = distance.clamp(MIN_DIST, MAX_DIST);
+        self.heading = heading;
+        self.tilt = tilt.clamp(0.0, MAX_TILT);
+    }
+
     // --- input --------------------------------------------------------------
 
     pub fn set_aspect(&mut self, w: u32, h: u32) {

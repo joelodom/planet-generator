@@ -25,6 +25,7 @@ mod logging;
 mod mesh;
 mod overlay;
 mod planet;
+mod tour;
 mod units;
 #[cfg(test)]
 mod tests;
@@ -138,6 +139,7 @@ fn print_controls() {
          A / D           rotate (spin) the view\n  \
          Q / E           tilt (top-down <-> horizon)\n  \
          Shift           move faster (hold)\n  \
+         T               guided tour (relaxing autopilot)\n  \
          R               teleport to a random spot\n  \
          P               print location & seed\n  \
          G               toggle wireframe\n  \
@@ -159,6 +161,7 @@ struct App {
     mods: ModifiersState,
     audio: Option<audio::Audio>,
     units: units::Units,
+    tour: Option<tour::Tour>,
 
     // Performance sampling (aggregated, logged at DEBUG every couple seconds).
     perf_accum: f32,
@@ -186,6 +189,7 @@ impl App {
             mods: ModifiersState::empty(),
             audio: None,
             units,
+            tour: None,
             perf_accum: 0.0,
             perf_frames: 0,
             frame_ms_max: 0.0,
@@ -207,10 +211,15 @@ impl App {
         if let Some(audio) = &mut self.audio {
             audio.tick();
         }
-        // Drive "move faster" from the authoritative modifier state (not Shift
-        // key-up/down events, which can get stuck on at launch).
-        self.camera.key(KeyAction::Boost, self.mods.shift_key());
-        self.camera.update(dt, &self.planet);
+        // The guided tour, when active, flies the camera itself; otherwise the
+        // player drives it. ("Move faster" comes from the authoritative modifier
+        // state — not Shift key events, which can get stuck on at launch.)
+        if let Some(tour) = &mut self.tour {
+            tour.update(dt, &self.planet, &mut self.camera);
+        } else {
+            self.camera.key(KeyAction::Boost, self.mods.shift_key());
+            self.camera.update(dt, &self.planet);
+        }
 
         let polled = streamer.poll();
         let uploads = polled.len();
@@ -432,6 +441,10 @@ impl App {
             _ => None,
         };
         if let Some(a) = action {
+            // Taking manual control ends the guided tour.
+            if pressed && self.tour.take().is_some() {
+                info!("tour stopped (manual control)");
+            }
             self.camera.key(a, pressed);
             return;
         }
@@ -463,6 +476,14 @@ impl App {
                 self.print_location();
             }
             KeyCode::KeyP => self.print_location(),
+            KeyCode::KeyT => {
+                if self.tour.take().is_some() {
+                    info!(action = "tour", "guided tour stopped");
+                } else {
+                    self.tour = Some(tour::Tour::new(&self.camera, &self.planet));
+                    info!(action = "tour", "guided tour started");
+                }
+            }
             KeyCode::KeyG => {
                 if let Some(r) = &mut self.renderer {
                     if r.supports_wireframe {

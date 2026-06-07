@@ -42,6 +42,7 @@ pub fn help_lines() -> Vec<String> {
         "A / D         rotate (spin) the view".to_string(),
         "Q / E         tilt (top-down <-> horizon)".to_string(),
         "Shift         move faster (hold)".to_string(),
+        "T             guided tour (relaxing autopilot)".to_string(),
         "R             teleport to a random spot".to_string(),
         "P             print location to the log".to_string(),
         "G             toggle wireframe".to_string(),
