@@ -1,87 +1,130 @@
-//! The camera: a single continuum from orbit to ground, with no hard mode
-//! switches.
+//! Google-Earth-style camera: it orbits a *focus point* on the planet surface.
 //!
-//! The trick is the state representation. Instead of tracking a free-floating
-//! eye, the camera stores an `anchor` (a unit direction = the lat/long it's
-//! above) and an `altitude` (height above the surface along that direction).
-//! Position is always `anchor * (surface_radius + altitude)`. Because both orbit
-//! and surface controls only ever nudge these two quantities, the camera can
-//! never end up underground or off the planet, and zooming from space to a
-//! hilltop is perfectly continuous — the controls simply reinterpret the same
-//! state as you descend.
+//! Instead of flying a free first-person eye (which is disorienting on a sphere),
+//! the camera always looks at a focus point on the ground and is parameterised
+//! the way Google Earth is:
+//!   - `focus`    — the lat/long on the surface being looked at
+//!   - `distance` — how far the eye is from that point (zoom)
+//!   - `heading`  — compass rotation around the focus
+//!   - `tilt`     — angle from straight-down (0) toward the horizon
+//!
+//! Everything is keyboard driven and scale-aware (panning/zooming speed grows
+//! with distance), so it feels the same from orbit down to street level.
 
-use crate::planet::{self, Planet};
+use crate::planet::{self, Planet, PLANET_RADIUS};
 use glam::{Mat4, Quat, Vec3};
-use std::f32::consts::PI;
 
-/// Altitude (world units) above which orbit-style controls take over.
-const ORBIT_ALT: f32 = 320.0;
-/// Never let the eye get closer than this to the surface.
-const MIN_ALT: f32 = 1.6;
-const MAX_ALT: f32 = 9000.0;
+const MIN_DIST: f32 = 1.5;
+const MAX_DIST: f32 = 9000.0;
+const MAX_TILT: f32 = 1.30; // ~74.5°, keeps the eye comfortably above the ground
+
+const ZOOM_RATE: f32 = 1.6; // e-folds per second
+const ROT_RATE: f32 = 1.3; // rad/s
+const TILT_RATE: f32 = 1.2; // rad/s
 
 #[derive(Default)]
 struct Keys {
-    fwd: bool,
-    back: bool,
-    left: bool,
-    right: bool,
-    up: bool,
-    down: bool,
-    sprint: bool,
+    pan_fwd: bool,
+    pan_back: bool,
+    pan_left: bool,
+    pan_right: bool,
+    zoom_in: bool,
+    zoom_out: bool,
+    rot_left: bool,
+    rot_right: bool,
+    tilt_more: bool, // toward the horizon
+    tilt_less: bool, // toward top-down
+    boost: bool,
 }
 
 pub struct Camera {
-    pub anchor: Vec3,
-    pub altitude: f32,
-    pub look_dir: Vec3,
+    /// Unit direction to the surface point under the camera's focus.
+    pub focus: Vec3,
+    /// Eye distance from the focus point.
+    distance: f32,
+    /// Compass heading (radians).
+    heading: f32,
+    /// Tilt from straight-down (0) toward the horizon.
+    tilt: f32,
+
     pub aspect: f32,
     pub fov_y: f32,
-
     keys: Keys,
-    pub left_mouse: bool,
-    pub right_mouse: bool,
-    pub free_look: bool,
-    speed_mult: f32,
 }
 
 impl Camera {
-    pub fn new(planet: &Planet, anchor: Vec3) -> Self {
-        let anchor = anchor.normalize();
-        let mut cam = Self {
-            anchor,
-            altitude: 2600.0,
-            look_dir: -anchor,
+    pub fn new(_planet: &Planet, focus: Vec3) -> Self {
+        Self {
+            focus: focus.normalize(),
+            distance: 5500.0, // start with a globe view
+            heading: 0.0,
+            tilt: 0.0,
             aspect: 1.0,
             fov_y: 60f32.to_radians(),
             keys: Keys::default(),
-            left_mouse: false,
-            right_mouse: false,
-            free_look: false,
-            speed_mult: 1.0,
-        };
-        cam.clamp_to_surface(planet);
-        cam
+        }
     }
 
-    fn orbit_mode(&self) -> bool {
-        self.altitude > ORBIT_ALT
+    // --- local frame & eye --------------------------------------------------
+
+    /// North/east tangents at the focus (north = toward +Y pole, projected).
+    fn frame(&self) -> (Vec3, Vec3) {
+        let up = self.focus;
+        let mut north = Vec3::Y - up * Vec3::Y.dot(up);
+        if north.length_squared() < 1e-5 {
+            north = planet::tangent_basis(up).0; // at a pole, any tangent
+        }
+        north = north.normalize();
+        let east = up.cross(north).normalize();
+        (north, east)
     }
 
-    /// Local up at the current position (away from planet centre).
-    fn up(&self) -> Vec3 {
-        self.anchor
+    /// Horizontal look direction (tangent) given the current heading.
+    fn look_h(&self) -> Vec3 {
+        let (north, east) = self.frame();
+        (north * self.heading.cos() + east * self.heading.sin()).normalize()
+    }
+
+    /// Eye position, look direction, and view-up — the camera basis.
+    fn view(&self, planet: &Planet) -> (Vec3, Vec3, Vec3) {
+        let up = self.focus;
+        let surface_r = planet.surface_radius(self.focus);
+        let focus_point = self.focus * surface_r;
+        let look_h = self.look_h();
+        let (st, ct) = (self.tilt.sin(), self.tilt.cos());
+
+        // Eye sits above-and-behind the focus; raising tilt swings it down toward
+        // the horizon.
+        let mut eye = focus_point + up * (self.distance * ct) - look_h * (self.distance * st);
+
+        // Never let the eye dip below the surface (e.g. steep tilt near ground).
+        let eye_dir = eye.normalize();
+        let min_r = planet.surface_radius(eye_dir) + 1.0;
+        if eye.length() < min_r {
+            eye = eye_dir * min_r;
+        }
+
+        let look_dir = (focus_point - eye).normalize();
+        // View-up = focus normal with the look component removed; degenerate only
+        // at exact top-down, where screen-up is the heading direction.
+        let mut up_vec = up - look_dir * up.dot(look_dir);
+        if up_vec.length_squared() < 1e-6 {
+            up_vec = look_h;
+        }
+        (eye, look_dir, up_vec.normalize())
     }
 
     pub fn position(&self, planet: &Planet) -> Vec3 {
-        self.anchor * (planet.surface_radius(self.anchor) + self.altitude)
+        self.view(planet).0
     }
 
+    /// Height of the eye above the terrain directly beneath it.
     pub fn altitude(&self) -> f32 {
-        self.altitude
+        // Cheap proxy used for fog/near-far; exact terrain height not needed.
+        self.distance
     }
 
-    // --- input -------------------------------------------------------------
+    // --- input --------------------------------------------------------------
 
     pub fn set_aspect(&mut self, w: u32, h: u32) {
         self.aspect = (w.max(1) as f32) / (h.max(1) as f32);
@@ -89,176 +132,106 @@ impl Camera {
 
     pub fn key(&mut self, code: KeyAction, pressed: bool) {
         match code {
-            KeyAction::Forward => self.keys.fwd = pressed,
-            KeyAction::Back => self.keys.back = pressed,
-            KeyAction::Left => self.keys.left = pressed,
-            KeyAction::Right => self.keys.right = pressed,
-            KeyAction::Ascend => self.keys.up = pressed,
-            KeyAction::Descend => self.keys.down = pressed,
-            KeyAction::Sprint => self.keys.sprint = pressed,
+            KeyAction::PanForward => self.keys.pan_fwd = pressed,
+            KeyAction::PanBack => self.keys.pan_back = pressed,
+            KeyAction::PanLeft => self.keys.pan_left = pressed,
+            KeyAction::PanRight => self.keys.pan_right = pressed,
+            KeyAction::ZoomIn => self.keys.zoom_in = pressed,
+            KeyAction::ZoomOut => self.keys.zoom_out = pressed,
+            KeyAction::RotateLeft => self.keys.rot_left = pressed,
+            KeyAction::RotateRight => self.keys.rot_right = pressed,
+            KeyAction::TiltMore => self.keys.tilt_more = pressed,
+            KeyAction::TiltLess => self.keys.tilt_less = pressed,
+            KeyAction::Boost => self.keys.boost = pressed,
         }
     }
 
-    pub fn adjust_speed(&mut self, factor: f32) {
-        self.speed_mult = (self.speed_mult * factor).clamp(0.1, 40.0);
+    /// Drop the focus onto a random surface point, zoomed in at a nice angle.
+    pub fn teleport(&mut self, _planet: &Planet, dir: Vec3) {
+        self.focus = dir.normalize();
+        self.distance = 12.0;
+        self.tilt = 0.85;
     }
 
-    pub fn toggle_free_look(&mut self) {
-        self.free_look = !self.free_look;
-    }
-
-    /// Mouse motion. Routed to orbiting or free-look depending on mode/buttons.
-    pub fn mouse_motion(&mut self, dx: f32, dy: f32) {
-        let orbit = self.orbit_mode();
-        if self.left_mouse && orbit {
-            self.orbit_drag(dx, dy);
-        } else if self.right_mouse || self.free_look || (self.left_mouse && !orbit) {
-            self.mouse_look(dx, dy);
-        }
-    }
-
-    fn orbit_drag(&mut self, dx: f32, dy: f32) {
-        let k = 0.005;
-        // Yaw around world up, pitch around the current tangent.
-        let yaw = Quat::from_rotation_y(-dx * k);
-        let right = self.anchor.cross(Vec3::Y).normalize_or_zero();
-        let right = if right == Vec3::ZERO { Vec3::X } else { right };
-        let pitch = Quat::from_axis_angle(right, -dy * k);
-        self.anchor = (pitch * yaw * self.anchor).normalize();
-        self.look_dir = -self.anchor; // keep the globe centred while orbiting
-    }
-
-    fn mouse_look(&mut self, dx: f32, dy: f32) {
-        let k = 0.0032;
-        let up = self.up();
-        let right = self.look_dir.cross(up).normalize_or_zero();
-        let right = if right == Vec3::ZERO { planet::tangent_basis(up).0 } else { right };
-        let yaw = Quat::from_axis_angle(up, -dx * k);
-        let pitch = Quat::from_axis_angle(right, -dy * k);
-        let mut dir = (yaw * pitch * self.look_dir).normalize();
-        // Clamp so we never look exactly along local up/down (avoids roll flips).
-        let cos = dir.dot(up).clamp(-1.0, 1.0);
-        let ang = cos.acos();
-        let limit = 0.06;
-        if ang < limit {
-            dir = (dir - up * (cos - limit.cos())).normalize();
-        } else if ang > PI - limit {
-            dir = (dir - up * (cos + limit.cos())).normalize();
-        }
-        self.look_dir = dir;
-    }
-
-    pub fn scroll(&mut self, delta: f32) {
-        // Multiplicative zoom toward/away from the surface: slows as you near
-        // the ground, so the descent into surface mode is smooth.
-        let factor = (1.0 - delta * 0.12).clamp(0.5, 2.0);
-        self.altitude = (self.altitude * factor).clamp(MIN_ALT, MAX_ALT);
-    }
-
-    /// Drop the camera onto a random point on the surface, looking at the horizon.
-    pub fn teleport(&mut self, planet: &Planet, dir: Vec3) {
-        self.anchor = dir.normalize();
-        self.altitude = 3.0;
-        // Look along a horizontal tangent, tilted slightly down toward the ground.
-        let (t, _) = planet::tangent_basis(self.anchor);
-        self.look_dir = (t - self.anchor * 0.12).normalize();
-        self.clamp_to_surface(planet);
-    }
-
-    // --- per-frame update --------------------------------------------------
+    // --- per-frame update ---------------------------------------------------
 
     pub fn update(&mut self, dt: f32, planet: &Planet) {
-        let up = self.up();
-        // Horizontal movement basis from where we're looking.
-        let mut fwd = self.look_dir - up * self.look_dir.dot(up);
-        if fwd.length_squared() < 1e-6 {
-            fwd = planet::tangent_basis(up).0;
+        let boost = if self.keys.boost { 4.0 } else { 1.0 };
+
+        // Zoom (multiplicative, so it's smooth across scales).
+        let zoom = (self.keys.zoom_out as i32 - self.keys.zoom_in as i32) as f32;
+        if zoom != 0.0 {
+            self.distance = (self.distance * (ZOOM_RATE * zoom * boost * dt).exp()).clamp(MIN_DIST, MAX_DIST);
         }
-        fwd = fwd.normalize();
-        let right = fwd.cross(up).normalize();
 
-        let mut move_dir = Vec3::ZERO;
-        if self.keys.fwd { move_dir += fwd; }
-        if self.keys.back { move_dir -= fwd; }
-        if self.keys.right { move_dir += right; }
-        if self.keys.left { move_dir -= right; }
+        // Rotate (heading) and tilt.
+        self.heading += (self.keys.rot_right as i32 - self.keys.rot_left as i32) as f32 * ROT_RATE * boost * dt;
+        self.tilt = (self.tilt + (self.keys.tilt_more as i32 - self.keys.tilt_less as i32) as f32 * TILT_RATE * dt)
+            .clamp(0.0, MAX_TILT);
 
-        let sprint = if self.keys.sprint { 6.0 } else { 1.0 };
-        // Speed scales with altitude so the world feels consistent from orbit to ground.
-        let base = (self.altitude * 0.55 + 10.0) * self.speed_mult * sprint;
-
-        if move_dir.length_squared() > 1e-6 {
-            let tangent = move_dir.normalize();
-            let surface_r = planet.surface_radius(self.anchor) + self.altitude;
-            let ang = (base * dt / surface_r).min(0.3);
-            let axis = self.anchor.cross(tangent).normalize_or_zero();
-            if axis != Vec3::ZERO {
-                let rot = Quat::from_axis_angle(axis, ang);
-                self.anchor = (rot * self.anchor).normalize();
-                // Carry the view with us so the horizon stays put as we walk.
-                self.look_dir = (rot * self.look_dir).normalize();
+        // Pan the focus across the surface, in screen-forward / screen-right.
+        let fwd = self.keys.pan_fwd as i32 - self.keys.pan_back as i32;
+        let strafe = self.keys.pan_right as i32 - self.keys.pan_left as i32;
+        if fwd != 0 || strafe != 0 {
+            let up = self.focus;
+            let look_h = self.look_h();
+            let right = look_h.cross(up).normalize(); // screen-right tangent
+            let mut dir = look_h * fwd as f32 + right * strafe as f32;
+            if dir.length_squared() > 1e-6 {
+                dir = dir.normalize();
+                // Pan speed grows with zoom but is capped so far-out panning is sane.
+                let pan_world = (self.distance * 0.6).clamp(3.0, 1200.0) * boost;
+                let ang = pan_world / PLANET_RADIUS * dt;
+                let axis = self.focus.cross(dir).normalize_or_zero();
+                if axis != Vec3::ZERO {
+                    self.focus = (Quat::from_axis_angle(axis, ang) * self.focus).normalize();
+                }
             }
         }
-
-        // Vertical: space ascends, descend key lowers. Scales with altitude too.
-        let vert = (self.altitude * 0.5 + 8.0) * self.speed_mult * sprint;
-        if self.keys.up { self.altitude += vert * dt; }
-        if self.keys.down { self.altitude -= vert * dt; }
-        self.clamp_to_surface(planet);
+        let _ = planet;
     }
 
-    fn clamp_to_surface(&mut self, _planet: &Planet) {
-        self.altitude = self.altitude.clamp(MIN_ALT, MAX_ALT);
-        self.anchor = self.anchor.normalize();
-        self.look_dir = self.look_dir.normalize_or_zero();
-        if self.look_dir == Vec3::ZERO {
-            self.look_dir = -self.anchor;
-        }
-    }
-
-    // --- matrices ----------------------------------------------------------
+    // --- matrices -----------------------------------------------------------
 
     pub fn near_far(&self) -> (f32, f32) {
-        let near = (self.altitude * 0.22).clamp(0.05, 120.0);
-        let far = self.altitude + planet::PLANET_RADIUS * 2.2 + 4000.0;
+        let near = (self.distance * 0.05).clamp(0.05, 100.0);
+        let far = self.distance + PLANET_RADIUS * 2.2 + 4000.0;
         (near, far)
     }
 
     pub fn view_proj(&self, planet: &Planet) -> (Mat4, Mat4, Vec3) {
-        let pos = self.position(planet);
-        let mut up = self.up();
-        // If we're looking nearly straight up/down, swap to a tangent up vector.
-        if self.look_dir.dot(up).abs() > 0.98 {
-            up = planet::tangent_basis(self.anchor).0;
-        }
-        let view = Mat4::look_to_rh(pos, self.look_dir, up);
+        let (eye, look_dir, up_vec) = self.view(planet);
+        let view = Mat4::look_to_rh(eye, look_dir, up_vec);
         let (near, far) = self.near_far();
         let proj = Mat4::perspective_rh(self.fov_y, self.aspect, near, far);
-        (proj * view, view, pos)
+        (proj * view, view, eye)
     }
 
-    /// Fog thickens near the ground (to hide LOD pop-in) and vanishes in space.
+    /// Fog thickens near the ground (hides LOD pop-in) and vanishes from orbit.
     pub fn fog_density(&self) -> f32 {
-        // 0 at high altitude, ~1/450 near the surface.
-        let t = (1.0 - (self.altitude / 600.0)).clamp(0.0, 1.0);
+        let t = (1.0 - (self.distance / 600.0)).clamp(0.0, 1.0);
         t * t * (1.0 / 450.0)
     }
 
     pub fn lat_lon(&self) -> (f32, f32) {
-        let lat = self.anchor.y.clamp(-1.0, 1.0).asin().to_degrees();
-        let lon = self.anchor.z.atan2(self.anchor.x).to_degrees();
+        let lat = self.focus.y.clamp(-1.0, 1.0).asin().to_degrees();
+        let lon = self.focus.z.atan2(self.focus.x).to_degrees();
         (lat, lon)
     }
 }
 
-/// Movement intents, decoupled from physical key codes (set in `main`).
+/// Navigation intents, decoupled from physical key codes (mapped in `main`).
 #[derive(Clone, Copy)]
 pub enum KeyAction {
-    Forward,
-    Back,
-    Left,
-    Right,
-    Ascend,
-    Descend,
-    Sprint,
+    PanForward,
+    PanBack,
+    PanLeft,
+    PanRight,
+    ZoomIn,
+    ZoomOut,
+    RotateLeft,
+    RotateRight,
+    TiltMore,
+    TiltLess,
+    Boost,
 }

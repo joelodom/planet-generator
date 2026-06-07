@@ -31,14 +31,14 @@ If macOS Gatekeeper ever complains, right-click the app → **Open**, or run
 
 ## Controls
 
+**Keyboard only.** Twin-stick style: **WASD moves, the arrow keys look around.**
+
 | Input | Action |
 |-------|--------|
-| Left-drag | Orbit the planet (when far out) |
-| Scroll | Zoom from orbit down to the surface (drives LOD) |
-| WASD / arrows | Move across the surface |
-| Space / C | Ascend / descend |
+| WASD | Move / strafe |
+| Arrow keys | Look around (turn / pitch) |
+| Space / C | Ascend / descend (zoom orbit ↔ surface; drives LOD) |
 | Shift | Sprint (move faster) |
-| Right-drag, or F | Look around (F toggles free-look) |
 | + / − | Adjust movement speed |
 | R | Teleport to a random spot on the surface |
 | P | Print current location & seed to stdout |

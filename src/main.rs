@@ -10,7 +10,7 @@
 //!   planet   — seeded source of truth: terrain, biomes, sun, atmosphere
 //!   mesh     — turns planet samples into triangles + vegetation instances
 //!   lod      — cube-sphere quadtree + background meshing pool
-//!   camera   — the seamless orbit↔surface control continuum
+//!   camera   — Google-Earth-style focus-orbit navigation (pan/zoom/rotate/tilt)
 //!   gfx      — wgpu renderer (sky / terrain / vegetation / water)
 //!
 //! Each system queries `Planet` for ground truth without touching the others,
@@ -36,10 +36,10 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
-use winit::window::{CursorGrabMode, Window, WindowId};
+use winit::window::{Window, WindowId};
 
 const SUN_AMBIENT: f32 = 0.32;
 /// Cap chunk requests per frame so a fast camera can't flood the work queue.
@@ -107,19 +107,19 @@ fn parse_seed() -> u64 {
 }
 
 fn print_controls() {
+    let quit = if cfg!(target_os = "macos") { "Cmd-Q" } else { "Ctrl-Q" };
     println!(
-        "\ncontrols:\n  \
-         Left-drag       orbit the planet (when far out)\n  \
-         Scroll          zoom from orbit down to the surface\n  \
-         WASD            move across the surface\n  \
-         Space / C       ascend / descend\n  \
-         Shift           sprint (move faster)\n  \
-         Right-drag / F  look around (F toggles free-look)\n  \
-         + / -           adjust movement speed\n  \
+        "\ncontrols (Google Earth style, keyboard only):\n  \
+         Arrow keys      pan across the surface\n  \
+         W / S  (+ / -)  zoom in / out\n  \
+         A / D           rotate (spin) the view\n  \
+         Q / E           tilt (top-down <-> horizon)\n  \
+         Shift           move faster (hold)\n  \
          R               teleport to a random spot\n  \
          P               print location & seed\n  \
          G               toggle wireframe\n  \
-         Esc             quit\n"
+         Esc             toggle help overlay\n  \
+         {quit} / close  quit\n"
     );
 }
 
@@ -133,7 +133,6 @@ struct App {
     start: Instant,
     last: Instant,
     title_timer: f32,
-    grabbed: bool,
     mods: ModifiersState,
 
     // Performance sampling (aggregated, logged at DEBUG every couple seconds).
@@ -159,34 +158,12 @@ impl App {
             start: Instant::now(),
             last: Instant::now(),
             title_timer: 0.0,
-            grabbed: false,
             mods: ModifiersState::empty(),
             perf_accum: 0.0,
             perf_frames: 0,
             frame_ms_max: 0.0,
             uploads_period: 0,
             last_hitch: 0.0,
-        }
-    }
-
-    fn set_grab(&mut self, grab: bool) {
-        if grab == self.grabbed {
-            return;
-        }
-        if let Some(w) = &self.window {
-            if grab {
-                let ok = w
-                    .set_cursor_grab(CursorGrabMode::Locked)
-                    .or_else(|_| w.set_cursor_grab(CursorGrabMode::Confined));
-                if ok.is_ok() {
-                    w.set_cursor_visible(false);
-                    self.grabbed = true;
-                }
-            } else {
-                let _ = w.set_cursor_grab(CursorGrabMode::None);
-                w.set_cursor_visible(true);
-                self.grabbed = false;
-            }
         }
     }
 
@@ -269,7 +246,7 @@ impl App {
             let fps = self.perf_frames as f32 / self.perf_accum;
             let avg_ms = self.perf_accum * 1000.0 / self.perf_frames as f32;
             let (lat, lon) = self.camera.lat_lon();
-            let biome = biome_name(self.planet.sample(self.camera.anchor).biome);
+            let biome = biome_name(self.planet.sample(self.camera.focus).biome);
             debug!(
                 target: "perf",
                 fps = round1(fps),
@@ -296,7 +273,7 @@ impl App {
         if self.title_timer > 0.4 {
             self.title_timer = 0.0;
             let (lat, lon) = self.camera.lat_lon();
-            let biome = biome_name(self.planet.sample(self.camera.anchor).biome);
+            let biome = biome_name(self.planet.sample(self.camera.focus).biome);
             let fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
             if let Some(w) = &self.window {
                 w.set_title(&format!(
@@ -309,7 +286,7 @@ impl App {
 
     fn print_location(&self) {
         let (lat, lon) = self.camera.lat_lon();
-        let s = self.planet.sample(self.camera.anchor);
+        let s = self.planet.sample(self.camera.focus);
         println!(
             "location: seed {} | lat {:.3}° lon {:.3}° | altitude {:.1} | terrain {:.1} | biome {}",
             self.seed, lat, lon, self.camera.altitude(), s.height, biome_name(s.biome)
@@ -376,33 +353,10 @@ impl ApplicationHandler for App {
                 self.camera.set_aspect(size.width, size.height);
             }
             WindowEvent::RedrawRequested => self.frame(),
-            WindowEvent::MouseWheel { delta, .. } => {
-                let d = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(p) => (p.y as f32) * 0.02,
-                };
-                self.camera.scroll(d);
-            }
-            WindowEvent::MouseInput { state, button, .. } => {
-                let pressed = state == ElementState::Pressed;
-                match button {
-                    MouseButton::Left => self.camera.left_mouse = pressed,
-                    MouseButton::Right => {
-                        self.camera.right_mouse = pressed;
-                        self.set_grab(pressed || self.camera.free_look);
-                    }
-                    _ => {}
-                }
-            }
+            // Keyboard-only: mouse buttons, motion, and wheel are intentionally ignored.
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::KeyboardInput { event, .. } => self.handle_key(event_loop, event),
             _ => {}
-        }
-    }
-
-    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
-        if let DeviceEvent::MouseMotion { delta } = event {
-            self.camera.mouse_motion(delta.0 as f32, delta.1 as f32);
         }
     }
 
@@ -418,15 +372,20 @@ impl App {
         let pressed = ev.state == ElementState::Pressed;
         let PhysicalKey::Code(code) = ev.physical_key else { return };
 
-        // Movement (continuous).
+        // Continuous controls — Google Earth style: arrows pan, W/S zoom,
+        // A/D rotate, Q/E tilt, Shift to move faster.
         let action = match code {
-            KeyCode::KeyW | KeyCode::ArrowUp => Some(KeyAction::Forward),
-            KeyCode::KeyS | KeyCode::ArrowDown => Some(KeyAction::Back),
-            KeyCode::KeyA | KeyCode::ArrowLeft => Some(KeyAction::Left),
-            KeyCode::KeyD | KeyCode::ArrowRight => Some(KeyAction::Right),
-            KeyCode::Space => Some(KeyAction::Ascend),
-            KeyCode::KeyC | KeyCode::ControlLeft => Some(KeyAction::Descend),
-            KeyCode::ShiftLeft | KeyCode::ShiftRight => Some(KeyAction::Sprint),
+            KeyCode::ArrowUp => Some(KeyAction::PanForward),
+            KeyCode::ArrowDown => Some(KeyAction::PanBack),
+            KeyCode::ArrowLeft => Some(KeyAction::PanLeft),
+            KeyCode::ArrowRight => Some(KeyAction::PanRight),
+            KeyCode::KeyW | KeyCode::Equal | KeyCode::NumpadAdd => Some(KeyAction::ZoomIn),
+            KeyCode::KeyS | KeyCode::Minus | KeyCode::NumpadSubtract => Some(KeyAction::ZoomOut),
+            KeyCode::KeyA => Some(KeyAction::RotateLeft),
+            KeyCode::KeyD => Some(KeyAction::RotateRight),
+            KeyCode::KeyE => Some(KeyAction::TiltMore),
+            KeyCode::KeyQ => Some(KeyAction::TiltLess),
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => Some(KeyAction::Boost),
             _ => None,
         };
         if let Some(a) = action {
@@ -471,19 +430,6 @@ impl App {
                         println!("wireframe not supported on this adapter");
                     }
                 }
-            }
-            KeyCode::KeyF => {
-                self.camera.toggle_free_look();
-                debug!(action = "free_look", on = self.camera.free_look, "free-look toggled");
-                self.set_grab(self.camera.free_look);
-            }
-            KeyCode::Equal | KeyCode::NumpadAdd => {
-                self.camera.adjust_speed(1.3);
-                debug!(action = "speed", change = "faster", "movement speed adjusted");
-            }
-            KeyCode::Minus | KeyCode::NumpadSubtract => {
-                self.camera.adjust_speed(1.0 / 1.3);
-                debug!(action = "speed", change = "slower", "movement speed adjusted");
             }
             _ => {}
         }
