@@ -1,5 +1,5 @@
-//! The renderer: all wgpu setup and the per-frame draw of sky, terrain,
-//! vegetation, and water into a single depth-tested pass.
+//! The renderer: all wgpu setup and the per-frame draw of sky, terrain (the
+//! ocean is part of the terrain mesh), and vegetation into one depth-tested pass.
 //!
 //! The renderer owns the GPU-resident chunk cache (keyed by [`ChunkKey`]). The
 //! main loop hands it freshly meshed [`CpuChunk`]s to upload and a list of which
@@ -139,11 +139,9 @@ pub struct Renderer {
     terrain_pipeline: wgpu::RenderPipeline,
     terrain_wire: Option<wgpu::RenderPipeline>,
     veg_pipeline: wgpu::RenderPipeline,
-    water_pipeline: wgpu::RenderPipeline,
 
     tree_mesh: GpuMesh,
     shrub_mesh: GpuMesh,
-    water_mesh: GpuMesh,
 
     overlay_pipeline: wgpu::RenderPipeline,
     overlay_quad: wgpu::Buffer,
@@ -277,7 +275,6 @@ impl Renderer {
         let sky_sh = shader(&device, "sky", include_str!("shaders/sky.wgsl"));
         let terrain_sh = shader(&device, "terrain", include_str!("shaders/terrain.wgsl"));
         let veg_sh = shader(&device, "vegetation", include_str!("shaders/vegetation.wgsl"));
-        let water_sh = shader(&device, "water", include_str!("shaders/water.wgsl"));
 
         let sky_pipeline = make_pipeline(&device, &pipeline_layout, &sky_sh, &[], format, PassKind::Sky, wgpu::PolygonMode::Fill);
         let terrain_pipeline = make_pipeline(&device, &pipeline_layout, &terrain_sh, &[vertex_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
@@ -287,7 +284,6 @@ impl Renderer {
             None
         };
         let veg_pipeline = make_pipeline(&device, &pipeline_layout, &veg_sh, &[vertex_layout(), instance_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
-        let water_pipeline = make_pipeline(&device, &pipeline_layout, &water_sh, &[vertex_layout()], format, PassKind::Water, wgpu::PolygonMode::Fill);
 
         // Overlay pipeline: no bind groups (pure screen-space), alpha blended.
         let overlay_sh = shader(&device, "overlay", include_str!("shaders/overlay.wgsl"));
@@ -360,10 +356,8 @@ impl Renderer {
 
         let tm = mesh::tree_mesh();
         let sm = mesh::shrub_mesh();
-        let wm = mesh::water_sphere(96, 160);
         let tree_mesh = GpuMesh::upload(&device, &tm.vertices, &tm.indices);
         let shrub_mesh = GpuMesh::upload(&device, &sm.vertices, &sm.indices);
-        let water_mesh = GpuMesh::upload(&device, &wm.vertices, &wm.indices);
 
         Ok(Self {
             surface,
@@ -378,10 +372,8 @@ impl Renderer {
             terrain_pipeline,
             terrain_wire,
             veg_pipeline,
-            water_pipeline,
             tree_mesh,
             shrub_mesh,
-            water_mesh,
             overlay_pipeline,
             overlay_quad,
             overlay_instances: None,
@@ -554,11 +546,7 @@ impl Renderer {
                 }
             }
 
-            // Water (transparent, depth-tested but no write).
-            pass.set_pipeline(&self.water_pipeline);
-            pass.set_vertex_buffer(0, self.water_mesh.vbuf.slice(..));
-            pass.set_index_buffer(self.water_mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.water_mesh.count, 0, 0..1);
+            // (Ocean is part of the terrain mesh now — no separate water pass.)
 
             // Help overlay on top of everything (screen-space).
             if self.overlay_visible {
@@ -676,7 +664,6 @@ fn shader(device: &wgpu::Device, label: &str, src: &str) -> wgpu::ShaderModule {
 enum PassKind {
     Sky,     // depth always, no write, opaque
     Opaque,  // depth less, write, opaque
-    Water,   // depth less, no write, alpha blend
     Overlay, // depth always, no write, alpha blend (screen-space UI on top)
 }
 
@@ -692,10 +679,9 @@ fn make_pipeline(
     let (depth_write, depth_compare) = match kind {
         PassKind::Sky | PassKind::Overlay => (false, wgpu::CompareFunction::Always),
         PassKind::Opaque => (true, wgpu::CompareFunction::Less),
-        PassKind::Water => (false, wgpu::CompareFunction::Less),
     };
     let blend = match kind {
-        PassKind::Water | PassKind::Overlay => Some(wgpu::BlendState::ALPHA_BLENDING),
+        PassKind::Overlay => Some(wgpu::BlendState::ALPHA_BLENDING),
         _ => Some(wgpu::BlendState::REPLACE),
     };
 
@@ -824,12 +810,10 @@ mod smoke {
         let sky_sh = shader(&device, "sky", include_str!("shaders/sky.wgsl"));
         let terrain_sh = shader(&device, "terrain", include_str!("shaders/terrain.wgsl"));
         let veg_sh = shader(&device, "veg", include_str!("shaders/vegetation.wgsl"));
-        let water_sh = shader(&device, "water", include_str!("shaders/water.wgsl"));
 
         let sky_p = make_pipeline(&device, &layout, &sky_sh, &[], format, PassKind::Sky, wgpu::PolygonMode::Fill);
         let terrain_p = make_pipeline(&device, &layout, &terrain_sh, &[vertex_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
         let veg_p = make_pipeline(&device, &layout, &veg_sh, &[vertex_layout(), instance_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
-        let water_p = make_pipeline(&device, &layout, &water_sh, &[vertex_layout()], format, PassKind::Water, wgpu::PolygonMode::Fill);
 
         // Overlay pipeline (no bind groups) + its geometry.
         let overlay_sh = shader(&device, "overlay", include_str!("shaders/overlay.wgsl"));
@@ -905,15 +889,11 @@ mod smoke {
         let trees = InstanceBuf::upload(&device, &cpu.trees);
         let tm = mesh::tree_mesh();
         let tree_mesh = GpuMesh::upload(&device, &tm.vertices, &tm.indices);
-        let wm = mesh::water_sphere(24, 32);
-        let water_mesh = GpuMesh::upload(&device, &wm.vertices, &wm.indices);
 
         // Camera looking at the chunk from above. Sit well clear of any peak
         // (terrain reaches ~+860 units) so the eye is never underground.
         let center = key.center_dir() * planet.surface_radius(key.center_dir());
         let eye = center.normalize() * (crate::planet::PLANET_RADIUS + 4000.0);
-        // Looking straight down the radial, so up must be a tangent (matches the
-        // real camera's handling of the near-vertical look case).
         let up = crate::planet::tangent_basis(center.normalize()).0;
         let view = Mat4::look_to_rh(eye, (center - eye).normalize(), up);
         let proj = Mat4::perspective_rh(60f32.to_radians(), w as f32 / h as f32, 2.0, 20000.0);
@@ -981,10 +961,6 @@ mod smoke {
                 pass.set_pipeline(&veg_p);
                 draw_instanced(&mut pass, &tree_mesh, t);
             }
-            pass.set_pipeline(&water_p);
-            pass.set_vertex_buffer(0, water_mesh.vbuf.slice(..));
-            pass.set_index_buffer(water_mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..water_mesh.count, 0, 0..1);
             // Overlay on top — validates the overlay shader/pipeline/layout.
             pass.set_pipeline(&overlay_p);
             pass.set_vertex_buffer(0, overlay_quad.slice(..));

@@ -207,6 +207,9 @@ impl App {
         if let Some(audio) = &mut self.audio {
             audio.tick();
         }
+        // Drive "move faster" from the authoritative modifier state (not Shift
+        // key-up/down events, which can get stuck on at launch).
+        self.camera.key(KeyAction::Boost, self.mods.shift_key());
         self.camera.update(dt, &self.planet);
 
         let polled = streamer.poll();
@@ -425,7 +428,7 @@ impl App {
             KeyCode::KeyD => Some(KeyAction::RotateRight),
             KeyCode::KeyE => Some(KeyAction::TiltMore),
             KeyCode::KeyQ => Some(KeyAction::TiltLess),
-            KeyCode::ShiftLeft | KeyCode::ShiftRight => Some(KeyAction::Boost),
+            // Shift (boost) is handled via modifier state in frame(), not here.
             _ => None,
         };
         if let Some(a) = action {

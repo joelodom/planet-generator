@@ -4,7 +4,7 @@
 //! fullscreen triangle) the renderer instances and reuses.
 
 use crate::lod::ChunkKey;
-use crate::planet::{self, Planet, Biome, FACES, PLANET_RADIUS, SEA_LEVEL};
+use crate::planet::{self, Planet, Biome, FACES, PLANET_RADIUS};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use rand::{RngExt, SeedableRng};
@@ -46,6 +46,7 @@ pub struct CpuChunk {
 /// Terrain tessellation per chunk side (quads). Total grid is (GRID+1)^2 verts.
 pub const GRID: usize = 20;
 
+
 /// Below this quadtree level, chunks are too coarse / too far to bother placing
 /// individual plants on.
 // Vegetation only appears on the finest chunks (≈ sub-km) — at coarser levels an
@@ -62,7 +63,11 @@ impl CpuChunk {
         let mut vertices: Vec<Vertex> = Vec::with_capacity(n * n);
         let mut dirs: Vec<Vec3> = Vec::with_capacity(n * n);
 
-        // Surface grid.
+        // Surface grid. The ocean is part of this same mesh: ocean vertices sit at
+        // sea level (height clamped to 0), so the sea is always on the exact same
+        // grid as the land at every LOD. That's what keeps land above water (no
+        // overflow) and avoids any separate-water-surface z-fighting/poke-through.
+        // The deeper water is still colored darker (from the true height).
         for r in 0..n {
             for c in 0..n {
                 let u = u0 + size * (c as f32 / GRID as f32);
@@ -70,7 +75,7 @@ impl CpuChunk {
                 let cube = face.base + face.right * u + face.up * v;
                 let dir = planet::cube_to_sphere(cube);
                 let s = planet.sample(dir);
-                let radius = PLANET_RADIUS + s.height;
+                let radius = PLANET_RADIUS + s.height.max(0.0);
                 let pos = dir * radius;
                 dirs.push(dir);
                 vertices.push(Vertex { pos: pos.into(), normal: dir.into(), color: s.color.into() });
@@ -255,33 +260,6 @@ pub fn tree_mesh() -> MeshData {
 pub fn shrub_mesh() -> MeshData {
     let mut m = MeshData { vertices: Vec::new(), indices: Vec::new() };
     hemisphere(&mut m, 0.6, 8, 4, Vec3::ONE, 0.1);
-    m
-}
-
-/// A UV sphere at sea level for the ocean surface. Normals point outward; the
-/// water shader animates and shades it.
-pub fn water_sphere(rings: usize, sectors: usize) -> MeshData {
-    let mut m = MeshData { vertices: Vec::new(), indices: Vec::new() };
-    use std::f32::consts::PI;
-    for i in 0..=rings {
-        let phi = PI * i as f32 / rings as f32;
-        for j in 0..=sectors {
-            let theta = 2.0 * PI * j as f32 / sectors as f32;
-            let dir = Vec3::new(phi.sin() * theta.cos(), phi.cos(), phi.sin() * theta.sin());
-            let p = dir * SEA_LEVEL;
-            m.vertices.push(Vertex { pos: p.into(), normal: dir.into(), color: [0.1, 0.3, 0.5] });
-        }
-    }
-    let stride = sectors + 1;
-    for i in 0..rings {
-        for j in 0..sectors {
-            let a = (i * stride + j) as u32;
-            let b = a + 1;
-            let c = a + stride as u32;
-            let d = c + 1;
-            m.indices.extend_from_slice(&[a, c, b, b, c, d]);
-        }
-    }
     m
 }
 

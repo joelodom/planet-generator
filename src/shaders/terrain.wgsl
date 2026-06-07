@@ -42,12 +42,38 @@ fn apply_fog(color: vec3<f32>, world: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let n = normalize(in.normal);
+    let radial = normalize(in.normal);
     let l = normalize(g.sun_dir.xyz);
+    let v = normalize(g.camera_pos.xyz - in.world);
     let amb = g.sun_dir.w;
+
+    // The ocean is part of this mesh, sitting at exactly sea level (= planet
+    // radius, params.y). Detect it to add a moving sun glint and rim sheen.
+    let is_water = length(in.world) < g.params.y + 1.5;
+
+    var n = radial;
+    if (is_water) {
+        // Gentle animated ripples perturb the (radial) normal for a live glint.
+        let t = g.camera_pos.w;
+        let p = in.world;
+        let ripple = vec3<f32>(
+            sin(p.x * 0.7 + t * 1.4) + sin(p.z * 1.1 - t * 1.0),
+            0.0,
+            cos(p.z * 0.9 + t * 1.2) + sin(p.x * 0.6 - t * 0.8),
+        ) * 0.03;
+        n = normalize(radial + ripple);
+    }
+
     let diff = max(dot(n, l), 0.0);
-    // Soft sky fill from straight up keeps shadowed slopes from going black.
-    let sky_fill = max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0) * 0.12;
-    let lit = in.color * (amb + diff * (1.0 - amb) + sky_fill);
-    return vec4<f32>(apply_fog(lit, in.world), 1.0);
+    let sky_fill = max(dot(radial, vec3<f32>(0.0, 1.0, 0.0)), 0.0) * 0.12;
+    var col = in.color * (amb + diff * (1.0 - amb) + sky_fill);
+
+    if (is_water) {
+        let h = normalize(l + v);
+        let spec = pow(max(dot(n, h), 0.0), 90.0) * 1.6;
+        let fres = pow(1.0 - max(dot(radial, v), 0.0), 4.0);
+        col = col + vec3<f32>(spec) + g.atmosphere.rgb * fres * 0.25;
+    }
+
+    return vec4<f32>(apply_fog(col, in.world), 1.0);
 }
