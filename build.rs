@@ -22,8 +22,11 @@ fn main() {
     }
     println!("cargo:rustc-env=GIT_HASH={hash}");
 
+    // Local build time (the headless dev account and the GUI account that runs the
+    // app share one timezone), e.g. "2026-06-08 07:16:59 EDT". Display-only — shown
+    // on the ESC overlay and in the startup log; not parsed anywhere.
     let date = Command::new("date")
-        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .args(["+%Y-%m-%d %H:%M:%S %Z"])
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())

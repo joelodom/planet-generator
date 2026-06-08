@@ -33,11 +33,12 @@ impl OverlayInstance {
 
 /// Title + build stamp (matches the log) — shown at the top of the overlay.
 fn header_lines() -> Vec<String> {
-    let built = env!("BUILD_DATE").replace('T', " ").replace('Z', " UTC");
+    // BUILD_DATE is already local and display-ready (see build.rs), e.g.
+    // "2026-06-08 07:16:59 EDT".
     vec![
         "PLANET EXPLORER".to_string(),
         format!("version {}   build {}", env!("CARGO_PKG_VERSION"), env!("GIT_HASH")),
-        format!("built {built}"),
+        format!("built {}", env!("BUILD_DATE")),
     ]
 }
 
