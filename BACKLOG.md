@@ -71,16 +71,27 @@ _(none)_
   compute-bound — thousands of tiny per-chunk draws keep the GPU front-end and the
   (heavier-on-DX12) driver busy without saturating the ALUs. Fewer/larger chunks here
   plus the buffer pooling/batching below directly target it._
+  _(Update 2026-06-08: the terrain arena below shipped, collapsing the per-chunk
+  buffer-*bind* overhead; this item is now about the residual per-chunk `draw_indexed`
+  COUNT, which lower `SPLIT_MAX` still reduces.)_
 
-- [ ] **GPU buffer pooling / suballocation.** `upload_chunk` creates 2–4 fresh
-  `wgpu::Buffer`s per chunk and frees them on eviction — constant allocate/free churn
-  as the camera moves (the review's H2; the log showed thousands of uploads/2 s near
-  the budget cap). Pool freed buffers by size class and reuse, or suballocate chunk
-  meshes from a few large growable buffers, to cut allocation overhead and
-  fragmentation. The bigger structural win for the 5090 is collapsing the per-chunk
-  draws via batching / indirect / multi-draw (pairs with the `split_factor` item).
-  Effort: **M** (a size-classed free list) → **L** (indirect draw).
-  _(LRU eviction — formerly bundled here — shipped 2026-06-08 with the byte budget.)_
+- [x] **✅ Terrain suballocation — DONE (2026-06-08).** Resident terrain now lives in a
+  shared `MeshArena` (fixed-size slots in a few large blocks, since every chunk is the
+  same size for a grid): per-chunk buffer create/free is gone, and the draw loop binds
+  each block ONCE and draws every chunk in it by base_vertex/first_index — terrain
+  buffer binds dropped from ~2 per drawn chunk to ~one per block (~20 at High vs
+  thousands). Veg also stopped rebinding a base buffer per species (all species' base
+  meshes are concatenated into one buffer, selected by base_vertex/first_index). This
+  targets the Windows/5090 draw-call bottleneck. _(LRU eviction shipped earlier with
+  the byte budget.)_
+
+- [ ] **Remaining draw-call headroom (veg instances + indirect).** Two follow-ups now
+  that terrain is pooled: (a) veg *instance* buffers are still per-chunk (one bind per
+  veg chunk) — route them through an arena too so the instance buffer binds once per
+  block; (b) collapse the residual per-chunk `draw_indexed` calls with
+  multi-draw-indirect — **DX12/Vulkan only (not Metal in wgpu)**, so gate it behind a
+  feature check and keep the current path for macOS. Effort: **M** (veg arena) → **L**
+  (indirect). Measure on the 5090 first — the terrain arena may already be enough.
 
 - [ ] **Wind sway.** Animate vegetation in `vegetation.wgsl`'s vertex stage —
   amplitude scaling up the plant (base fixed, tips move), from a wind vector, time

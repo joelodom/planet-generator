@@ -30,12 +30,16 @@ pub struct Globals {
 }
 
 /// An indexed mesh living on the GPU.
+/// A standalone uploaded mesh (its own vertex+index buffers). Now used only by the
+/// offscreen test harnesses; resident terrain lives in the shared `MeshArena`.
+#[cfg(test)]
 struct GpuMesh {
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
     count: u32,
 }
 
+#[cfg(test)]
 impl GpuMesh {
     fn upload(device: &wgpu::Device, verts: &[Vertex], indices: &[u32]) -> Self {
         let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -58,17 +62,163 @@ fn mesh_bytes(verts: usize, indices: usize) -> usize {
     verts * std::mem::size_of::<Vertex>() + indices * std::mem::size_of::<u32>()
 }
 
+// ── Suballocated terrain storage ─────────────────────────────────────────────
+// Every terrain chunk has the SAME vertex/index count for a given grid (a full
+// (grid+1)² surface plus four skirts), so chunk meshes pack into uniform *slots*
+// inside a few large shared GPU buffers ("blocks"). Binding one block and drawing
+// every chunk in it by base_vertex/first_index replaces the old per-chunk buffer
+// create/free + a vertex+index rebind per drawn chunk — the draw-call/submission
+// cost that left the RTX 5090 GPU-busy-but-half-idle. Slots are reused via a free
+// list; blocks are added on demand and released only by `clear_chunks`.
+
+/// Target bytes for one arena block's vertex slab + index slab combined. Kept well
+/// under wgpu's 256 MiB default `max_buffer_size` so we never raise device limits;
+/// larger = fewer per-frame block binds, smaller = less slack in a partial block.
+const ARENA_BLOCK_BYTES: usize = 48 << 20; // 48 MiB
+
+/// A terrain chunk's location in the arena: which block, which uniform slot.
+#[derive(Clone, Copy)]
+struct TerrainSlot {
+    block: u32,
+    slot: u32,
+}
+
+struct ArenaBlock {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+}
+
+/// Fixed-slot suballocator for terrain chunk meshes (see the note above).
+struct MeshArena {
+    slot_verts: u32,
+    slot_indices: u32,
+    slots_per_block: u32,
+    blocks: Vec<ArenaBlock>,
+    /// Slots ready to reuse, across all blocks (LIFO — recency is irrelevant here).
+    free: Vec<TerrainSlot>,
+}
+
+impl MeshArena {
+    fn new(slot_verts: u32, slot_indices: u32) -> Self {
+        let slot_bytes =
+            slot_verts as usize * std::mem::size_of::<Vertex>() + slot_indices as usize * std::mem::size_of::<u32>();
+        // At least one slot per block, even if a single slot exceeds the target.
+        let slots_per_block = (ARENA_BLOCK_BYTES / slot_bytes.max(1)).max(1) as u32;
+        Self { slot_verts, slot_indices, slots_per_block, blocks: Vec::new(), free: Vec::new() }
+    }
+
+    fn add_block(&mut self, device: &wgpu::Device) {
+        let block = self.blocks.len() as u32;
+        let vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("terrain-arena-verts"),
+            size: self.slots_per_block as u64 * self.slot_verts as u64 * std::mem::size_of::<Vertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ibuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("terrain-arena-indices"),
+            size: self.slots_per_block as u64 * self.slot_indices as u64 * std::mem::size_of::<u32>() as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.blocks.push(ArenaBlock { vbuf, ibuf });
+        for slot in 0..self.slots_per_block {
+            self.free.push(TerrainSlot { block, slot });
+        }
+    }
+
+    /// Reserve a slot, growing by one block when none are free.
+    fn alloc(&mut self, device: &wgpu::Device) -> TerrainSlot {
+        if self.free.is_empty() {
+            self.add_block(device);
+        }
+        self.free.pop().expect("a free slot exists after add_block")
+    }
+
+    fn free_slot(&mut self, s: TerrainSlot) {
+        self.free.push(s);
+    }
+
+    /// Copy a chunk mesh into its slot. The mesh must fit (it always does — every
+    /// chunk is the same size for the current grid; the caller guards otherwise).
+    fn write(&self, queue: &wgpu::Queue, s: TerrainSlot, verts: &[Vertex], indices: &[u32]) {
+        let block = &self.blocks[s.block as usize];
+        let v_off = s.slot as u64 * self.slot_verts as u64 * std::mem::size_of::<Vertex>() as u64;
+        let i_off = s.slot as u64 * self.slot_indices as u64 * std::mem::size_of::<u32>() as u64;
+        queue.write_buffer(&block.vbuf, v_off, bytemuck::cast_slice(verts));
+        queue.write_buffer(&block.ibuf, i_off, bytemuck::cast_slice(indices));
+    }
+
+    fn base_vertex(&self, s: TerrainSlot) -> i32 {
+        (s.slot * self.slot_verts) as i32
+    }
+    fn first_index(&self, s: TerrainSlot) -> u32 {
+        s.slot * self.slot_indices
+    }
+}
+
+/// Every species' base mesh concatenated into one static vertex+index buffer, so
+/// the vegetation pass binds geometry ONCE and selects a species by base_vertex/
+/// first_index — instead of re-binding a base buffer per species per chunk.
+struct VegBaseMeshes {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    species: Vec<SpeciesRange>,
+}
+
+#[derive(Clone, Copy)]
+struct SpeciesRange {
+    base_vertex: i32,
+    first_index: u32,
+    count: u32,
+}
+
+impl VegBaseMeshes {
+    fn build(device: &wgpu::Device, meshes: &[&MeshData]) -> Self {
+        let mut verts: Vec<Vertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let mut species = Vec::with_capacity(meshes.len());
+        for m in meshes {
+            species.push(SpeciesRange {
+                base_vertex: verts.len() as i32,
+                first_index: indices.len() as u32,
+                count: m.indices.len() as u32,
+            });
+            verts.extend_from_slice(&m.vertices);
+            indices.extend_from_slice(&m.indices);
+        }
+        // BufferInit can't make a zero-sized buffer; with no vegetation at all (no
+        // species) fall back to a 1-element dummy that is simply never drawn.
+        if verts.is_empty() {
+            verts.push(Vertex { pos: [0.0; 3], normal: [0.0, 1.0, 0.0], color: [0.0; 3] });
+            indices.push(0);
+        }
+        let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("veg-base-verts"),
+            contents: bytemuck::cast_slice(&verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("veg-base-indices"),
+            contents: bytemuck::cast_slice(&indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        Self { vbuf, ibuf, species }
+    }
+}
+
 /// A chunk's vegetation on the GPU: one instance buffer plus a `(species, start,
 /// count)` run per species. Each run is one instanced draw of that species' shared
-/// base mesh (held by the renderer), so the chunk stores only the instances.
+/// base mesh (the renderer's combined `VegBaseMeshes`), so the chunk stores only
+/// the instances.
 struct GpuVeg {
     instances: wgpu::Buffer,
     draws: Vec<(u32, u32, u32)>,
 }
 
-/// A terrain chunk plus its vegetation instances, all GPU-resident.
+/// A terrain chunk (a slot in the shared arena) plus its vegetation instances.
 struct GpuChunk {
-    terrain: GpuMesh,
+    terrain: TerrainSlot,
     veg: Option<GpuVeg>,
     /// Approximate GPU bytes this chunk holds (terrain mesh + veg instances), summed
     /// into `Renderer.resident_bytes` so eviction can honour a real budget.
@@ -140,9 +290,9 @@ pub struct Renderer {
     terrain_pipeline: wgpu::RenderPipeline,
     terrain_wire: Option<wgpu::RenderPipeline>,
 
-    // Vegetation: one base mesh per species (uploaded once), drawn instanced.
+    // Vegetation: every species' base mesh concatenated (uploaded once), drawn instanced.
     veg_pipeline: wgpu::RenderPipeline,
-    species_meshes: Vec<GpuMesh>,
+    veg_base: VegBaseMeshes,
 
     overlay_pipeline: wgpu::RenderPipeline,
     overlay_quad: wgpu::Buffer,
@@ -156,6 +306,10 @@ pub struct Renderer {
     planet_bind: wgpu::BindGroup,
     image_instance: Option<wgpu::Buffer>,
 
+    /// Shared, suballocated storage for every resident terrain mesh (replaces
+    /// per-chunk buffers). `None` until the first chunk sizes it; reset by
+    /// `clear_chunks` when a settings change alters the grid.
+    terrain_arena: Option<MeshArena>,
     chunks: HashMap<ChunkKey, GpuChunk>,
     /// Running total of approximate GPU bytes across `chunks`, so eviction bounds
     /// *real* memory instead of a chunk count.
@@ -293,10 +447,7 @@ impl Renderer {
         // pipeline that transforms them per-instance (model matrix + tint).
         let veg_sh = shader(&device, "vegetation", include_str!("shaders/vegetation.wgsl"));
         let veg_pipeline = make_pipeline(&device, &pipeline_layout, &veg_sh, &[vertex_layout(), veg_instance_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
-        let species_meshes: Vec<GpuMesh> = veg_meshes
-            .iter()
-            .map(|m| GpuMesh::upload(&device, &m.vertices, &m.indices))
-            .collect();
+        let veg_base = VegBaseMeshes::build(&device, veg_meshes);
 
         // Overlay pipeline: no bind groups (pure screen-space), alpha blended.
         let overlay_sh = shader(&device, "overlay", include_str!("shaders/overlay.wgsl"));
@@ -380,7 +531,7 @@ impl Renderer {
             terrain_pipeline,
             terrain_wire,
             veg_pipeline,
-            species_meshes,
+            veg_base,
             overlay_pipeline,
             overlay_quad,
             overlay_instances: None,
@@ -390,6 +541,7 @@ impl Renderer {
             image_pipeline,
             planet_bind,
             image_instance: None,
+            terrain_arena: None,
             chunks: HashMap::new(),
             resident_bytes: 0,
             tick: 0,
@@ -457,18 +609,36 @@ impl Renderer {
         let CpuChunk { vertices, indices, veg } = cpu;
         let bytes =
             mesh_bytes(vertices.len(), indices.len()) + veg.instances.len() * std::mem::size_of::<VegInstance>();
-        let terrain = GpuMesh::upload(&self.device, &vertices, &indices);
+        // Cloned handles (cheap Arc bumps) so the arena can borrow device/queue
+        // without conflicting with the `&mut self.terrain_arena` borrow below.
+        let device = self.device.clone();
+        let queue = self.queue.clone();
+        // The arena sizes itself to the current grid from the first chunk; every
+        // chunk is identical in size until a settings change calls `clear_chunks`.
+        let arena = self
+            .terrain_arena
+            .get_or_insert_with(|| MeshArena::new(vertices.len() as u32, indices.len() as u32));
+        if vertices.len() as u32 > arena.slot_verts || indices.len() as u32 > arena.slot_indices {
+            // Can't happen for a fixed grid; degrade (skip) rather than corrupt a slot.
+            tracing::error!(level = key.level, verts = vertices.len(), "chunk mesh exceeds arena slot; skipped");
+            return;
+        }
+        let terrain = arena.alloc(&device);
+        arena.write(&queue, terrain, &vertices, &indices);
         let veg = (!veg.instances.is_empty()).then(|| GpuVeg {
-            instances: self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            instances: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("veg-instances"),
                 contents: bytemuck::cast_slice(&veg.instances),
                 usage: wgpu::BufferUsages::VERTEX,
             }),
             draws: veg.draws,
         });
-        // Replacing a key frees the old chunk's buffers — discount its bytes first.
+        // Replacing a key returns the old chunk's slot to the arena — discount it first.
         if let Some(old) = self.chunks.insert(key, GpuChunk { terrain, veg, bytes, last_used: self.tick }) {
             self.resident_bytes -= old.bytes;
+            if let Some(arena) = self.terrain_arena.as_mut() {
+                arena.free_slot(old.terrain);
+            }
         }
         self.resident_bytes += bytes;
     }
@@ -498,6 +668,9 @@ impl Renderer {
             }
             if let Some(c) = self.chunks.remove(&k) {
                 self.resident_bytes -= c.bytes;
+                if let Some(arena) = self.terrain_arena.as_mut() {
+                    arena.free_slot(c.terrain);
+                }
             }
         }
     }
@@ -516,6 +689,9 @@ impl Renderer {
     pub fn clear_chunks(&mut self) {
         self.chunks.clear();
         self.resident_bytes = 0;
+        // Release the arena's blocks; the next upload re-sizes it (the grid, and
+        // hence the per-slot mesh size, may have changed).
+        self.terrain_arena = None;
     }
 
     pub fn update_globals(&self, g: &Globals) {
@@ -588,27 +764,40 @@ impl Renderer {
                 &self.terrain_pipeline
             };
             pass.set_pipeline(terrain_pipe);
-            for key in draw {
-                if let Some(chunk) = self.chunks.get(key) {
-                    pass.set_vertex_buffer(0, chunk.terrain.vbuf.slice(..));
-                    pass.set_index_buffer(chunk.terrain.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..chunk.terrain.count, 0, 0..1);
+            // All resident terrain lives in the shared arena: bind each block's
+            // buffers ONCE, then draw every visible chunk in that block by
+            // base_vertex/first_index — a handful of binds per frame instead of two
+            // per drawn chunk (the draw-call bottleneck on the RTX 5090).
+            if let Some(arena) = &self.terrain_arena {
+                for (bi, block) in arena.blocks.iter().enumerate() {
+                    let bi = bi as u32;
+                    pass.set_vertex_buffer(0, block.vbuf.slice(..));
+                    pass.set_index_buffer(block.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    for key in draw {
+                        if let Some(chunk) = self.chunks.get(key)
+                            && chunk.terrain.block == bi
+                        {
+                            let first = arena.first_index(chunk.terrain);
+                            pass.draw_indexed(first..first + arena.slot_indices, arena.base_vertex(chunk.terrain), 0..1);
+                        }
+                    }
                 }
             }
 
-            // Vegetation: each chunk's baked plant mesh, drawn with the terrain
-            // pipeline (same lit/fogged world-space triangles). Skipped in
-            // wireframe mode to keep the debug view legible.
-            if !self.wireframe {
+            // Vegetation: bind the combined base-mesh buffers ONCE (a species is
+            // selected by base_vertex/first_index), then per veg chunk bind its
+            // instance buffer once and draw each species' run — instead of rebinding
+            // a base buffer per species per chunk. Skipped in wireframe mode.
+            if !self.wireframe && !self.veg_base.species.is_empty() {
                 pass.set_pipeline(&self.veg_pipeline);
+                pass.set_vertex_buffer(0, self.veg_base.vbuf.slice(..));
+                pass.set_index_buffer(self.veg_base.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 for key in draw {
                     if let Some(GpuChunk { veg: Some(veg), .. }) = self.chunks.get(key) {
                         pass.set_vertex_buffer(1, veg.instances.slice(..));
                         for &(species, start, count) in &veg.draws {
-                            let base = &self.species_meshes[species as usize];
-                            pass.set_vertex_buffer(0, base.vbuf.slice(..));
-                            pass.set_index_buffer(base.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                            pass.draw_indexed(0..base.count, 0, start..start + count);
+                            let s = self.veg_base.species[species as usize];
+                            pass.draw_indexed(s.first_index..s.first_index + s.count, s.base_vertex, start..start + count);
                         }
                     }
                 }
@@ -798,6 +987,24 @@ mod smoke {
     use crate::planet::Planet;
     use glam::Mat4;
 
+    // Pure check (no GPU) of the arena's slot math — the highest-risk part, since a
+    // wrong base_vertex/first_index renders garbage. Uses representative grid counts.
+    #[test]
+    fn arena_slot_offsets_are_uniform_and_bounded() {
+        const MAX_BUFFER: u64 = 256 << 20; // wgpu's default max_buffer_size
+        let (sv, si) = (525u32, 2880u32); // a grid=20 chunk: 21² + 4·21 verts; 20²·6 + 4·20·6 indices
+        let a = MeshArena::new(sv, si);
+        assert!(a.slots_per_block >= 1);
+        let vbytes = a.slots_per_block as u64 * sv as u64 * std::mem::size_of::<Vertex>() as u64;
+        let ibytes = a.slots_per_block as u64 * si as u64 * std::mem::size_of::<u32>() as u64;
+        assert!(vbytes <= MAX_BUFFER && ibytes <= MAX_BUFFER, "an arena block must fit max_buffer_size");
+        for k in [0u32, 1, 7, a.slots_per_block - 1] {
+            let s = TerrainSlot { block: 0, slot: k };
+            assert_eq!(a.base_vertex(s), (k * sv) as i32);
+            assert_eq!(a.first_index(s), k * si);
+        }
+    }
+
     #[test]
     fn offscreen_pipeline_validates() {
         let mut idesc = wgpu::InstanceDescriptor::new_without_display_handle();
@@ -948,16 +1155,22 @@ mod smoke {
         let planet = Planet::new(7);
         let key = ChunkKey { face: 2, level: 8, i: 128, j: 128 };
         let cpu = CpuChunk::build(&planet, key, &crate::mesh::MeshConfig::standard());
-        let terrain = GpuMesh::upload(&device, &cpu.vertices, &cpu.indices);
-        // Vegetation: per-species base meshes + a synthetic instance at the chunk
-        // centre, to validate the instanced pipeline/draw (real per-chunk placement
-        // is exercised visually by the closeup render).
-        let species_meshes: Vec<GpuMesh> = (0..planet.flora.species_count())
-            .map(|i| {
-                let m = &planet.flora.species(i as u32).mesh;
-                GpuMesh::upload(&device, &m.vertices, &m.indices)
-            })
+        // Terrain through the real suballocating arena: allocate two slots and render
+        // the chunk from the SECOND one, so a nonzero base_vertex/first_index is
+        // exercised end-to-end (a wrong offset => no terrain => the brightness
+        // assertion below fails).
+        let mut arena = MeshArena::new(cpu.vertices.len() as u32, cpu.indices.len() as u32);
+        let _slot0 = arena.alloc(&device);
+        let slot = arena.alloc(&device);
+        assert_ne!(arena.base_vertex(slot), 0, "second slot must have a nonzero base_vertex to test");
+        arena.write(&queue, slot, &cpu.vertices, &cpu.indices);
+        // Vegetation: the combined base-mesh buffer + a synthetic instance at the
+        // chunk centre, validating the instanced pipeline/draw and the per-species
+        // base_vertex/first_index selection (real placement is shown by the closeup).
+        let species: Vec<&MeshData> = (0..planet.flora.species_count())
+            .map(|i| &planet.flora.species(i as u32).mesh)
             .collect();
+        let veg_base = VegBaseMeshes::build(&device, &species);
         let veg_dir = key.center_dir();
         let veg_inst = VegInstance {
             model: glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(40.0), glam::Quat::IDENTITY, veg_dir * planet.surface_radius(veg_dir)).to_cols_array_2d(),
@@ -1033,16 +1246,22 @@ mod smoke {
             pass.set_pipeline(&sky_p);
             pass.draw(0..3, 0..1);
             pass.set_pipeline(&terrain_p);
-            pass.set_vertex_buffer(0, terrain.vbuf.slice(..));
-            pass.set_index_buffer(terrain.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..terrain.count, 0, 0..1);
-            // Vegetation: instanced (validates vegetation.wgsl + the instanced draw).
-            if let Some(base) = species_meshes.first() {
+            {
+                let block = &arena.blocks[slot.block as usize];
+                pass.set_vertex_buffer(0, block.vbuf.slice(..));
+                pass.set_index_buffer(block.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                let first = arena.first_index(slot);
+                pass.draw_indexed(first..first + arena.slot_indices, arena.base_vertex(slot), 0..1);
+            }
+            // Vegetation: instanced via the combined base buffer (validates
+            // vegetation.wgsl + the base_vertex/first_index species selection). The
+            // LAST species is drawn so nonzero offsets are exercised.
+            if let Some(s) = veg_base.species.last().copied() {
                 pass.set_pipeline(&veg_p);
+                pass.set_vertex_buffer(0, veg_base.vbuf.slice(..));
+                pass.set_index_buffer(veg_base.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.set_vertex_buffer(1, veg_buf.slice(..));
-                pass.set_vertex_buffer(0, base.vbuf.slice(..));
-                pass.set_index_buffer(base.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..base.count, 0, 0..1);
+                pass.draw_indexed(s.first_index..s.first_index + s.count, s.base_vertex, 0..1);
             }
             // Overlay on top — validates the overlay shader/pipeline/layout.
             pass.set_pipeline(&overlay_p);
