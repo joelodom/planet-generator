@@ -20,6 +20,7 @@ const TRACKS: &[(&str, &[u8])] = &[
     ("Atlas of Dawn", include_bytes!("../assets/soundtrack2.mp3")),
     ("Silver Crown March", include_bytes!("../assets/soundtrack3.mp3")),
     ("Trail in Pine", include_bytes!("../assets/soundtrack4.mp3")),
+    ("Trailside Drift", include_bytes!("../assets/soundtrack5.mp3")),
 ];
 
 /// Holds the audio output alive and drives the playlist. Drop to stop playback.
