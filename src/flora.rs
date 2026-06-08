@@ -51,6 +51,7 @@ const FALL_HUE_MAX: f32 = 0.13; // autumn: red(0) → orange → yellow(0.13)
 const FALL_SAT_MIN: f32 = 0.65;
 const FALL_VAL_MIN: f32 = 0.45;
 const FOLIAGE_VERT_JITTER: f32 = 0.05; // ± per-vertex colour noise within foliage
+const AO_UNDERSIDE: f32 = 0.55; // baked AO: downward-facing surfaces darken to 1-this
 const BARK_VAL_MIN: f32 = 0.10; // near-black bark …
 const BARK_VAL_MAX: f32 = 0.34; // … to pale grey/tan
 const BARK_SAT_MAX: f32 = 0.45;
@@ -572,7 +573,11 @@ fn bark_color(rng: &mut StdRng) -> Vec3 {
 // ---------------------------------------------------------------------------
 
 fn vert(p: Vec3, n: Vec3, c: Vec3) -> Vertex {
-    Vertex { pos: p.into(), normal: n.into(), color: c.into() }
+    // Cheap baked ambient occlusion: downward-facing (occluded, under-canopy) surfaces
+    // darken; tops and sides keep full brightness. Gives a canopy volume without any
+    // runtime occlusion — folded into the vertex colour, so it costs the GPU nothing.
+    let ao = 1.0 - AO_UNDERSIDE * (-n.y).max(0.0);
+    Vertex { pos: p.into(), normal: n.into(), color: (c * ao).into() }
 }
 
 fn sym(rng: &mut StdRng) -> f32 {

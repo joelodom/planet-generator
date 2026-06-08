@@ -153,6 +153,93 @@ seeded) and keep it O(attempts) per chunk.
 was densest); GPU veg vertex/draw load **down**. Pools A and C unchanged. *Net: a
 realism win that also reclaims memory and CPU.*
 
+### Per-biome density calibration (empirical — 2026-06-08)
+
+After the area-proportional redesign shipped, in-world feedback: **Tundra reads about
+right; the dense biomes (tropical/temperate/grassland/boreal) and the cold/high ground
+around snow read too dense.** First correction applied — a **global ~50% cut**:
+`VEG_REFERENCE_AREA` 1100→2200 (halves the area-proportional attempt rate) and
+`VEG_MAX_ATTEMPTS` 384→192 (halves the cap), so **every LOD level drops ~50%
+uniformly** while the per-biome *relative* mix (via `biome_coverage`) is preserved.
+
+Future per-biome tuning, if the dense biomes still run heavy relative to Tundra (0.40)
+after the global cut: scale the high-coverage biomes down via `biome_coverage` (today
+Tropical 0.95 / Temperate 0.85 / Grassland 0.80 / Boreal 0.70), keeping the ecological
+ordering (rainforest > tundra). Note the **Snow biome itself grows no flora**
+(`biome_profile` returns `None`); "snow looks too dense" is the sparse Tundra/Boreal/
+Mountain plants reading against snowy terrain — the global cut thins those. The
+calibration knob of first resort stays `VEG_REFERENCE_AREA` (raise = sparser).
+
+---
+
+## Day/night terminator — HIGH PRIORITY (whole-planet lighting)
+
+**Problem.** The lit hemisphere looks good (nice sun glint), but the planet has **no
+real night side**: terrain/veg shading is `color · (amb + diff·(1-amb) + sky_fill)`
+with a *flat* `amb ≈ 0.42` applied everywhere, so the hemisphere facing away from the
+sun is still ~42 %-lit — a uniformly-lit globe with no terminator, which reads wrong
+(the far side has no business being that bright).
+
+**Goal.** A genuine **lit day side and dark night side** with a soft terminator: the
+sun's diffuse contribution falls to ~0 past the terminator, the day side stays fully
+lit, and the night side drops to a low **twilight floor** — not pure black, so it stays
+navigable and atmospheric.
+
+**Approach (shaders + globals; cross-cutting — `terrain.wgsl`, `vegetation.wgsl`,
+`sky.wgsl`):**
+- Drive ambient from the **sun geometry**, not a constant: scale it by
+  `dot(surface_up, sun_dir)` (the sun's elevation at that point) so it's high in
+  daylight and decays through the terminator to a small `NIGHT_FLOOR`.
+- **Soft terminator band** via a `smoothstep` around the horizon so the day/night line
+  is a gradient (atmospheric scatter, not a hard edge), tinted warm (sunset) in the band.
+- **Night fill:** the low ambient floor + the existing starfield + a faint
+  atmospheric/moonlight term (cool tint) so the dark side is dark-but-readable.
+- The sky's rim already brightens on the sunlit side (`sky.wgsl` `sun_face`) — extend
+  that day/night consistency to the surface terminator.
+
+**Design caveats.** The guided tour and free-fly can sit on the night side — keep
+`NIGHT_FLOOR` high enough to see terrain and tour-visible vegetation, or bias the tour
+toward the lit hemisphere. Day/night stays **deterministic** from the (per-world,
+constant) sun direction — no wall-clock.
+
+**Resource impact:** shader-only, a few ALU ops per fragment. **Pools A/B/C ×1.0**, no
+new memory. The cost is purely tuning the terminator/twilight. Synergises with the
+Tier-0 foliage shading below (those terms are already sun-relative, so they darken
+correctly once the ambient floor drops at night).
+
+---
+
+## Finer branches & leaves — breaking the blob silhouette
+
+**Why trees still read as blobs (geometry, not shading).** A canopy is 3–7 `ellipsoid`
+blobs (`BLOB_RINGS=3`, `BLOB_SECTORS=5` → smooth 24-vert spheres) over a *single* level
+of `segment` limbs. So at any distance the silhouette is a few overlapping balls with a
+smooth edge — no twig- or leaf-scale structure, no recursive woody ramification. Tier-0
+shading makes the blobs read as foliage-coloured *volume*, but the **silhouette** is
+still a blob; only geometry fixes that.
+
+**Approach (a Tier-1 geometry expansion; baked into the species mesh = Pool A, once):**
+1. **Recursive branching (L-system-lite).** Replace the one limb level with 2–3 levels
+   of ramification — trunk → boughs → branches → twigs — each child shorter/thinner at a
+   branch angle, with droop and per-branch RNG, so crowns sit on visible structure.
+2. **Leaf clusters, not solid blobs.** Break each canopy blob into many small foliage
+   elements so the edge goes lacy:
+   - **Geometry leaves** (no texture): many small displaced quads/tris — cheapest path,
+     no new pipeline, just more polys.
+   - **Alpha-tested leaf cards** (Tier 3a): textured alpha-masked quads — far fewer tris
+     for the same richness, but needs the texture/alpha pipeline (Pool C + fragment
+     overdraw). The real photoreal path; geometry leaves are the stepping stone.
+3. **LOD discipline.** Finer geometry only pays off up close — pair with vegetation LOD
+   impostors (Tier 3c) or raise `veg_min_level` so heavy meshes are near-only.
+
+**Resource impact.** Pool A ×~2–4 (a broadleaf ~200 → ~600–1200 verts; total ~1.6 MB →
+~4–6 MB — still trivial). **Pool B (per-instance) ×1.0** — instances are unchanged. The
+real cost is **GPU vertex throughput on drawn veg ×~2–4**, mitigated by the just-shipped
+~50 %-lower density, impostors, and a higher `veg_min_level`. Leaf cards add Pool C
+(textures ~5–50 MB fixed) + fragment overdraw. *This is the highest-impact remaining
+silhouette fix, but the GPU-heaviest flora item — gate poly density behind the preset
+and lean on impostors.*
+
 ---
 
 ## The tiers (each with its resource factor)
