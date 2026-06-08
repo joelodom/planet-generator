@@ -21,6 +21,7 @@ const TRACKS: &[(&str, &[u8])] = &[
     ("Silver Crown March", include_bytes!("../assets/soundtrack3.mp3")),
     ("Trail in Pine", include_bytes!("../assets/soundtrack4.mp3")),
     ("Trailside Drift", include_bytes!("../assets/soundtrack5.mp3")),
+    ("Paper Kite Morning", include_bytes!("../assets/soundtrack6.mp3")),
 ];
 
 /// Holds the audio output alive and drives the playlist. Drop to stop playback.
