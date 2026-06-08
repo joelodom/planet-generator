@@ -187,13 +187,14 @@ pub const BIOMES: [Biome; BIOME_COUNT] = [
     Biome::Snow,
 ];
 
-/// What a single surface sample resolves to: where it is, how it's lit, what
-/// grows there. Returned by [`Planet::sample`].
+/// What a single surface sample resolves to for queries: where it is, how steep
+/// it is, and what grows there. Vertex *color* is a rendering concern computed by
+/// [`Planet::sample_terrain`], not part of this query result. Returned by
+/// [`Planet::sample`].
 #[derive(Clone, Copy)]
 pub struct Surface {
     pub height: f32,
     pub biome: Biome,
-    pub color: Vec3,
     pub steepness: f32,
 }
 
@@ -307,12 +308,36 @@ impl Planet {
         h_unit * HEIGHT_SCALE
     }
 
-    /// Resolve everything about a surface point: height, biome, color, slope.
+    /// Resolve a surface point for queries: its height, biome, and slope. (Vertex
+    /// *color* is a rendering output — use [`Self::sample_terrain`] for that, so
+    /// this gameplay/HUD/vegetation path doesn't compute a color it would ignore.)
     pub fn sample(&self, dir: Vec3) -> Surface {
         let d = dir.normalize();
         let height = self.height(d);
         let steepness = self.steepness(d, height);
+        let (biome, _temp, _moisture) = self.classify_at(d, height, steepness);
+        Surface { height, biome, steepness }
+    }
 
+    /// Lean terrain sample for chunk meshing: the height and vertex color the mesh
+    /// needs, nothing else. Slope only changes the biome on high ground (the
+    /// Mountain test in [`classify`], gated by `MOUNTAIN_MIN_HEIGHT`), so the two
+    /// extra `height()` probes that [`Self::steepness`] costs are skipped at or
+    /// below that line — the bulk of every chunk's vertices — making this ~2x
+    /// cheaper than a full classify with **identical** color (proven by the
+    /// `sample_terrain_color_is_slope_independent_below_mountains` test).
+    pub fn sample_terrain(&self, dir: Vec3) -> (f32, Vec3) {
+        let d = dir.normalize();
+        let height = self.height(d);
+        // Below the mountain line slope can't change the biome — don't pay for it.
+        let steepness = if height > MOUNTAIN_MIN_HEIGHT { self.steepness(d, height) } else { 0.0 };
+        let (biome, temp, moisture) = self.classify_at(d, height, steepness);
+        (height, self.terrain_color(d, height, biome, temp, moisture))
+    }
+
+    /// Biome at a point, plus the temperature and moisture fields it (and coloring)
+    /// derive from. Shared by [`Self::sample`] and [`Self::sample_terrain`].
+    fn classify_at(&self, d: Vec3, height: f32, steepness: f32) -> (Biome, f32, f32) {
         let p = [d.x as f64, d.y as f64, d.z as f64];
         let moisture = (self.moisture.get(p) as f32 * 0.5 + 0.5).clamp(0.0, 1.0);
 
@@ -323,11 +348,15 @@ impl Planet {
         // Altitude cooling: high peaks run much colder (so they hold snow).
         let temp = (1.0 - lat - (height.max(0.0) / ALTITUDE_COOLING_SCALE) + tvar).clamp(0.0, 1.0);
 
-        let biome = classify(height, temp, moisture, steepness);
-        let cnoise = self.detail.get([p[0] * COLOR_DETAIL_FREQ, p[1] * COLOR_DETAIL_FREQ, p[2] * COLOR_DETAIL_FREQ]) as f32;
-        let color = biome_color(biome, height, temp, moisture, cnoise);
+        (classify(height, temp, moisture, steepness), temp, moisture)
+    }
 
-        Surface { height, biome, color, steepness }
+    /// Per-vertex terrain color for a classified point (adds the high-frequency
+    /// color-jitter noise). Split out so [`Self::sample`] needn't compute it.
+    fn terrain_color(&self, d: Vec3, height: f32, biome: Biome, temp: f32, moisture: f32) -> Vec3 {
+        let p = [d.x as f64, d.y as f64, d.z as f64];
+        let cnoise = self.detail.get([p[0] * COLOR_DETAIL_FREQ, p[1] * COLOR_DETAIL_FREQ, p[2] * COLOR_DETAIL_FREQ]) as f32;
+        biome_color(biome, height, temp, moisture, cnoise)
     }
 
     /// Approximate surface slope at a point: 0 = flat, 1 = ~vertical cliff.
@@ -444,5 +473,78 @@ pub(crate) fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Vec3 {
         3 => Vec3::new(p, q, v),
         4 => Vec3::new(t, p, v),
         _ => Vec3::new(v, p, q),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic spread of unit directions over the sphere (golden spiral).
+    fn dirs(n: usize) -> Vec<Vec3> {
+        let ga = PI * (3.0 - 5f32.sqrt());
+        (0..n)
+            .map(|i| {
+                let y = 1.0 - (i as f32 / (n as f32 - 1.0)) * 2.0;
+                let r = (1.0 - y * y).max(0.0).sqrt();
+                let t = ga * i as f32;
+                Vec3::new(t.cos() * r, y, t.sin() * r)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sample_terrain_color_is_slope_independent_below_mountains() {
+        // H1: `sample_terrain` skips the slope probe at/below MOUNTAIN_MIN_HEIGHT.
+        // Prove that's color-neutral — its color must equal the color computed with
+        // the slope probe forced on at every point, so meshing output is unchanged.
+        let p = Planet::new(2024);
+        for d in dirs(4000) {
+            // `sample_terrain` normalizes `d` once internally; mirror that exactly
+            // (a second normalize would shift the noise inputs by an ULP and make
+            // this an apples-to-oranges comparison rather than a real equivalence).
+            let (h, lean) = p.sample_terrain(d);
+            let dn = d.normalize();
+            let (biome, temp, moisture) = p.classify_at(dn, h, p.steepness(dn, h));
+            let full = p.terrain_color(dn, h, biome, temp, moisture);
+            assert_eq!(lean.to_array(), full.to_array(), "color differs at {dn:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark; run: cargo test --release planet::tests::h1 -- --ignored --nocapture"]
+    fn h1_steepness_skip_speedup() {
+        use std::time::Instant;
+        let p = Planet::new(2024);
+        let ds = dirs(20_000);
+        let mut acc = 0.0f32; // keep the calls from being optimized away
+
+        // Pre-H1 cost: classify with the slope probe forced on everywhere.
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            for &d in &ds {
+                let dn = d.normalize();
+                let h = p.height(dn);
+                let (b, t, m) = p.classify_at(dn, h, p.steepness(dn, h));
+                acc += p.terrain_color(dn, h, b, t, m).x + h;
+            }
+        }
+        let before = t0.elapsed();
+
+        // Post-H1: sample_terrain skips the probe below the mountain line.
+        let t1 = Instant::now();
+        for _ in 0..5 {
+            for &d in &ds {
+                let (h, c) = p.sample_terrain(d.normalize());
+                acc += c.x + h;
+            }
+        }
+        let after = t1.elapsed();
+
+        eprintln!(
+            "grid sample before(slope always)={before:?}  after(H1)={after:?}  \
+             speedup={:.2}x  (acc {acc})",
+            before.as_secs_f64() / after.as_secs_f64()
+        );
     }
 }

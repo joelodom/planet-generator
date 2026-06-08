@@ -118,11 +118,13 @@ impl CpuChunk {
                 let v = v0 + size * (r as f32 / grid as f32);
                 let cube = face.base + face.right * u + face.up * v;
                 let dir = planet::cube_to_sphere(cube);
-                let s = planet.sample(dir);
-                let radius = PLANET_RADIUS + s.height.max(0.0);
+                // Lean terrain sample: meshing needs only height + color, so this
+                // skips the slope probes everywhere they can't change the biome.
+                let (height, color) = planet.sample_terrain(dir);
+                let radius = PLANET_RADIUS + height.max(0.0);
                 let pos = dir * radius;
                 dirs.push(dir);
-                vertices.push(Vertex { pos: pos.into(), normal: dir.into(), color: s.color.into() });
+                vertices.push(Vertex { pos: pos.into(), normal: dir.into(), color: color.into() });
             }
         }
 
