@@ -1,8 +1,8 @@
 # planet-explorer
 
-A real-time 3D procedural planet explorer in Rust, built directly on **wgpu**
-(Metal on macOS) — no game engine. Generate a planet from a seed and fly
-seamlessly from orbit down to the grass.
+A real-time 3D procedural planet explorer in Rust, built directly on **wgpu** — no
+game engine. Runs on **macOS** (Metal) and **Windows** (DX12/Vulkan, e.g. an RTX
+5090). Generate a planet from a seed and fly seamlessly from orbit down to the grass.
 
 ```bash
 cargo run                 # random seed
@@ -29,6 +29,19 @@ it. To launch with a specific seed:
 If macOS Gatekeeper ever complains, right-click the app → **Open**, or run
 `xattr -dr com.apple.quarantine "Planet Explorer.app"`.
 
+## Build a Windows .exe
+
+```powershell
+.\package_windows.ps1     # or run package_windows.cmd to bypass the PowerShell execution policy
+```
+
+Release-builds a single, self-contained `dist\planet-explorer.exe` — all assets are
+embedded, so that one file is all you need to copy and run. The MSVC C runtime is
+statically linked by default (no Visual C++ redistributable required); pass
+`-DynamicCrt` for a smaller exe that needs the redist, or `-Run` to launch after
+building. Requires the Rust MSVC toolchain (`rustup default stable-msvc`) and a
+current GPU driver (DX12, or Vulkan).
+
 ## Controls
 
 The planet is **Earth-sized** (6,371 km radius), with Earth-like elevations and
@@ -43,11 +56,15 @@ real-world units in the HUD — metric by default, or `--units us` for imperial.
 | A / D | Rotate (spin) the view |
 | Q / E | Tilt (top-down ↔ horizon) |
 | Shift | Move faster (hold) |
+| T | Guided tour — a relaxing autopilot (any control key takes back over) |
 | R | Teleport to a random spot on the surface |
 | P | Print current location & seed (real units) |
 | G | Toggle wireframe |
 | Esc | Open the overlay (**HELP** / **GRAPHICS** tabs) |
 | Cmd-Q / Ctrl-Q | Quit (or close the window) |
+
+If you don't touch anything for ~5 seconds after launch, the guided tour starts on
+its own (attract mode); any key takes back control.
 
 ### Graphics settings (Esc → GRAPHICS tab)
 
@@ -98,10 +115,14 @@ seed, so every world is lit differently.
 | Module | Responsibility |
 |--------|----------------|
 | `planet` | Seeded source of truth: height field, biomes, sun, atmosphere |
+| `flora` | Per-planet procedural species library, grown from the seed |
 | `mesh` | Planet samples → triangles, skirts, vegetation instances, base meshes |
 | `lod` | Cube-sphere quadtree selection + background meshing pool |
 | `camera` | The seamless orbit↔surface control continuum |
+| `tour` | The guided "attract mode" autopilot camera |
 | `gfx` | wgpu renderer (sky / terrain / vegetation / water) |
+| `settings` · `overlay` | Graphics presets/knobs; the ESC menu + HUD (engine-free bitmap text) |
+| `audio` · `units` · `logging` | Embedded soundtrack · real-world unit display · shared-file logging |
 
 Each system queries `Planet` for ground truth without touching the others —
 the seam along which the roadmap (animals, NPCs, manipulable objects, weather)

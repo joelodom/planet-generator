@@ -889,7 +889,7 @@ mod tests {
 
     /// The recursively-grown species meshes stay well-formed and bounded: the
     /// detail is baked once per species, but a single mesh must stay affordable to
-    /// instance (no vegetation LOD yet — see FLORA_PHOTOREALISM_PLAN.md).
+    /// instance (no vegetation LOD yet — see the flora items in `BACKLOG.md`).
     #[test]
     fn species_meshes_are_bounded_and_well_formed() {
         // Cap on any one species' geometry — recursion/leaf counts must not blow up.
