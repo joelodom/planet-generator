@@ -13,25 +13,31 @@ optimizer, read the notes/logs it writes and edit THIS file by hand:
     optimizer_log.txt         — terse per-iteration log lines
     ~/Public/planet-explorer/ — timestamped A/B sample renders + STATUS.md
 
-How the loop works — A/B, judge-driven, with a feedback loop
-------------------------------------------------------------
+How the loop works — research-driven, A/B-gated
+-----------------------------------------------
 We do NOT score trees on an absolute rubric and we do NOT tell the model what a
-good tree looks like. Each iteration is a head-to-head:
+good tree looks like. Each iteration grounds its improvement in real, published
+technique, then proves it with a head-to-head:
 
-  A = the current best tree.   B = a candidate the model just produced.
-  1. Render A and B over a FIXED PANEL of seeds/angles (paired, same camera).
-  2. A JUDGE model looks at each A/B pair and picks the one that is MORE
-     PHOTOREALISTIC — just "more like a real photograph of a real tree". No
-     rubric, no checklist; the AI decides what "better" means. Presentation order
-     is randomized per pair to cancel position bias; we tally the votes.
-  3. B replaces A only if B wins the panel by a margin (more votes, by >= a
-     threshold). Otherwise B is reverted.
-  4. FEEDBACK LOOP: the judge also explains WHY the winner looked better and what
-     the loser lacked. That explanation is fed into the next code-rewrite, so the
-     improver iterates on real visual feedback plus its own creative ideas.
+  A = the current best tree.   B = the candidate this iteration produces.
+  1. RENDER A over a FIXED PANEL of seeds/angles (paired, same camera).
+  2. CRITIQUE + RESEARCH: a session reads A's renders, names the single biggest
+     remaining photorealism weakness, and uses real WebSearch/WebFetch to find a
+     PROVEN procedural-foliage technique that fixes it within this renderer's
+     limits (geometry + vertex color only — no textures/shaders), writing an
+     implementation plan with cited sources. This is the key step: ideation is
+     grounded in the large body of online work (SpeedTree, space colonization,
+     L-systems, phyllotaxis, …) instead of the model guessing unaided.
+  3. IMPLEMENT: a second session applies that ONE technique to src/flora.rs → B.
+  4. RENDER B over the same panel; a JUDGE picks the MORE PHOTOREALISTIC of each
+     pair (no rubric; the AI decides what "better" is; order randomized to cancel
+     position bias). B replaces A only if it wins by VOTE_MARGIN net votes.
+  5. The judge's written reason feeds the NEXT round's research.
 
-Periodically the current best is also judged against the ORIGINAL tree (the
-"anchor") to prove cumulative progress, not just local wins.
+So: current state → render → feedback+research → implement → render → A/B keep-or-
+revert → (the feedback drives the next research). Periodically the best is also
+judged against the ORIGINAL (the "anchor") to prove cumulative — not just local —
+progress.
 
 Why A/B instead of absolute scores: an earlier absolute-scoring run re-scored the
 *same* tree from 24.5 to 28.5 and could never tell a real change from noise — so
@@ -78,9 +84,16 @@ RENDER_BIN     = PROJECT_ROOT / "target" / "release" / "planet-explorer"
 # routes straight to Form::Broadleaf regardless of seed, so every panel view is a
 # broadleaf. Switch this string to retarget the experiment to another object.
 RENDER_OBJECT  = "broadleaf"
-RENDER_W       = 512   # sample image width  (px)
-RENDER_H       = 512   # sample image height (px)
-RENDER_TIMEOUT = 120   # seconds per single view
+# Render BIG. At 512² the renders were visibly grainy/aliased — a dead "this is a
+# low-res 3D render" giveaway that has nothing to do with the tree itself and that
+# the A/B judge can't even see (it's identical in both images, so it never affects
+# a comparison). Rendering large and letting the viewer / vision model downsample
+# supersamples the jaggies away, so both the human (PNGs in ~/Public) and the judge
+# see the actual form rather than pixel mush. ~1.5k sits near the vision model's
+# effective sampling ceiling while staying crisp for a human on a real monitor.
+RENDER_W       = 1536  # sample image width  (px)
+RENDER_H       = 1536  # sample image height (px)
+RENDER_TIMEOUT = 180   # seconds per single view (higher res → allow a little longer)
 
 # Fixed evaluation panel: (seed, yaw_deg, pitch_deg). A and B are always rendered
 # on THIS set, so the head-to-head is paired (same individual, same camera). The
@@ -108,10 +121,11 @@ ANCHOR_EVERY = 5
 BOLD_STREAK = 3
 
 # ── Model / sessions ─────────────────────────────────────────────────────────
-CLAUDE_MODEL   = "opus"   # alias → latest Opus on the subscription login
-JUDGE_TIMEOUT  = 300      # seconds for one A/B judging session
-MODIFY_TIMEOUT = 600      # seconds for one code-rewrite session
-CLAUDE_RETRIES = 3        # attempts per model session before giving up the step
+CLAUDE_MODEL     = "opus"  # alias → latest Opus on the subscription login
+RESEARCH_TIMEOUT = 720     # seconds for one critique+web-research planning session
+IMPLEMENT_TIMEOUT = 600    # seconds for one code-implementation session
+JUDGE_TIMEOUT    = 300     # seconds for one A/B judging session
+CLAUDE_RETRIES   = 3       # attempts per model session before giving up the step
 RETRY_SLEEP    = 30       # seconds between model retries
 SKIP_SLEEP     = 30       # seconds to wait after skipping an iteration (avoid a hot loop)
 ITER_SLEEP     = 2        # seconds between successful iterations
@@ -131,6 +145,7 @@ RENDERS       = PROJECT_ROOT / "renders"
 SNAPSHOTS     = PROJECT_ROOT / "snapshots"
 A_DIR         = RENDERS / "current_best"   # renders of A (current best)
 B_DIR         = RENDERS / "candidate"      # renders of B (candidate)
+RESEARCH_PLAN = RENDERS / "research_plan.md"  # latest critique + researched technique + sources
 ANCHOR_DIR    = RENDERS / "anchor"         # renders of the original tree
 ANCHOR_CMP_DIR = RENDERS / "anchor_current"  # current-best renders for the anchor check
                                              # (separate dir so A_DIR stays valid for publish)
@@ -311,9 +326,12 @@ def judge_ab(a_panel, b_panel, out_path: Path, salt: int):
         except Exception:
             pass
     prompt = (
-        f"Below are {len(orient)} PAIRS of rendered images. In each pair, FIRST and SECOND are two "
-        f"versions of the SAME procedurally generated tree, from the SAME camera:\n\n{listing}\n\n"
-        "Read every image. For each pair, decide which one looks MORE PHOTOREALISTIC — simply, more "
+        f"Below are {len(orient)} PAIRS of images. Each image is an offscreen RENDER (a snapshot) of a "
+        "procedurally generated 3D TREE MODEL — a real-time graphics render of one tree on flat ground "
+        "under a fixed sky and sun, NOT a photograph. Within a pair, FIRST and SECOND are the SAME 3D "
+        "model rendered from the SAME camera, resolution, and lighting; ONLY the underlying geometry and "
+        f"vertex colors differ, so judge that difference.\n\n{listing}\n\n"
+        "Read every image. For each pair, decide which RENDER looks MORE PHOTOREALISTIC — simply, more "
         "like an actual PHOTOGRAPH of a real tree. Use your own eye; there is NO rubric and no "
         "checklist — you decide what 'better' means. If a pair is genuinely indistinguishable you "
         "may answer 'tie', but prefer to pick one.\n\n"
@@ -362,70 +380,100 @@ def _tally(data, orient, a_panel):
 # Code-rewrite session — feedback-driven, NON-prescriptive (model decides "better")
 # ──────────────────────────────────────────────────────────────────────────────
 
-def modify(state, change_path: Path) -> bool:
+def research(state, a_panel, plan_path: Path):
+    """CRITIQUE + RESEARCH (vision + web). Look at the current best tree, name the
+    highest-impact remaining weakness, web-research a PROVEN procedural-foliage
+    technique that fixes it within this renderer's geometry/vertex-color limits, and
+    write a concrete implementation plan. Writes NO code. Returns the plan text
+    (which is also the human-readable feedback), or None if it produced nothing."""
+    if plan_path.exists():
+        try:
+            plan_path.unlink()
+        except Exception:
+            pass
+    listing = "\n".join(f"  {i}: {p}" for i, (p, _) in enumerate(a_panel))
+    fb = state.get("last_feedback", "").strip()
+    tried = state.get("tried_changes", [])[-15:]
+    tried_block = "\n".join(
+        f"  - [{t.get('result','?')}] {t.get('desc','')}" for t in tried) or "  (none yet)"
+    prompt = (
+        "You are improving the photorealism of a procedurally generated BROADLEAF tree in a Rust + wgpu "
+        "renderer. In THIS step you do NOT write code — you CRITIQUE the current tree, RESEARCH a proven "
+        "technique to fix its biggest flaw, and write an implementation plan for the next step to follow.\n\n"
+        f"Renders of the CURRENT tree (read them):\n{listing}\n\n"
+        + (f"Most recent A/B judge feedback on it:\n\"\"\"\n{fb}\n\"\"\"\n\n" if fb else "")
+        + "Techniques already tried (newest last — do NOT repeat these; note that color/shading tweaks "
+        "have been heavily explored, so favor the highest-impact remaining weakness even if it is "
+        "STRUCTURAL and harder):\n" + tried_block + "\n\n"
+        "STEP 1 — CRITIQUE: in 1-2 sentences, name the SINGLE highest-impact remaining reason this tree "
+        "does not look like a photograph of a real tree.\n\n"
+        "STEP 2 — RESEARCH (use the WebSearch and WebFetch tools — actually search the web): find PROVEN, "
+        "established techniques for procedurally generating realistic trees/foliage that address that "
+        "weakness — e.g. SpeedTree / GDC talks, academic papers (space colonization, L-systems, "
+        "phyllotaxis / golden-angle leaf layout), Sebastian Lague and other write-ups. Read enough to "
+        "understand HOW the technique works, and cite the real sources you used (titles + URLs).\n\n"
+        "HARD CONSTRAINTS — the technique MUST fit this renderer (reject anything that doesn't):\n"
+        "  * You may only change GEOMETRY and PER-VERTEX COLOR in src/flora.rs. There are NO textures, NO "
+        "alpha-test, NO shader edits; lighting is a fixed diffuse+ambient+sky model. So the technique must "
+        "be expressible as mesh + vertex color — e.g. more/overlapping/crossed-quad leaf cards, leaf "
+        "phyllotaxis/placement, canopy silhouette & normal shaping, baked AO and vertex-color gradients, "
+        "space-colonization / L-system branching, bark vertex-color noise, trunk taper/gnarl. (Soft, "
+        "feathered leaf edges can only be APPROXIMATED with more, smaller, overlapping cards — not alpha.)\n"
+        "  * Deterministic (seeded; add new RNG draws only at the END of a builder), under 30k verts per "
+        "species, no magic numbers (named SCREAMING_SNAKE consts).\n\n"
+        "STEP 3 — PLAN: write ONLY the plan (Markdown) to this exact path:\n  " + str(plan_path) + "\n"
+        "with these sections:\n"
+        "  ## Weakness  — the one you are fixing\n"
+        "  ## Technique  — name + 1-2 sentence summary of how it works\n"
+        "  ## Sources  — titles + URLs you actually read\n"
+        "  ## Implementation in flora.rs  — which function(s); exactly what to add/change; specific, "
+        "bounded, surgical — ONE increment that fits in a single edit and keeps the build green\n"
+        "  ## Expected visual effect\n"
+        "Pick ONE technique and keep the implementation increment minimal."
+    )
+    if run_claude(prompt, RESEARCH_TIMEOUT, "research") and plan_path.exists():
+        txt = plan_path.read_text(encoding="utf-8", errors="ignore").strip()
+        if txt:
+            return txt
+    log("research produced no plan; implement will fall back to the latest judge feedback", "WARN")
+    return None
+
+
+def implement(state, plan, change_path: Path) -> bool:
+    """Implement ONE researched technique in src/flora.rs (target-only; the caller guards scope)."""
     if change_path.exists():
         try:
             change_path.unlink()
         except Exception:
             pass
-
-    fb = state.get("last_feedback", "").strip()
-    verdict = state.get("last_verdict", "")
-    if fb:
-        feedback_block = (
-            "FEEDBACK from the most recent head-to-head (a judge compared your previous attempt "
-            f"against the current best, and the previous attempt was {verdict}):\n"
-            f"\"\"\"\n{fb}\n\"\"\"\n"
-            "Treat this as visual feedback to build on — but you are free to disagree and try your "
-            "own idea.\n\n"
-        )
+    if plan:
+        guidance = ("Implement the RESEARCHED PLAN below. Stay faithful to its technique (you may refine "
+                    "details) as ONE minimal, self-contained increment:\n\"\"\"\n" + plan + "\n\"\"\"\n\n")
     else:
-        feedback_block = "This is the first attempt — there is no comparison feedback yet.\n\n"
-
-    tried = state.get("tried_changes", [])[-12:]
-    if tried:
-        tried_block = "Changes already tried (newest last, with outcome — don't just repeat a "
-        tried_block += "rejected one verbatim; iterate or try something new):\n"
-        tried_block += "\n".join(
-            f"  - [{t.get('result','?')}] {t.get('desc','')}" for t in tried) + "\n\n"
-    else:
-        tried_block = ""
-
+        fb = state.get("last_feedback", "").strip()
+        guidance = (("No research plan was produced this round. Use this feedback plus your own judgment:\n"
+                     "\"\"\"\n" + fb + "\n\"\"\"\n\n") if fb else
+                    "No plan or feedback yet — make one sensible, surgical improvement.\n\n")
     streak = state.get("loss_streak", 0)
-    nudge = ("You have lost several head-to-heads in a row, so small tweaks aren't working — make a "
-             "BOLDER, materially different change this time.\n\n") if streak >= BOLD_STREAK else ""
-
+    nudge = ("You have lost several head-to-heads in a row — make a bolder, materially different change.\n\n"
+             if streak >= BOLD_STREAK else "")
     prompt = (
-        "You are iteratively improving a procedurally generated BROADLEAF tree in a Rust + wgpu "
-        "renderer (planet-explorer) so it looks MORE PHOTOREALISTIC — just better, more like a real "
-        "photograph of a real tree. YOU decide what 'better' means and how to get there; there is no "
-        "checklist and nobody will tell you what a tree should look like. Be creative.\n\n"
+        "You are improving a procedurally generated BROADLEAF tree in a Rust + wgpu renderer so it looks "
+        f"MORE photorealistic. Implement ONE concrete change in `{SRC_TARGET}`.\n\n"
         "STRICT SCOPE — READ CAREFULLY:\n"
-        f"  * You may edit ONLY `{SRC_TARGET}`. Touch NO other file. The broadleaf tree is what gets\n"
-        "    judged, so improve how IT looks (its builder and the leaf/branch/bark code it uses);\n"
-        "    don't bother retuning other species.\n"
-        "  * NEVER edit evolve.py or tree_optimizer.py (the optimizer harness), any other *.py,\n"
-        "    any *.md, Cargo.*, or shaders. Edits outside the target are auto-reverted.\n"
-        "  * Do NOT run cargo, git, package scripts, or tree_optimizer.py. Make the SOURCE change\n"
-        "    only — the harness builds it, renders it, judges it against the current best, and keeps\n"
-        "    or reverts it.\n\n"
-        "RESPECT `CLAUDE.md`:\n"
-        "  * No magic numbers — every new tuning literal must be a SCREAMING_SNAKE_CASE `const` with\n"
-        "    a short unit/intent comment, hoisted near the top of its module/impl.\n"
-        "  * Determinism — same seed must yield an identical mesh. Do NOT reorder or remove existing\n"
-        "    RNG draws; only add new draws at the END of a builder (or derive from existing values).\n"
-        "  * Stay under the 30,000-vertex-per-species cap. Lighting/shaders are fixed, so work in\n"
-        "    geometry and vertex color.\n\n"
-        f"{feedback_block}"
-        f"{tried_block}"
-        f"{nudge}"
-        "Make ONE creative, surgical change to the broadleaf tree in "
-        f"`{SRC_TARGET}` that you believe will make it look more photorealistic. Keep it minimal, "
-        "self-contained, and green.\n\n"
-        f"Finally, write to `{change_path}` a ONE-LINE plain-text summary of what you changed AND "
-        "your hypothesis for why it will look more realistic."
+        f"  * Edit ONLY `{SRC_TARGET}`. Touch NO other file. Improve the broadleaf tree (its builder and the "
+        "leaf/branch/bark code it uses); leave other species alone.\n"
+        "  * NEVER edit evolve.py, tree_optimizer.py, any other *.py, *.md, Cargo.*, or shaders — edits "
+        "outside the target are auto-reverted. Do NOT run cargo/git/the optimizer; just edit the source.\n\n"
+        "RESPECT `CLAUDE.md`: no magic numbers (named SCREAMING_SNAKE consts); determinism (do NOT reorder/"
+        "remove existing RNG draws — add new draws only at the END of a builder, or derive from existing "
+        "values); stay under 30k verts/species; lighting/shaders are fixed, so work in geometry & vertex "
+        "color.\n\n"
+        + guidance + nudge +
+        "Make the change minimal, self-contained, green, and faithful to the planned TECHNIQUE. Then write "
+        f"to `{change_path}` a ONE-LINE plain-text summary naming the technique and what you changed."
     )
-    return run_claude(prompt, MODIFY_TIMEOUT, "modify")
+    return run_claude(prompt, IMPLEMENT_TIMEOUT, "implement")
 
 
 def _read_change(change_file: Path) -> str:
@@ -588,10 +636,11 @@ def _copy(src: Path, dst: Path) -> None:
         log(f"publish copy failed ({dst.name}): {exc}", "WARN")
 
 
-def publish(iteration, generation, a_panel, b_panel, verdict, kept, change_desc, anchor_note):
+def publish(iteration, generation, a_panel, b_panel, verdict, kept, change_desc, anchor_note, plan=""):
     """Every evaluation, drop into ~/Public: the A image, the B image, and a Markdown
-    record of the comparison (code change + judge feedback). Also refresh the live
-    STATUS.md and a side-by-side `latest/` panel. Logs exactly what it dropped."""
+    record of the comparison (researched technique + sources + code change + judge
+    feedback). Also refresh the live STATUS.md and a side-by-side `latest/` panel.
+    Logs exactly what it dropped."""
     ensure_public()
     # Side-by-side current panel (overwritten each iteration) for live viewing.
     for f in PUBLIC_LATEST.glob("*.png"):
@@ -616,7 +665,7 @@ def publish(iteration, generation, a_panel, b_panel, verdict, kept, change_desc,
     try:
         (PUBLIC_DIR / md_name).write_text(
             _comparison_md_text(iteration, generation, verdict, kept, change_desc,
-                                anchor_note, a_name, b_name), encoding="utf-8")
+                                anchor_note, a_name, b_name, plan), encoding="utf-8")
         os.chmod(PUBLIC_DIR / md_name, 0o644)
     except Exception as exc:
         log(f"could not write comparison record {md_name}: {exc}", "WARN")
@@ -663,8 +712,9 @@ def _status_text(iteration, generation, verdict, kept, change_desc, anchor_note)
 
 
 def _comparison_md_text(iteration, generation, verdict, kept, change_desc, anchor_note,
-                        a_name, b_name) -> str:
-    """The per-iteration record dropped in ~/Public: code change + judge feedback."""
+                        a_name, b_name, plan="") -> str:
+    """The per-iteration record dropped in ~/Public: researched technique + sources +
+    code change + judge feedback."""
     rows = "\n".join(
         f"| seed {pv['seed']} | yaw {pv['yaw']} | pitch {pv['pitch']} | "
         f"{'**B (candidate)**' if pv['winner']=='B' else ('A (best)' if pv['winner']=='A' else 'tie')} |"
@@ -681,8 +731,10 @@ def _comparison_md_text(iteration, generation, verdict, kept, change_desc, ancho
         f"+{VOTE_MARGIN}, got {net:+d}\n"
         f"- **Improvements kept so far (generation):** {generation}\n"
         f"{('- **Cumulative vs ORIGINAL:** ' + anchor_note + chr(10)) if anchor_note else ''}"
-        f"\n## Code change tried (B vs the current best A)\n\n{change_desc}\n\n"
-        "## Judge feedback — why one looked more photorealistic (this drives the next rewrite)\n\n"
+        f"\n## Research that drove this change (critique → web research → plan)\n\n"
+        f"{plan.strip() if plan else '(no research plan this round — fell back to judge feedback)'}\n\n"
+        f"## Code change implemented (B vs the current best A)\n\n{change_desc}\n\n"
+        "## Judge feedback — why one looked more photorealistic (feeds the next round's research)\n\n"
         f"{verdict['reason'] or '(none given)'}\n\n"
         "## Per-view verdict\n\n"
         f"| seed | yaw | pitch | more photorealistic |\n|---|---|---|---|\n{rows}\n\n"
@@ -704,24 +756,29 @@ This optimizer is **fixed harness code**: neither `tree_optimizer.py` nor
 *optimizer*, do NOT expect it to improve itself — read the data it leaves and edit
 `tree_optimizer.py` by hand:
 
-- **`optimizer_history.jsonl`** — one record per iteration: the change, the A/B
-  vote tally, every per-view winner, and the judge's reason. Analyze this to ask:
-  are candidates winning? is the vote margin right? is the judge consistent?
+- **`optimizer_history.jsonl`** — one record per iteration: the researched plan, the
+  change, the A/B vote tally, every per-view winner, and the judge's reason. Analyze
+  this to ask: is the research surfacing real techniques? are candidates winning? is
+  the vote margin right? is the judge consistent?
 - **`optimizer_log.txt`** — terse per-iteration lines.
 - **`~/Public/planet-explorer/`** — labeled A (best) vs B (candidate) sample PNGs +
-  `STATUS.md`, so the trees can be eyeballed from another account while it runs.
+  a per-iteration `.md` (researched technique + sources + judge feedback) + `STATUS.md`.
 
-**The method:** each iteration is a head-to-head. The current best (A) and a new
-candidate (B) are rendered over the same fixed panel of seeds/angles; a judge
-picks the more photorealistic of each pair (no rubric — it decides what "better"
-is), with presentation order randomized to cancel position bias. B replaces A only
-if it wins by `VOTE_MARGIN` net votes. The judge's written reason becomes the
-**feedback** for the next rewrite, so the improver iterates on real visual signal
-plus its own ideas. Every `ANCHOR_EVERY` kept improvements the best is also judged
-against the ORIGINAL tree to confirm cumulative progress.
+**The method — research-driven A/B:** each iteration (1) renders the current best,
+(2) a CRITIQUE+RESEARCH session reads those renders, names the biggest remaining
+weakness, and uses real WebSearch/WebFetch to find a PROVEN procedural-foliage
+technique that fits this renderer (geometry + vertex color only), writing a plan
+with sources; (3) an IMPLEMENT session applies that ONE technique to `src/flora.rs`;
+(4) the candidate is rendered and a JUDGE picks the more photorealistic of each
+paired view (no rubric; order randomized to cancel position bias). B replaces A only
+if it wins by `VOTE_MARGIN` net votes. The judge's reason feeds the NEXT round's
+research. Every `ANCHOR_EVERY` kept improvements the best is judged against the
+ORIGINAL to confirm cumulative progress.
 
-If real wins keep getting rejected, lower `VOTE_MARGIN` or add panel views; if kept
-changes still look like noise, raise it or add a second judge vote.
+Tuning: if real wins keep getting rejected, lower `VOTE_MARGIN` or add panel views;
+if the research keeps proposing the same thing, it's in `tried_changes` — check the
+plans in the `.md` records. Research uses the `claude` CLI's web tools; if a run has
+no web access the research step degrades to the model's own knowledge.
 """
 
 
@@ -786,8 +843,9 @@ def default_state() -> dict:
         "generation": 0,            # number of KEPT improvements (the progress metric)
         "loss_streak": 0,
         "focus": RENDER_OBJECT,
-        "last_feedback": "",        # judge's reasoning carried into the next rewrite
+        "last_feedback": "",        # judge's reasoning carried into the next round's research
         "last_verdict": "(none yet)",
+        "current_plan": "",         # latest researched technique + sources + implementation plan
         "tried_changes": [],        # [{desc, result}]
         "history": [],
         "journal": [],
@@ -831,7 +889,7 @@ def save_state(state: dict) -> None:
 # Iteration bookkeeping
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _record(iteration, change, build_ok, decision, verdict, reverted):
+def _record(iteration, change, build_ok, decision, verdict, reverted, plan=""):
     rec = {
         "iteration": iteration,
         "ts": datetime.datetime.now().isoformat(),
@@ -839,6 +897,7 @@ def _record(iteration, change, build_ok, decision, verdict, reverted):
         "build_ok": build_ok,
         "decision": decision,
         "out_of_scope_reverted": reverted or [],
+        "research_plan": plan or "",
     }
     if verdict:
         rec.update({
@@ -943,13 +1002,28 @@ def run_iteration(state: dict) -> dict:
         state["anchor"]["captured"] = True
         save_state(state)
 
-    # 1. Snapshot A, then rewrite → B (feedback-driven; target-only, guarded).
-    snap = snapshot_target(it)
-    pre_src = snapshot_src_bytes()  # pre-session state of all src + harness files
-    CANDIDATE_CHANGE = B_DIR
-    CANDIDATE_CHANGE.mkdir(parents=True, exist_ok=True)
-    change_file = CANDIDATE_CHANGE / "change.txt"
-    modify(state, change_file)
+    # Snapshot the full pre-iteration source BEFORE any model session, so neither
+    # research nor implement can change anything outside src/flora.rs — and research
+    # (which must NOT write code) can't change even that.
+    snap = snapshot_target(it)            # flora.rs baseline (the current best)
+    pre_src = snapshot_src_bytes()        # all of src/ + the protected .py harness files
+
+    # 1. CRITIQUE + RESEARCH: read the current tree, find the top weakness, and web-research
+    #    a proven procedural-foliage technique to fix it → an implementation plan. Read-only:
+    #    undo anything the session touched (harness files and even flora.rs).
+    plan = research(state, a_panel, RESEARCH_PLAN)
+    stray = guard_out_of_scope(pre_src)   # research must not edit harness/other src
+    restore_from(snap)                    # …or flora.rs
+    if stray:
+        log(f"research touched out-of-scope files (reverted): {stray}", "WARN")
+    state["current_plan"] = plan or ""
+    if plan:
+        log(f"ITER {it}: research plan ready ({len(plan)} chars) — implementing")
+
+    # 2. IMPLEMENT the researched plan in flora.rs → B (target-only; guard reverts the rest).
+    B_DIR.mkdir(parents=True, exist_ok=True)
+    change_file = B_DIR / "change.txt"
+    implement(state, plan, change_file)
     reverted = guard_out_of_scope(pre_src)
     if reverted:
         log(f"scope guard reverted out-of-target edits: {reverted}", "WARN")
@@ -965,7 +1039,7 @@ def run_iteration(state: dict) -> dict:
                                   "Make a simpler, self-contained change that builds cleanly.")
         state["last_verdict"] = "build failed"
         log(f"ITER {it}: BUILD_FAILED — reverted. {change_desc}", "WARN")
-        rec = _record(it, change_desc, False, "BUILD_FAILED", None, reverted)
+        rec = _record(it, change_desc, False, "BUILD_FAILED", None, reverted, plan)
         _finish(state, rec, change_desc, kept=False)
         return state
 
@@ -1022,9 +1096,9 @@ def run_iteration(state: dict) -> dict:
             anchor_note = anchor_check(state, cur)
         state["anchor"]["since_check"] = 0
 
-    rec = _record(it, change_desc, True, "KEPT" if kept else "REJECTED", verdict, reverted)
+    rec = _record(it, change_desc, True, "KEPT" if kept else "REJECTED", verdict, reverted, plan)
     _finish(state, rec, change_desc, kept)
-    publish(it, state["generation"], a_panel, b_panel, verdict, kept, change_desc, anchor_note)
+    publish(it, state["generation"], a_panel, b_panel, verdict, kept, change_desc, anchor_note, plan)
     return state
 
 
