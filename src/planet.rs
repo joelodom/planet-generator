@@ -145,13 +145,14 @@ impl Planet {
             .set_frequency(0.9)
             .set_persistence(0.5)
             .set_lacunarity(2.1);
-        // Higher-frequency ridged noise makes steep, local mountain ranges (rather
-        // than continent-wide gentle swells), so peaks read as real rocky/snowy
-        // mountains with dramatic relief.
+        // Ridged noise for mountains. The base frequency sets the size of a
+        // mountain range: ~freq cycles across the planet, so freq 22 → ranges
+        // ~290 km across — clearly visible as peaks from flying altitude (a low
+        // frequency just makes one continent-wide swell that reads as flat).
         let mountains = RidgedMulti::<Perlin>::new(sub(&mut s))
-            .set_octaves(6)
-            .set_frequency(4.2)
-            .set_lacunarity(2.4);
+            .set_octaves(7)
+            .set_frequency(34.0)
+            .set_lacunarity(2.2);
         let detail = Fbm::<Perlin>::new(sub(&mut s))
             .set_octaves(5)
             .set_frequency(13.0)
@@ -199,12 +200,12 @@ impl Planet {
         // Ridged mountains, only meaningful on land. Sharper power + higher weight
         // gives prominent ranges with steep flanks.
         let m = self.mountains.get(p) as f32;
-        let mountains = (m * 0.5 + 0.5).powf(1.7) * land;
+        let mountains = (m * 0.5 + 0.5).powf(1.4) * land;
 
         // Fine detail everywhere (surface roughness as you zoom in).
         let detail = self.detail.get(p) as f32 * 0.08;
 
-        let h_unit = continent * 0.5 + mountains * 1.05 + detail;
+        let h_unit = continent * 0.5 + mountains * 1.25 + detail;
         h_unit * HEIGHT_SCALE
     }
 

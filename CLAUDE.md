@@ -1,5 +1,21 @@
 # planet-generator
 
+## Coding conventions — IMPORTANT
+
+**No magic numbers.** Tuning values and any non-obvious literal must be a
+`const` with a `SCREAMING_SNAKE_CASE` name and a short comment on its
+units/intent, hoisted near the top of its module (or the relevant `impl`). This
+applies to Rust *and* the WGSL shaders (use `const NAME: T = ...;`). It matters
+most for the tuning-heavy code: noise frequencies/weights and biome thresholds
+(`planet.rs`), camera rates/clamps and tour phase durations/distances/speeds
+(`camera.rs`/`tour.rs`), LOD factors (`lod.rs`), vegetation density/sizes and
+skirt depth (`mesh.rs`), and lighting/fog/wave/atmosphere constants (shaders).
+
+Obvious exceptions that may stay inline: identity/zero values (`0.0`, `1.0`),
+halving/doubling (`0.5`, `2.0`), small structural integers (loop bounds, array
+indices, `+ 1`), and standard math (`PI`, `255` for a byte). When in doubt, name
+it. New code must follow this; don't reintroduce bare tuning literals.
+
 ## Target platforms — IMPORTANT
 
 Developed on **macOS / Apple Silicon (Metal)**, but **will soon also run on
