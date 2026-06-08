@@ -30,11 +30,14 @@ shared folder** — never `cargo run`.
   world-readable/executable, and copies it to **`/Users/Shared/Planet Explorer.app`**
   — the shared drop point the GUI account launches from. (There is no
   `/Users/Shared/Applications`; the `.app` lives directly in `/Users/Shared/`.)
-- **Whenever the user will "run/test" a change, re-run `./package_macos.sh`** so
-  the shared app reflects it. The bundle's version carries the git short hash with
-  a `-dirty` suffix for uncommitted trees, so the user can confirm the build
-  they're running (`".../planet-explorer" --version`, or the startup line in the
-  log).
+- **Always package after building — every build, no exceptions.** The packaged
+  `.app` in `/Users/Shared/` is how the user tests, so a bare `cargo build` they
+  can't launch is never the finish line: whenever you build (to verify a change,
+  after an edit, etc.), run **`./package_macos.sh`** so the shared app reflects it.
+  Don't wait to be asked, and don't stop at "it compiles." The bundle's version
+  carries the git short hash with a `-dirty` suffix for uncommitted trees, so the
+  user can confirm the build they're running (`".../planet-explorer" --version`,
+  or the startup line in the log).
 - **What you CAN verify headlessly here:** `cargo test` (the GPU smoke test runs
   if an adapter is present, else skips), `cargo clippy`, and `--version` (it exits
   before any window/GPU). Actual visuals are the user's to check from the GUI

@@ -1,48 +1,75 @@
 //! Runtime graphics settings, adjustable from the ESC overlay's GRAPHICS tab, so
-//! the same build can run lean on a cheap laptop GPU and crank way up on a 5090.
+//! the same build can run lean on a basic laptop GPU and crank all the way up on a
+//! 5090. There is no longer a single opaque "detail" master: every parameter the
+//! renderer actually consumes is exposed on its own row, in real units, so nothing
+//! is hidden behind a percentage.
 //!
-//! Two knobs:
-//!   - **Detail** — a single master that drives LOD subdivision, terrain mesh
-//!     resolution, and vegetation (distance + density) together. Future "detail
-//!     object" types should derive from it too, rather than adding sliders.
-//!   - **Memory budget** — a real memory target (MB/GB) for resident geometry;
-//!     the resident-chunk cap is derived from it and the current mesh resolution,
-//!     so the same budget holds fewer chunks at higher detail.
+//! The exposed parameters:
+//!   - **Geometry LOD** (`split_factor`) — how eagerly the quadtree subdivides
+//!     (a chunk splits while the camera is within this many of its own edge
+//!     lengths). Higher = finer terrain persists farther out. *Live.*
+//!   - **Terrain mesh** (`mesh_res`) — quads per chunk edge. *Rebuild.*
+//!   - **Plant distance** (`veg_min_level`) — the coarsest quadtree level that gets
+//!     vegetation; lower level = bigger/farther chunks get plants = longer plant
+//!     draw distance. Shown as the approximate real-world reach. *Rebuild.*
+//!   - **Plant density** (`veg_density`) — areal vegetation density, shown as
+//!     plants/km². *Rebuild.*
+//!   - **Memory budget** (`mem_budget_mb`) — resident-geometry target; the renderer
+//!     evicts cached chunks to stay under it. *Live.*
 //!
-//! LOD and the memory budget apply live (read fresh each frame); mesh resolution
-//! and vegetation are baked into chunk geometry, so they take effect on a rebuild
-//! when the menu closes.
+//! "Live" parameters are read fresh each frame; "Rebuild" parameters are baked into
+//! chunk geometry, so they take effect on a re-mesh when the menu closes (see
+//! [`Graphics::rebuild_signature`]).
 
-// Master-detail end points. `detail` is 0..1; these are its min/max effects.
-// Maxed out is intentionally punishing (a laptop should struggle on Ultra while a
-// high-end GPU looks great).
-const SPLIT_MIN: f32 = 1.3; // LOD split factor (higher = finer, more chunks)
-const SPLIT_MAX: f32 = 6.5;
-const GRID_MIN: u32 = 16; // terrain quads per chunk side
-const GRID_MAX: u32 = 88;
-const VEG_LEVEL_NEAR: u32 = 15; // veg only on small/near chunks (low detail) ...
-const VEG_LEVEL_FAR: u32 = 11; // ... out to bigger/farther chunks (high detail)
-const DENSITY_MIN: u32 = 30; // vegetation attempts per chunk
-// Vegetation is instanced now (each plant is ~80 bytes, not a baked mesh), so density
-// is cheap on GPU memory again. The CPU cost of placement still scales with this.
-const DENSITY_MAX: u32 = 750;
+use crate::mesh::VEG_REFERENCE_AREA;
+use crate::planet::{METERS_PER_UNIT, PLANET_RADIUS};
+use crate::units::{self, Units};
 
-const DETAIL_STEP: f32 = 0.05;
+// --- Geometry LOD (split factor): dimensionless. A chunk subdivides while the
+// camera is within SPLIT × its world-space edge length. Higher = more chunks,
+// finer geometry at distance. Min is the laptop floor; max pushes a 5090. ---
+const SPLIT_MIN: f32 = 1.8;
+const SPLIT_MAX: f32 = 10.0;
+const SPLIT_STEP: f32 = 0.5;
 
-// Memory budget for resident geometry, in MB. The low end suits a 2–4 GB laptop
-// GPU; the high end gives a 5090 room to keep a lot of fine geometry resident.
+// --- Terrain tessellation: quads per chunk edge (the mesh is GRID×GRID quads). ---
+const GRID_MIN: u32 = 24;
+const GRID_MAX: u32 = 96;
+const GRID_STEP: u32 = 2;
+
+// --- Vegetation reach: the minimum quadtree level a chunk must reach before it is
+// populated with plants. LOWER level = larger/farther chunks get vegetation = plants
+// drawn farther from the camera. So detail rises as this value falls. ---
+const VEG_LEVEL_NEAR: u32 = 15; // Low: plants only on the smallest, nearest chunks
+const VEG_LEVEL_FAR: u32 = 11; // Ultra: plants out toward the horizon
+
+// --- Vegetation areal density: raw placement attempts per VEG_REFERENCE_AREA patch
+// (the unit the mesher consumes). Surfaced to the user as plants/km². ---
+const DENSITY_MIN: u32 = 100;
+const DENSITY_MAX: u32 = 1000;
+const DENSITY_STEP: u32 = 25;
+
+// --- Resident-geometry memory budget, in MB. The low end suits a 2–4 GB laptop GPU;
+// the high end gives a 5090 room to keep a lot of fine geometry resident. ---
 const MEM_MIN_MB: u32 = 256;
-const MEM_MAX_MB: u32 = 16_384; // 16 GB — for big unified-memory Macs / the 5090 box
+const MEM_MAX_MB: u32 = 24_576; // 24 GB — Ultra on a 32 GB 5090
 const MEM_STEP_MB: u32 = 256;
 
-/// (name, detail 0..1, memory budget MB) — tiers from a cheap laptop to a 5090. With
-/// instanced vegetation the budget is mostly terrain + cache, so these run liberal:
-/// an 18 GB Mac has ample room for High at 8 GB.
-const PRESETS: [(&str, f32, u32); 4] = [
-    ("Low", 0.10, 1_024),    // weak/integrated laptop GPU
-    ("Medium", 0.35, 3_072), // decent laptop / entry desktop
-    ("High", 0.65, 8_192),   // solid gaming GPU / 16 GB+ unified memory
-    ("Ultra", 1.00, MEM_MAX_MB), // 5090 / 32 GB+ — maxes out everything
+const SQ_M_PER_SQ_KM: f32 = 1_000_000.0;
+/// A cube face spans [-1, 1] in face coordinates, so its full edge is 2 units wide;
+/// level L quarters the area, i.e. halves the edge L times.
+const FACE_EDGE_SPAN: f32 = 2.0;
+
+/// (name, split factor, mesh quads/side, veg min level, veg density, memory MB) —
+/// five tiers from a basic laptop (Low) to a 5090 pushed to its limits (Ultra). The
+/// detail parameters are spaced evenly between Low and Ultra; the memory budgets are
+/// the deliberate per-tier targets (roughly geometric, not linear).
+const PRESETS: [(&str, f32, u32, u32, u32, u32); 5] = [
+    ("Low", 1.8, 24, 15, 100, 1_024),       // basic/integrated laptop GPU
+    ("Medium", 3.9, 42, 14, 325, 3_072),    // decent laptop / entry desktop
+    ("High", 6.0, 60, 13, 550, 8_192),      // solid gaming GPU / 16 GB+ unified memory
+    ("Very High", 8.0, 78, 12, 775, 16_384), // high-end desktop
+    ("Ultra", 10.0, 96, 11, 1_000, 24_576), // 5090 / 32 GB — pushed to the limit
 ];
 const DEFAULT_PRESET: usize = 2; // High
 const CUSTOM: &str = "Custom";
@@ -52,9 +79,10 @@ pub const TAB_HELP: usize = 0;
 pub const TAB_GRAPHICS: usize = 1;
 pub const TAB_COUNT: usize = 2;
 
-/// GRAPHICS-tab rows, in display order. Row 0 is the preset selector.
+/// GRAPHICS-tab rows, in display order. Row 0 is the preset selector; the rest are
+/// one exposed parameter each.
 pub const ROW_PRESET: usize = 0;
-pub const ROW_COUNT: usize = 3;
+pub const ROW_COUNT: usize = 6;
 
 /// One rendered menu row: a label, a value string, and (for sliders) a 0..1 fill.
 pub struct Row {
@@ -66,52 +94,65 @@ pub struct Row {
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct Graphics {
-    pub detail: f32,        // master detail, 0..1
-    pub mem_budget_mb: u32, // resident-geometry memory target
+    pub split_factor: f32,  // chunk subdivides while camera is within this × its edge (live LOD)
+    pub mesh_res: u32,      // terrain quads per chunk edge (rebuild)
+    pub veg_min_level: u32, // coarsest quadtree level that gets vegetation (rebuild)
+    pub veg_density: u32,   // areal vegetation attempts, raw mesher units (rebuild)
+    pub mem_budget_mb: u32, // resident-geometry memory target (live)
     pub preset: &'static str,
 }
 
 impl Default for Graphics {
     fn default() -> Self {
-        let mut g = Graphics { detail: 0.0, mem_budget_mb: MEM_MIN_MB, preset: CUSTOM };
+        let mut g = Graphics {
+            split_factor: SPLIT_MIN,
+            mesh_res: GRID_MIN,
+            veg_min_level: VEG_LEVEL_NEAR,
+            veg_density: DENSITY_MIN,
+            mem_budget_mb: MEM_MIN_MB,
+            preset: CUSTOM,
+        };
         g.apply_preset(DEFAULT_PRESET);
         g
     }
 }
 
 impl Graphics {
-    // --- derived detail values (the single `detail` knob fans out to these) ---
-    pub fn split_factor(&self) -> f32 {
-        lerp(SPLIT_MIN, SPLIT_MAX, self.detail)
-    }
-    pub fn mesh_res(&self) -> u32 {
-        lerp_u32(GRID_MIN, GRID_MAX, self.detail)
-    }
-    pub fn veg_min_level(&self) -> u32 {
-        // Higher detail lowers the level (vegetation appears farther out).
-        lerp_u32(VEG_LEVEL_NEAR, VEG_LEVEL_FAR, self.detail)
-    }
-    pub fn veg_density(&self) -> u32 {
-        lerp_u32(DENSITY_MIN, DENSITY_MAX, self.detail)
-    }
-
     /// Resident-geometry budget in bytes — the renderer evicts cached chunks to keep
-    /// real GPU memory (terrain + vegetation) under this. Finer detail makes each
-    /// chunk bigger, so fewer fit — but that now falls out of the *actual* sizes the
-    /// renderer tracks, not an estimate.
+    /// real GPU memory (terrain + vegetation) under this.
     pub fn mem_budget_bytes(&self) -> usize {
         (self.mem_budget_mb as usize) << 20
     }
 
     /// The values baked into chunk geometry; when this changes the world rebuilds.
+    /// `split_factor` and the memory budget are excluded — they apply live.
     pub fn rebuild_signature(&self) -> (u32, u32, u32) {
-        (self.mesh_res(), self.veg_min_level(), self.veg_density())
+        (self.mesh_res, self.veg_min_level, self.veg_density)
+    }
+
+    /// Approximate camera distance (render units) out to which plants are drawn: a
+    /// chunk at `veg_min_level` has this edge length, and chunks that coarse are
+    /// rendered out to ~`split_factor` × their edge. Couples both LOD knobs, on
+    /// purpose — it's the real reach, not a single hidden number.
+    fn plant_view_units(&self) -> f32 {
+        let edge = FACE_EDGE_SPAN / (1u32 << self.veg_min_level) as f32 * PLANET_RADIUS;
+        self.split_factor * edge
+    }
+
+    /// Areal vegetation density as plants per km² (the mesher stores raw attempts per
+    /// [`VEG_REFERENCE_AREA`] patch; this converts that to a real areal density).
+    fn plants_per_km2(&self) -> u32 {
+        let patch_sq_m = VEG_REFERENCE_AREA * METERS_PER_UNIT * METERS_PER_UNIT;
+        (self.veg_density as f32 * SQ_M_PER_SQ_KM / patch_sq_m).round() as u32
     }
 
     fn apply_preset(&mut self, idx: usize) {
         let p = PRESETS[idx];
-        self.detail = p.1;
-        self.mem_budget_mb = p.2;
+        self.split_factor = p.1;
+        self.mesh_res = p.2;
+        self.veg_min_level = p.3;
+        self.veg_density = p.4;
+        self.mem_budget_mb = p.5;
         self.preset = p.0;
     }
 
@@ -122,8 +163,12 @@ impl Graphics {
             return;
         }
         match index {
-            1 => self.detail = round2((self.detail + dir as f32 * DETAIL_STEP).clamp(0.0, 1.0)),
-            2 => self.mem_budget_mb = step_u32(self.mem_budget_mb, dir, MEM_STEP_MB, MEM_MIN_MB, MEM_MAX_MB),
+            1 => self.split_factor = round1((self.split_factor + dir as f32 * SPLIT_STEP).clamp(SPLIT_MIN, SPLIT_MAX)),
+            2 => self.mesh_res = step_u32(self.mesh_res, dir, GRID_STEP, GRID_MIN, GRID_MAX),
+            // More detail = LOWER min level (plants reach farther), so invert `dir`.
+            3 => self.veg_min_level = (self.veg_min_level as i32 - dir).clamp(VEG_LEVEL_FAR as i32, VEG_LEVEL_NEAR as i32) as u32,
+            4 => self.veg_density = step_u32(self.veg_density, dir, DENSITY_STEP, DENSITY_MIN, DENSITY_MAX),
+            5 => self.mem_budget_mb = step_u32(self.mem_budget_mb, dir, MEM_STEP_MB, MEM_MIN_MB, MEM_MAX_MB),
             _ => {}
         }
         self.preset = CUSTOM;
@@ -140,18 +185,34 @@ impl Graphics {
         self.apply_preset(next as usize);
     }
 
-    pub fn rows(&self) -> Vec<Row> {
+    pub fn rows(&self, sys: Units) -> Vec<Row> {
         vec![
             Row { label: "Preset", value: self.preset.to_string(), frac: None },
             Row {
-                label: "Detail",
-                value: format!("{}%", (self.detail * 100.0).round() as i32),
-                frac: Some(self.detail),
+                label: "Geometry LOD",
+                value: format!("{:.1}x", self.split_factor),
+                frac: Some(frac(self.split_factor, SPLIT_MIN, SPLIT_MAX)),
+            },
+            Row {
+                label: "Terrain mesh",
+                value: format!("{}/side", self.mesh_res),
+                frac: Some(frac_u32(self.mesh_res, GRID_MIN, GRID_MAX)),
+            },
+            Row {
+                label: "Plant distance",
+                value: units::distance(self.plant_view_units(), sys),
+                // Lower min level = farther plants = more detail, so the fill inverts.
+                frac: Some(frac_u32_inv(self.veg_min_level, VEG_LEVEL_FAR, VEG_LEVEL_NEAR)),
+            },
+            Row {
+                label: "Plant density",
+                value: format!("{}/km2", self.plants_per_km2()),
+                frac: Some(frac_u32(self.veg_density, DENSITY_MIN, DENSITY_MAX)),
             },
             Row {
                 label: "Memory budget",
                 value: format_mem(self.mem_budget_mb),
-                frac: Some((self.mem_budget_mb - MEM_MIN_MB) as f32 / (MEM_MAX_MB - MEM_MIN_MB) as f32),
+                frac: Some(frac_u32(self.mem_budget_mb, MEM_MIN_MB, MEM_MAX_MB)),
             },
         ]
     }
@@ -165,16 +226,23 @@ fn format_mem(mb: u32) -> String {
     }
 }
 
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t.clamp(0.0, 1.0)
+/// 0..1 position of `v` within `[lo, hi]`, for a slider fill.
+fn frac(v: f32, lo: f32, hi: f32) -> f32 {
+    ((v - lo) / (hi - lo)).clamp(0.0, 1.0)
 }
 
-fn lerp_u32(a: u32, b: u32, t: f32) -> u32 {
-    (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)).round() as u32
+fn frac_u32(v: u32, lo: u32, hi: u32) -> f32 {
+    (v.clamp(lo, hi) - lo) as f32 / (hi - lo) as f32
 }
 
-fn round2(v: f32) -> f32 {
-    (v * 100.0).round() / 100.0
+/// Like [`frac_u32`] but inverted: `lo` reads full, `hi` reads empty. Used where a
+/// smaller stored value means more detail (the vegetation min level).
+fn frac_u32_inv(v: u32, lo: u32, hi: u32) -> f32 {
+    (hi - v.clamp(lo, hi)) as f32 / (hi - lo) as f32
+}
+
+fn round1(v: f32) -> f32 {
+    (v * 10.0).round() / 10.0
 }
 
 fn step_u32(v: u32, dir: i32, step: u32, lo: u32, hi: u32) -> u32 {
@@ -185,40 +253,97 @@ fn step_u32(v: u32, dir: i32, step: u32, lo: u32, hi: u32) -> u32 {
 mod tests {
     use super::*;
 
+    /// Cycle the preset selector until it lands on `name`.
+    fn preset(name: &str) -> Graphics {
+        let mut g = Graphics::default();
+        while g.preset != name {
+            g.adjust(ROW_PRESET, 1);
+        }
+        g
+    }
+
+    const ORDER: [&str; 5] = ["Low", "Medium", "High", "Very High", "Ultra"];
+
     #[test]
     fn default_is_high() {
         let g = Graphics::default();
         assert_eq!(g.preset, "High");
-        assert_eq!(g.rows().len(), ROW_COUNT);
+        assert_eq!(g.rows(Units::Metric).len(), ROW_COUNT);
     }
 
     #[test]
-    fn ultra_maxes_everything() {
-        let mut g = Graphics::default();
-        while g.preset != "Ultra" {
-            g.adjust(ROW_PRESET, 1);
-        }
-        assert_eq!(g.detail, 1.0);
+    fn low_is_the_floor() {
+        let g = preset("Low");
+        assert_eq!(g.split_factor, SPLIT_MIN);
+        assert_eq!(g.mesh_res, GRID_MIN);
+        assert_eq!(g.veg_min_level, VEG_LEVEL_NEAR);
+        assert_eq!(g.veg_density, DENSITY_MIN);
+    }
+
+    #[test]
+    fn ultra_pushes_the_limits() {
+        let g = preset("Ultra");
+        assert_eq!(g.split_factor, SPLIT_MAX);
+        assert_eq!(g.mesh_res, GRID_MAX);
+        assert_eq!(g.veg_min_level, VEG_LEVEL_FAR);
+        assert_eq!(g.veg_density, DENSITY_MAX);
         assert_eq!(g.mem_budget_mb, MEM_MAX_MB);
-        assert_eq!(g.mesh_res(), GRID_MAX);
-        assert_eq!(g.veg_density(), DENSITY_MAX);
-        assert_eq!(g.veg_min_level(), VEG_LEVEL_FAR);
+    }
+
+    #[test]
+    fn presets_increase_monotonically() {
+        let tiers: Vec<Graphics> = ORDER.iter().map(|n| preset(n)).collect();
+        for w in tiers.windows(2) {
+            let (lo, hi) = (&w[0], &w[1]);
+            assert!(hi.split_factor > lo.split_factor, "split must climb");
+            assert!(hi.mesh_res > lo.mesh_res, "mesh must climb");
+            assert!(hi.veg_min_level < lo.veg_min_level, "veg level must fall (reach farther)");
+            assert!(hi.veg_density > lo.veg_density, "density must climb");
+            assert!(hi.mem_budget_mb > lo.mem_budget_mb, "memory must climb");
+            // Plants reach farther and the slider fills more at higher tiers.
+            assert!(hi.plant_view_units() > lo.plant_view_units());
+        }
+    }
+
+    #[test]
+    fn adjusting_a_row_drops_to_custom_and_clamps() {
+        let mut g = preset("Ultra");
+        g.adjust(1, 1); // try to push Geometry LOD past Ultra's max
+        assert_eq!(g.preset, CUSTOM);
+        assert_eq!(g.split_factor, SPLIT_MAX); // clamped, not exceeded
+    }
+
+    #[test]
+    fn veg_row_inverts_direction() {
+        let mut g = preset("High");
+        let before = g.veg_min_level;
+        g.adjust(3, 1); // +1 = more detail = farther plants = LOWER level
+        assert_eq!(g.veg_min_level, before - 1);
+        assert!(g.plant_view_units() > preset("High").plant_view_units());
     }
 
     #[test]
     fn mem_budget_bytes_tracks_the_setting() {
-        let g = Graphics { detail: 0.5, mem_budget_mb: 2048, preset: "Custom" };
+        let mut g = Graphics::default();
+        g.adjust(5, 0); // no-op step, but proves the field drives bytes
+        g.mem_budget_mb = 2048;
         assert_eq!(g.mem_budget_bytes(), 2048usize << 20);
     }
 
     #[test]
-    fn detail_fans_out_monotonically() {
-        let lo = Graphics { detail: 0.0, mem_budget_mb: 2048, preset: "Custom" };
-        let hi = Graphics { detail: 1.0, mem_budget_mb: 2048, preset: "Custom" };
-        assert!(hi.split_factor() > lo.split_factor());
-        assert!(hi.mesh_res() > lo.mesh_res());
-        assert!(hi.veg_density() > lo.veg_density());
-        assert!(hi.veg_min_level() < lo.veg_min_level());
+    fn plant_density_reads_in_plants_per_km2() {
+        // Raw attempts convert to a plausible areal density, and Ultra > Low.
+        assert!(preset("Ultra").plants_per_km2() > preset("Low").plants_per_km2());
+        let row = &preset("High").rows(Units::Metric)[4];
+        assert!(row.value.ends_with("/km2"));
+    }
+
+    #[test]
+    fn plant_distance_row_uses_real_units() {
+        let metric = &preset("Ultra").rows(Units::Metric)[3];
+        assert!(metric.value.ends_with("km") || metric.value.ends_with('m'));
+        let us = &preset("Ultra").rows(Units::Us)[3];
+        assert!(us.value.ends_with("mi") || us.value.ends_with("ft"));
     }
 
     #[test]

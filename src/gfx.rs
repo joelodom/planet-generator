@@ -928,7 +928,8 @@ mod smoke {
         });
         let image_p = make_pipeline(&device, &image_pl, &image_sh, &[overlay_corner_layout(), overlay_instance_layout()], format, PassKind::Overlay, wgpu::PolygonMode::Fill);
 
-        let (menu_lines, menu_hl) = overlay::menu(&crate::settings::Graphics::default(), crate::settings::TAB_GRAPHICS, 1);
+        let (menu_lines, menu_hl) =
+            overlay::menu(&crate::settings::Graphics::default(), crate::settings::TAB_GRAPHICS, 1, crate::units::Units::Metric);
         let overlay_geo = overlay::layout(&menu_lines, menu_hl, w, h);
         assert!(!overlay_geo.quads.is_empty());
         let image_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

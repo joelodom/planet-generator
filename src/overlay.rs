@@ -4,6 +4,7 @@
 
 use crate::font8x8::FONT8X8;
 use crate::settings::{self, Graphics};
+use crate::units::Units;
 use bytemuck::{Pod, Zeroable};
 
 /// Width (chars) of a settings slider bar, e.g. `[####------]`.
@@ -66,9 +67,9 @@ fn help_body() -> Vec<String> {
 
 /// The GRAPHICS tab body: a hint line then the setting rows. Returns the body and
 /// the index *within the body* of the selected row.
-fn graphics_body(graphics: &Graphics, selected: usize) -> (Vec<String>, usize) {
+fn graphics_body(graphics: &Graphics, selected: usize, sys: Units) -> (Vec<String>, usize) {
     let mut v = vec!["up/down: select     left/right: adjust".to_string()];
-    for (i, row) in graphics.rows().iter().enumerate() {
+    for (i, row) in graphics.rows(sys).iter().enumerate() {
         let marker = if i == selected { '>' } else { ' ' };
         let body = match row.frac {
             Some(f) => format!("{}  {:>6}", bar(f), row.value),
@@ -114,9 +115,9 @@ fn bar(frac: f32) -> String {
 ///
 /// Both tabs are padded to a common width and height so the panel size and font
 /// scale never change when you switch tabs.
-pub fn menu(graphics: &Graphics, tab: usize, selected: usize) -> (Vec<String>, usize) {
+pub fn menu(graphics: &Graphics, tab: usize, selected: usize, sys: Units) -> (Vec<String>, usize) {
     let help = help_body();
-    let (gfx, gfx_hl) = graphics_body(graphics, selected);
+    let (gfx, gfx_hl) = graphics_body(graphics, selected, sys);
     let body_rows = help.len().max(gfx.len());
 
     let mut lines = header_lines();

@@ -111,7 +111,7 @@ const VEG_TINT_JITTER: f32 = 0.06; // ± per-plant brightness so a stand isn't u
 // large coarse chunk can't request tens of thousands of plants.
 // (These two were halved 2026-06-08 on in-world feedback that flora ran too dense —
 // doubling the reference area and halving the cap cuts attempts ~50% at every LOD.)
-const VEG_REFERENCE_AREA: f32 = 2_200.0; // ground area (unit²; ≈2.2 ha) at which `density` == raw attempts
+pub const VEG_REFERENCE_AREA: f32 = 2_200.0; // ground area (unit²) at which `density` == raw attempts
 const VEG_MAX_ATTEMPTS: usize = 192; // per-chunk attempt (hence instance) cap — bounds CPU + Pool-B memory
 
 // Per-plant age/size: a reverse-J distribution (many young/small, few mature) drawn

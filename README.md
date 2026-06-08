@@ -55,15 +55,20 @@ Press **Esc** for an on-screen overlay with two tabs (**Tab** switches): HELP
 (these key bindings) and GRAPHICS. On the GRAPHICS tab, ↑/↓ select a row and
 ←/→ adjust:
 
-| Setting | What it does |
-|---------|--------------|
-| Preset | Low / Medium / High / Ultra |
-| Detail | One master slider — drives LOD subdivision, terrain mesh resolution, and vegetation (and future detail objects) together |
-| Memory budget | How much geometry stays resident as you look around |
+| Setting | What it does | Units |
+|---------|--------------|-------|
+| Preset | Low / Medium / High / Very High / Ultra | — |
+| Geometry LOD | How eagerly terrain subdivides — higher keeps fine geometry farther out | × chunk size |
+| Terrain mesh | Tessellation of each chunk | quads/side |
+| Plant distance | How far from the camera vegetation is drawn | real distance (m/km, respects `--units`) |
+| Plant density | How thickly vegetation is scattered | plants/km² |
+| Memory budget | How much geometry stays resident as you look around | MB/GB |
 
-LOD detail and the memory budget apply immediately; mesh/vegetation re-mesh the
-world when you close the menu. **Ultra is intentionally punishing** — tune it
-down on a laptop, crank it up on a big GPU.
+Each parameter is exposed on its own row with real units — there's no single
+hidden "detail" number. **Geometry LOD** and the **memory budget** apply
+immediately; **terrain mesh** and **vegetation** re-mesh the world when you close
+the menu. The presets step evenly from **Low** (runs on a basic laptop GPU) to
+**Ultra** (targets a 5090 and pushes it to the limit).
 
 ## How it works
 

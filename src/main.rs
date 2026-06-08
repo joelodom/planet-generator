@@ -208,7 +208,7 @@ impl App {
         let anchor = Vec3::new(0.4, 0.5, 0.77).normalize();
         let camera = Camera::new(&planet, anchor);
         let graphics = settings::Graphics::default();
-        let mesh_cfg = mesh::MeshConfig::new(graphics.mesh_res(), graphics.veg_min_level(), graphics.veg_density());
+        let mesh_cfg = mesh::MeshConfig::new(graphics.mesh_res, graphics.veg_min_level, graphics.veg_density);
         Self {
             seed,
             planet,
@@ -278,7 +278,7 @@ impl App {
         }
 
         let cam_pos = self.camera.position(&self.planet);
-        let sel = lod::select(&self.planet, cam_pos, self.graphics.split_factor(), &|k| renderer.has_chunk(k));
+        let sel = lod::select(&self.planet, cam_pos, self.graphics.split_factor, &|k| renderer.has_chunk(k));
         let draw_count = sel.draw.len();
 
         // Request the nearest wanted chunks first.
@@ -423,7 +423,7 @@ impl ApplicationHandler for App {
             pollster::block_on(Renderer::new(window.clone(), &veg_meshes)).expect("renderer init")
         };
         self.camera.set_aspect(renderer.size.0, renderer.size.1);
-        let (lines, hl) = overlay::menu(&self.graphics, self.menu_tab, self.menu_sel);
+        let (lines, hl) = overlay::menu(&self.graphics, self.menu_tab, self.menu_sel, self.units);
         renderer.set_overlay(lines, hl);
 
         // Generate the six root chunks up front so there's always a planet to see.
@@ -487,7 +487,7 @@ impl ApplicationHandler for App {
 impl App {
     /// Push the current settings/selection into the overlay geometry.
     fn refresh_overlay(&mut self) {
-        let (lines, hl) = overlay::menu(&self.graphics, self.menu_tab, self.menu_sel);
+        let (lines, hl) = overlay::menu(&self.graphics, self.menu_tab, self.menu_sel, self.units);
         if let Some(r) = &mut self.renderer {
             r.set_overlay(lines, hl);
         }
@@ -537,7 +537,7 @@ impl App {
     /// Re-mesh the world at the current mesh/vegetation settings.
     fn apply_rebuild(&mut self) {
         let g = self.graphics;
-        self.mesh_cfg.set(g.mesh_res(), g.veg_min_level(), g.veg_density());
+        self.mesh_cfg.set(g.mesh_res, g.veg_min_level, g.veg_density);
         if let Some(s) = &mut self.streamer {
             s.clear();
         }
@@ -550,10 +550,10 @@ impl App {
             }
         }
         info!(
-            detail = round1(g.detail),
-            grid = g.mesh_res(),
-            veg_min_level = g.veg_min_level(),
-            veg_density = g.veg_density(),
+            split = round1(g.split_factor),
+            grid = g.mesh_res,
+            veg_min_level = g.veg_min_level,
+            veg_density = g.veg_density,
             "rebuilding world at new detail settings"
         );
     }
