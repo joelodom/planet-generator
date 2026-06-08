@@ -24,6 +24,15 @@
     .\package_windows.ps1 -DynamicCrt
 
 .NOTES
+    "running scripts is disabled on this system"? That's PowerShell's default
+    execution policy blocking unsigned local scripts. Three ways around it:
+      * Easiest — run the bundled wrapper, which bypasses the policy for just this
+        one invocation (no system change):   package_windows.cmd
+      * Or invoke PowerShell with a one-off bypass:
+            powershell -ExecutionPolicy Bypass -File .\package_windows.ps1
+      * Or allow local scripts for your user (persistent):
+            Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+
     Prerequisites:
       * Rust (MSVC toolchain): https://rustup.rs  — `rustup default stable-msvc`
         Edition 2024 needs Rust 1.85 or newer.
@@ -51,7 +60,10 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 
 # Single source of truth for the version: the crate version in Cargo.toml,
 # stamped with the git short hash (mirrors package_macos.sh).
-$Version = (Select-String -Path 'Cargo.toml' -Pattern '^\s*version\s*=\s*"(.*)"').Matches[0].Groups[1].Value
+# Version stamp is cosmetic — degrade to a placeholder rather than hard-fail if the
+# manifest can't be parsed (matches package_macos.sh's best-effort approach).
+$VersionMatch = Select-String -Path 'Cargo.toml' -Pattern '^\s*version\s*=\s*"(.*)"' | Select-Object -First 1
+$Version = if ($VersionMatch) { $VersionMatch.Matches[0].Groups[1].Value } else { 'unknown' }
 $GitHash = 'unknown'
 if (Get-Command git -ErrorAction SilentlyContinue) {
     try { $GitHash = (git rev-parse --short HEAD).Trim() } catch { $GitHash = 'unknown' }
