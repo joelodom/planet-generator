@@ -447,45 +447,68 @@ def _read_bytes(path: Path) -> bytes:
         return b""
 
 
-def guard_out_of_scope(protected_snapshot: dict):
-    """Revert any change a model session made outside ALLOWED_EDIT_FILES.
+def snapshot_src_bytes() -> dict:
+    """Bytes of every file under src/ plus the protected harness files, captured
+    BEFORE a model session.
 
-    Restores exact pre-session bytes of the PROTECTED harness files, and
-    git-reverts / deletes any other changed file under src/. Returns the list of
-    reverted paths (empty == the session stayed in scope).
+    The guard reverts out-of-scope edits to THIS pre-session state — NOT to git
+    HEAD. That distinction matters: the headless render CLI lives in gfx.rs/main.rs
+    as legitimate, often-uncommitted changes (added by bootstrap). Reverting to
+    HEAD would delete the renderer the loop depends on (it did — that was the bug);
+    reverting to the pre-session snapshot preserves it while still undoing any
+    stray edit the rewrite made outside src/flora.rs.
     """
+    snap = {}
+    src = PROJECT_ROOT / "src"
+    if src.exists():
+        for p in src.rglob("*"):
+            if p.is_file():
+                snap[str(p.relative_to(PROJECT_ROOT))] = _read_bytes(p)
+    for rel in PROTECTED_FILES:
+        snap[rel] = _read_bytes(PROJECT_ROOT / rel)
+    return snap
+
+
+def guard_out_of_scope(pre: dict):
+    """Revert anything a model session changed outside ALLOWED_EDIT_FILES back to
+    its pre-session bytes: restore modified files, re-create deleted ones, and
+    remove newly-created ones. Returns the list of reverted paths (empty == in scope)."""
     reverted = []
-    for rel, original in protected_snapshot.items():
-        p = PROJECT_ROOT / rel
-        if _read_bytes(p) != original:
-            try:
-                p.write_bytes(original)
-                reverted.append(rel)
-            except Exception as exc:
-                log(f"could not restore protected file {rel}: {exc}", "ERROR")
-    try:
-        out = subprocess.run(
-            ["git", "-C", str(PROJECT_ROOT), "status", "--porcelain", "--", "src"],
-            capture_output=True, text=True, timeout=30,
-        ).stdout
-        for line in out.splitlines():
-            if not line.strip():
+    src = PROJECT_ROOT / "src"
+    seen = set()
+    if src.exists():
+        for p in src.rglob("*"):
+            if not p.is_file():
                 continue
-            status, path = line[:2], line[3:].strip()
-            if path in ALLOWED_EDIT_FILES:
+            rel = str(p.relative_to(PROJECT_ROOT))
+            seen.add(rel)
+            if rel in ALLOWED_EDIT_FILES:
                 continue
-            if "?" in status:  # untracked file the session created under src/
+            if rel in pre:
+                if _read_bytes(p) != pre[rel]:
+                    try:
+                        p.write_bytes(pre[rel])
+                        reverted.append(rel)
+                    except Exception as exc:
+                        log(f"could not restore {rel}: {exc}", "ERROR")
+            else:  # a new file the session created under src/ → remove it
                 try:
-                    (PROJECT_ROOT / path).unlink()
-                    reverted.append(path)
+                    p.unlink()
+                    reverted.append(rel + " (new→removed)")
                 except Exception:
                     pass
-            else:
-                subprocess.run(["git", "-C", str(PROJECT_ROOT), "checkout", "--", path],
-                               capture_output=True, text=True, timeout=30)
-                reverted.append(path)
-    except Exception as exc:
-        log(f"scope-guard git check failed: {exc}", "WARN")
+    # Restore any pre-session file that the session deleted, plus the protected .py.
+    for rel, data in pre.items():
+        if rel in ALLOWED_EDIT_FILES or rel in seen:
+            continue
+        p = PROJECT_ROOT / rel
+        if _read_bytes(p) != data:
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(data)
+                reverted.append(rel + " (restored)")
+            except Exception as exc:
+                log(f"could not restore {rel}: {exc}", "ERROR")
     return reverted
 
 
@@ -922,12 +945,12 @@ def run_iteration(state: dict) -> dict:
 
     # 1. Snapshot A, then rewrite → B (feedback-driven; target-only, guarded).
     snap = snapshot_target(it)
-    protected = {rel: _read_bytes(PROJECT_ROOT / rel) for rel in PROTECTED_FILES}
+    pre_src = snapshot_src_bytes()  # pre-session state of all src + harness files
     CANDIDATE_CHANGE = B_DIR
     CANDIDATE_CHANGE.mkdir(parents=True, exist_ok=True)
     change_file = CANDIDATE_CHANGE / "change.txt"
     modify(state, change_file)
-    reverted = guard_out_of_scope(protected)
+    reverted = guard_out_of_scope(pre_src)
     if reverted:
         log(f"scope guard reverted out-of-target edits: {reverted}", "WARN")
     change_desc = _read_change(change_file)
