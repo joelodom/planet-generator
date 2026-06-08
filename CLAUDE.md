@@ -1,4 +1,4 @@
-# planet-generator
+# planet-explorer
 
 ## Architecture — north star — IMPORTANT
 
