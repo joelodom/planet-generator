@@ -11,6 +11,7 @@
 //! separation is what makes the roadmap (animals, NPCs, weather, ...) tractable:
 //! new systems query `Planet` for ground truth without touching rendering.
 
+use crate::flora::Flora;
 use glam::{Quat, Vec3};
 use noise::{Fbm, MultiFractal, NoiseFn, Perlin, RidgedMulti};
 use std::f32::consts::PI;
@@ -167,6 +168,25 @@ pub enum Biome {
     Snow,
 }
 
+/// Number of [`Biome`] variants. `biome as usize` indexes a per-biome table
+/// (e.g. the flora library's species lists).
+pub const BIOME_COUNT: usize = 11;
+
+/// All biomes in `as usize` order. Used to drive per-biome generation loops.
+pub const BIOMES: [Biome; BIOME_COUNT] = [
+    Biome::Ocean,
+    Biome::Beach,
+    Biome::PolarIce,
+    Biome::Tundra,
+    Biome::BorealForest,
+    Biome::Grassland,
+    Biome::TemperateForest,
+    Biome::Desert,
+    Biome::TropicalForest,
+    Biome::Mountain,
+    Biome::Snow,
+];
+
 /// What a single surface sample resolves to: where it is, how it's lit, what
 /// grows there. Returned by [`Planet::sample`].
 #[derive(Clone, Copy)]
@@ -185,6 +205,9 @@ pub struct Planet {
     pub sun_dir: Vec3,
     /// Atmosphere / horizon tint, also used for distance fog. Per seed.
     pub atmosphere: Vec3,
+    /// The procedurally generated plant species for this world, grouped by biome.
+    /// Built once at construction; shared read-only with the meshing workers.
+    pub flora: Flora,
 
     continents: Fbm<Perlin>,
     mountains: RidgedMulti<Perlin>,
@@ -248,7 +271,10 @@ impl Planet {
             ATMOSPHERE_VALUE,
         );
 
-        Self { seed, sun_dir, atmosphere, continents, mountains, detail, warp, moisture, temp_var }
+        // Procedural plant library for this world (pure function of the seed).
+        let flora = Flora::generate(seed);
+
+        Self { seed, sun_dir, atmosphere, flora, continents, mountains, detail, warp, moisture, temp_var }
     }
 
     /// Terrain height in world units at a point on the sphere (positive = above
@@ -404,7 +430,7 @@ pub fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Vec3 {
+pub(crate) fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Vec3 {
     let h = (h.fract() + 1.0).fract() * 6.0;
     let i = h.floor() as i32;
     let f = h - i as f32;

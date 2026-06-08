@@ -4,11 +4,12 @@
 //! fullscreen triangle) the renderer instances and reuses.
 
 use crate::lod::ChunkKey;
-use crate::planet::{self, Planet, Biome, FACES, PLANET_RADIUS};
+use crate::planet::{self, Planet, Biome, FACES, METERS_PER_UNIT, PLANET_RADIUS};
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+use glam::{Mat3, Mat4, Vec3};
 use rand::{RngExt, SeedableRng};
 use rand::rngs::StdRng;
+use std::f32::consts::TAU;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -60,45 +61,39 @@ pub struct Vertex {
     pub color: [f32; 3],
 }
 
-/// One instanced placement (a tree or shrub): a full model matrix plus a color
-/// tint. 80 bytes; cheap to stream a few thousand of per visible region.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct InstanceRaw {
-    pub model: [[f32; 4]; 4],
-    pub color: [f32; 4],
-}
-
-impl InstanceRaw {
-    fn new(model: Mat4, color: Vec3) -> Self {
-        Self { model: model.to_cols_array_2d(), color: [color.x, color.y, color.z, 1.0] }
-    }
-}
-
-/// Everything a worker produces for one chunk: the terrain mesh and the
-/// vegetation that grows on it, split by base mesh so each draws in one call.
+/// Everything a worker produces for one chunk: the terrain mesh and a single
+/// baked vegetation mesh (every plant on the chunk, in world space, ready to draw
+/// in one call). Procedural per-planet species are baked in here rather than
+/// instanced, so a chunk can carry unlimited plant variety at no extra draw cost.
 pub struct CpuChunk {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
-    pub trees: Vec<InstanceRaw>,
-    pub shrubs: Vec<InstanceRaw>,
+    pub veg: MeshData,
 }
 
 // Crack-hiding skirts around each chunk edge.
 const SKIRT_DEPTH_FACTOR: f32 = 3.0; // skirt depth ≈ this × a terrain quad's width
 const SKIRT_MIN_DEPTH: f32 = 2.0; // render units
 
-// Vegetation scatter. Density and the min LOD level are runtime settings (see
-// MeshConfig); the rest are fixed tuning.
+// Vegetation scatter. Density (attempts per chunk) and the min LOD level are
+// runtime settings (see MeshConfig); the rest is fixed tuning.
 const VEG_MIN_GROUND_HEIGHT: f32 = 1.0; // skip water/waterline (render units)
 const VEG_MAX_STEEPNESS: f32 = 0.5; // skip cliffs
-const TREE_SCALE_MIN: f32 = 0.8; // ~8–26 m trees (render units)
-const TREE_SCALE_MAX: f32 = 2.6;
-const SHRUB_SCALE_MIN: f32 = 0.25; // ~2.5–8 m shrubs
-const SHRUB_SCALE_MAX: f32 = 0.8;
-const TREE_TINT_JITTER: f32 = 0.08; // ± per-plant color variation
-const SHRUB_TINT_JITTER: f32 = 0.10;
-const SHRUB_TINT_BRIGHTEN: f32 = 1.1; // shrubs a touch lighter than the biome tint
+const VEG_SINK: f32 = 0.15; // bury each plant's base this deep to hide the seam
+const VEG_TINT_JITTER: f32 = 0.06; // ± per-plant brightness so a stand isn't uniform
+
+// Same-species "stands". A Worley cell grid laid over each cube face, independent
+// of the LOD chunk grid so stands cross chunk seams seamlessly. Every cell owns a
+// jittered seed point and (per biome) one species; nearby plants adopt it, so one
+// kind of plant clusters together the way real stands do.
+const CLUSTER_CELL_METERS: f32 = 320.0; // ~ stand diameter
+const CLUSTER_CELL_UV: f32 = CLUSTER_CELL_METERS / METERS_PER_UNIT / PLANET_RADIUS;
+// Density falls off from each stand's seed: a dense core thinning to gaps, plus a
+// sparse floor of stragglers between stands. Distances are normalised to the cell.
+const CLUSTER_CORE: f32 = 0.18; // within this radius of a seed: full density
+const CLUSTER_EDGE: f32 = 0.62; // past this: bare ground
+const CLUSTER_FLOOR: f32 = 0.06; // baseline density between stands (loose mixing)
+const CLUSTER_MIX: f32 = 0.5; // odds, near a border, of taking the neighbour's species
 
 impl CpuChunk {
     /// Build the terrain mesh and vegetation for one quadtree node, at the detail
@@ -200,9 +195,9 @@ impl CpuChunk {
         add_skirt(&left, &mut vertices, &mut indices);
         add_skirt(&right, &mut vertices, &mut indices);
 
-        let (trees, shrubs) = place_vegetation(planet, key, face, u0, v0, size, veg_min_level, veg_density);
+        let veg = place_vegetation(planet, key, face, u0, v0, size, veg_min_level, veg_density);
 
-        CpuChunk { vertices, indices, trees, shrubs }
+        CpuChunk { vertices, indices, veg }
     }
 }
 
@@ -219,11 +214,10 @@ fn place_vegetation(
     size: f32,
     min_level: u32,
     density: usize,
-) -> (Vec<InstanceRaw>, Vec<InstanceRaw>) {
-    let mut trees = Vec::new();
-    let mut shrubs = Vec::new();
+) -> MeshData {
+    let mut veg = MeshData { vertices: Vec::new(), indices: Vec::new() };
     if key.level < min_level {
-        return (trees, shrubs);
+        return veg;
     }
 
     let mut rng = StdRng::seed_from_u64(key.hash(planet.seed));
@@ -234,136 +228,132 @@ fn place_vegetation(
         let dir = planet::cube_to_sphere(cube);
         let s = planet.sample(dir);
 
-        // Nothing grows in water, on ice/snow, on bare rock, or on cliffs.
+        // Nothing grows in water, on bare cliffs, or in a biome with no flora.
         if s.height < VEG_MIN_GROUND_HEIGHT || s.steepness > VEG_MAX_STEEPNESS {
             continue;
         }
-        let (tree_p, shrub_p, tint) = match s.biome {
-            Biome::TropicalForest => (0.85, 0.5, Vec3::new(0.10, 0.45, 0.16)),
-            Biome::TemperateForest => (0.72, 0.4, Vec3::new(0.18, 0.45, 0.20)),
-            Biome::BorealForest => (0.6, 0.35, Vec3::new(0.12, 0.30, 0.18)),
-            Biome::Grassland => (0.10, 0.6, Vec3::new(0.40, 0.52, 0.24)),
-            Biome::Tundra => (0.0, 0.30, Vec3::new(0.36, 0.40, 0.30)),
-            Biome::Desert => (0.0, 0.07, Vec3::new(0.40, 0.50, 0.25)),
-            Biome::Beach => (0.0, 0.05, Vec3::new(0.35, 0.5, 0.25)),
-            _ => (0.0, 0.0, Vec3::ZERO),
-        };
-
-        let up = dir;
-        let ground = PLANET_RADIUS + s.height;
-        let roll = rng.random::<f32>();
-        if roll < tree_p {
-            let scale = rng.random_range(TREE_SCALE_MIN..TREE_SCALE_MAX);
-            let yaw = rng.random_range(0.0..std::f32::consts::TAU);
-            let pos = up * ground;
-            let model = Mat4::from_scale_rotation_translation(
-                Vec3::splat(scale),
-                planet::upright_rotation(up, yaw),
-                pos,
-            );
-            let var = (rng.random::<f32>() - 0.5) * TREE_TINT_JITTER;
-            trees.push(InstanceRaw::new(model, (tint + Vec3::splat(var)).clamp(Vec3::ZERO, Vec3::ONE)));
-        } else if roll < tree_p + shrub_p {
-            let scale = rng.random_range(SHRUB_SCALE_MIN..SHRUB_SCALE_MAX);
-            let yaw = rng.random_range(0.0..std::f32::consts::TAU);
-            let pos = up * ground;
-            let model = Mat4::from_scale_rotation_translation(
-                Vec3::splat(scale),
-                planet::upright_rotation(up, yaw),
-                pos,
-            );
-            let var = (rng.random::<f32>() - 0.5) * SHRUB_TINT_JITTER;
-            shrubs.push(InstanceRaw::new(model, (tint * SHRUB_TINT_BRIGHTEN + Vec3::splat(var)).clamp(Vec3::ZERO, Vec3::ONE)));
+        let coverage = biome_coverage(s.biome);
+        if coverage <= 0.0 || !planet.flora.has_vegetation(s.biome) {
+            continue;
         }
+
+        // Which stand are we in? Its local density decides whether a plant grows
+        // here (dense cores, thinning to gaps); its species hash decides which.
+        let stand = cluster_lookup(planet.seed, key.face, u, v, &mut rng);
+        if rng.random::<f32>() > coverage * stand.density {
+            continue;
+        }
+        let Some(species_id) = planet.flora.pick(s.biome, stand.species_hash) else { continue };
+        let species = planet.flora.species(species_id);
+
+        // Plant it: upright on the surface, with a yaw spin and a size jitter.
+        let up = dir;
+        let yaw = rng.random_range(0.0..TAU);
+        let scale = rng.random_range(species.scale_min..species.scale_max);
+        let pos = up * (PLANET_RADIUS + s.height - VEG_SINK);
+        let rot = planet::upright_rotation(up, yaw);
+        let model = Mat4::from_scale_rotation_translation(Vec3::splat(scale), rot, pos);
+        let nmat = Mat3::from_quat(rot);
+        let tint = Vec3::splat(1.0 + (rng.random::<f32>() - 0.5) * VEG_TINT_JITTER);
+        bake_plant(&mut veg, &species.mesh, model, nmat, tint);
     }
 
-    (trees, shrubs)
+    veg
+}
+
+/// Append one plant's local-space mesh into a chunk's vegetation mesh, baked to
+/// world space (positions via `model`, normals via the rotation `nmat`), tinted.
+fn bake_plant(dst: &mut MeshData, src: &MeshData, model: Mat4, nmat: Mat3, tint: Vec3) {
+    let base = dst.vertices.len() as u32;
+    for v in &src.vertices {
+        let p = model.transform_point3(Vec3::from(v.pos));
+        let n = (nmat * Vec3::from(v.normal)).normalize_or_zero();
+        let c = (Vec3::from(v.color) * tint).clamp(Vec3::ZERO, Vec3::ONE);
+        dst.vertices.push(Vertex { pos: p.into(), normal: n.into(), color: c.into() });
+    }
+    dst.indices.extend(src.indices.iter().map(|&i| base + i));
+}
+
+/// The stand covering a point: how dense vegetation is here, and a stable hash
+/// selecting its species.
+struct Stand {
+    density: f32,
+    species_hash: u64,
+}
+
+/// Worley-cell lookup over the stand grid. Finds the nearest seed point (and the
+/// runner-up, for soft borders), returning the local stand density and a species
+/// hash that's constant across a stand's core so one species clusters together.
+fn cluster_lookup(seed: u64, face: u8, u: f32, v: f32, rng: &mut StdRng) -> Stand {
+    let cu = (u / CLUSTER_CELL_UV).floor() as i64;
+    let cv = (v / CLUSTER_CELL_UV).floor() as i64;
+    let (mut d1, mut d2) = (f32::INFINITY, f32::INFINITY);
+    let (mut h1, mut h2) = (0u64, 0u64);
+    for di in -1..=1 {
+        for dj in -1..=1 {
+            let (gi, gj) = (cu + di, cv + dj);
+            let h = cell_hash(seed, face, gi, gj);
+            // Jittered seed point inside the cell (two 16-bit fractions from h).
+            let jx = (h & 0xFFFF) as f32 / 65535.0;
+            let jy = ((h >> 16) & 0xFFFF) as f32 / 65535.0;
+            let su = (gi as f32 + jx) * CLUSTER_CELL_UV;
+            let sv = (gj as f32 + jy) * CLUSTER_CELL_UV;
+            let d = (((u - su).powi(2) + (v - sv).powi(2)).sqrt()) / CLUSTER_CELL_UV;
+            if d < d1 {
+                d2 = d1;
+                h2 = h1;
+                d1 = d;
+                h1 = h;
+            } else if d < d2 {
+                d2 = d;
+                h2 = h;
+            }
+        }
+    }
+    let density = CLUSTER_FLOOR.max(1.0 - planet::smoothstep(CLUSTER_CORE, CLUSTER_EDGE, d1));
+    // Near a stand border, sometimes adopt the neighbour's species so stands
+    // interleave instead of meeting on hard Voronoi lines.
+    let species_hash = if d2 < d1 * (1.0 + CLUSTER_MIX) && rng.random::<f32>() < CLUSTER_MIX {
+        h2
+    } else {
+        h1
+    };
+    Stand { density, species_hash }
+}
+
+/// Stable hash of a stand-grid cell (per planet, per face).
+fn cell_hash(seed: u64, face: u8, gi: i64, gj: i64) -> u64 {
+    let mut h = seed ^ (face as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for x in [gi as u64, gj as u64] {
+        h ^= x.wrapping_add(0x9E37_79B9_7F4A_7C15).wrapping_add(h << 6).wrapping_add(h >> 2);
+        h = h.wrapping_mul(0x0100_0000_01B3);
+    }
+    h
+}
+
+/// Peak vegetation coverage for a biome (probability a candidate at a stand core
+/// becomes a plant). Lush biomes are dense; harsh ones sparse; barren ones zero.
+fn biome_coverage(biome: Biome) -> f32 {
+    match biome {
+        Biome::TropicalForest => 0.95,
+        Biome::TemperateForest => 0.85,
+        Biome::Grassland => 0.80,
+        Biome::BorealForest => 0.70,
+        Biome::Tundra => 0.40,
+        Biome::Mountain => 0.30,
+        Biome::Beach => 0.30,
+        Biome::Desert => 0.25,
+        _ => 0.0,
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Static base meshes
+// Mesh container
 // ---------------------------------------------------------------------------
 
-/// A simple indexed mesh of [`Vertex`].
+/// A simple indexed mesh of [`Vertex`]. Used for terrain chunks and as the
+/// container the flora module grows plant species into (see `crate::flora`).
 pub struct MeshData {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
-}
-
-/// A tree: a tapered trunk plus a conical canopy. Trunk verts are brown; canopy
-/// verts are white so the per-instance color tint sets their green. Unit-ish
-/// height (~3.2), scaled by the instance.
-pub fn tree_mesh() -> MeshData {
-    let mut m = MeshData { vertices: Vec::new(), indices: Vec::new() };
-    let brown = Vec3::new(0.32, 0.22, 0.13);
-    // Trunk: hexagonal prism.
-    cylinder(&mut m, 0.18, 0.13, 1.3, 7, brown, 0.0);
-    // Canopy: stacked cones, colored white (tinted per-instance).
-    cone(&mut m, 0.95, 1.4, 9, Vec3::ONE, 1.1);
-    cone(&mut m, 0.70, 1.2, 9, Vec3::ONE, 2.0);
-    cone(&mut m, 0.45, 1.0, 9, Vec3::ONE, 2.8);
-    m
-}
-
-/// A shrub: a low hemisphere, colored white (tinted per-instance).
-pub fn shrub_mesh() -> MeshData {
-    let mut m = MeshData { vertices: Vec::new(), indices: Vec::new() };
-    hemisphere(&mut m, 0.6, 8, 4, Vec3::ONE, 0.1);
-    m
-}
-
-fn cylinder(m: &mut MeshData, r_bottom: f32, r_top: f32, height: f32, sides: usize, color: Vec3, y0: f32) {
-    use std::f32::consts::TAU;
-    let start = m.vertices.len() as u32;
-    for s in 0..=sides {
-        let a = TAU * s as f32 / sides as f32;
-        let (c, sn) = (a.cos(), a.sin());
-        let nrm = Vec3::new(c, 0.3, sn).normalize();
-        m.vertices.push(Vertex { pos: [c * r_bottom, y0, sn * r_bottom], normal: nrm.into(), color: color.into() });
-        m.vertices.push(Vertex { pos: [c * r_top, y0 + height, sn * r_top], normal: nrm.into(), color: color.into() });
-    }
-    for s in 0..sides {
-        let b = start + (s * 2) as u32;
-        m.indices.extend_from_slice(&[b, b + 1, b + 2, b + 2, b + 1, b + 3]);
-    }
-}
-
-fn cone(m: &mut MeshData, radius: f32, height: f32, sides: usize, color: Vec3, y0: f32) {
-    use std::f32::consts::TAU;
-    let start = m.vertices.len() as u32;
-    let apex = Vec3::new(0.0, y0 + height, 0.0);
-    m.vertices.push(Vertex { pos: apex.into(), normal: [0.0, 1.0, 0.0], color: color.into() });
-    for s in 0..=sides {
-        let a = TAU * s as f32 / sides as f32;
-        let (c, sn) = (a.cos(), a.sin());
-        let nrm = Vec3::new(c, 0.5, sn).normalize();
-        m.vertices.push(Vertex { pos: [c * radius, y0, sn * radius], normal: nrm.into(), color: color.into() });
-    }
-    for s in 0..sides {
-        let b = start + 1 + s as u32;
-        m.indices.extend_from_slice(&[start, b + 1, b]);
-    }
-}
-
-fn hemisphere(m: &mut MeshData, radius: f32, sectors: usize, rings: usize, color: Vec3, y0: f32) {
-    use std::f32::consts::PI;
-    let start = m.vertices.len() as u32;
-    for i in 0..=rings {
-        let phi = (PI * 0.5) * i as f32 / rings as f32; // 0..pi/2
-        for j in 0..=sectors {
-            let theta = 2.0 * PI * j as f32 / sectors as f32;
-            let dir = Vec3::new(phi.sin() * theta.cos(), phi.cos(), phi.sin() * theta.sin());
-            m.vertices.push(Vertex { pos: (dir * radius + Vec3::new(0.0, y0, 0.0)).into(), normal: dir.into(), color: color.into() });
-        }
-    }
-    let stride = (sectors + 1) as u32;
-    for i in 0..rings as u32 {
-        for j in 0..sectors as u32 {
-            let a = start + i * stride + j;
-            let b = a + 1;
-            let c = a + stride;
-            let d = c + 1;
-            m.indices.extend_from_slice(&[a, c, b, b, c, d]);
-        }
-    }
 }

@@ -7,7 +7,7 @@
 //! the rendering layer a thin, replaceable slab beneath the simulation.
 
 use crate::lod::ChunkKey;
-use crate::mesh::{self, CpuChunk, InstanceRaw, Vertex};
+use crate::mesh::{CpuChunk, Vertex};
 use crate::overlay::{self, OverlayInstance};
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
@@ -52,51 +52,23 @@ impl GpuMesh {
     }
 }
 
-/// An instance buffer (vegetation placements for one chunk).
-struct InstanceBuf {
-    buf: wgpu::Buffer,
-    count: u32,
-}
-
-impl InstanceBuf {
-    fn upload(device: &wgpu::Device, instances: &[InstanceRaw]) -> Option<Self> {
-        if instances.is_empty() {
-            return None;
-        }
-        let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("instances"),
-            contents: bytemuck::cast_slice(instances),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        Some(Self { buf, count: instances.len() as u32 })
-    }
-}
-
-/// A terrain chunk plus its vegetation, all GPU-resident.
+/// A terrain chunk plus its baked vegetation mesh, all GPU-resident. Vegetation
+/// is a single world-space mesh (grown by the worker from this planet's procedural
+/// species), so it draws in one call with the terrain pipeline — no instancing, no
+/// per-species state, unlimited plant variety per chunk.
 struct GpuChunk {
     terrain: GpuMesh,
-    trees: Option<InstanceBuf>,
-    shrubs: Option<InstanceBuf>,
+    veg: Option<GpuMesh>,
 }
 
 const VERT_ATTRS: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
-const INST_ATTRS: [wgpu::VertexAttribute; 5] =
-    wgpu::vertex_attr_array![3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4];
 
 fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<Vertex>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &VERT_ATTRS,
-    }
-}
-
-fn instance_layout() -> wgpu::VertexBufferLayout<'static> {
-    wgpu::VertexBufferLayout {
-        array_stride: std::mem::size_of::<InstanceRaw>() as u64,
-        step_mode: wgpu::VertexStepMode::Instance,
-        attributes: &INST_ATTRS,
     }
 }
 
@@ -138,10 +110,6 @@ pub struct Renderer {
     sky_pipeline: wgpu::RenderPipeline,
     terrain_pipeline: wgpu::RenderPipeline,
     terrain_wire: Option<wgpu::RenderPipeline>,
-    veg_pipeline: wgpu::RenderPipeline,
-
-    tree_mesh: GpuMesh,
-    shrub_mesh: GpuMesh,
 
     overlay_pipeline: wgpu::RenderPipeline,
     overlay_quad: wgpu::Buffer,
@@ -275,7 +243,6 @@ impl Renderer {
 
         let sky_sh = shader(&device, "sky", include_str!("shaders/sky.wgsl"));
         let terrain_sh = shader(&device, "terrain", include_str!("shaders/terrain.wgsl"));
-        let veg_sh = shader(&device, "vegetation", include_str!("shaders/vegetation.wgsl"));
 
         let sky_pipeline = make_pipeline(&device, &pipeline_layout, &sky_sh, &[], format, PassKind::Sky, wgpu::PolygonMode::Fill);
         let terrain_pipeline = make_pipeline(&device, &pipeline_layout, &terrain_sh, &[vertex_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
@@ -284,7 +251,8 @@ impl Renderer {
         } else {
             None
         };
-        let veg_pipeline = make_pipeline(&device, &pipeline_layout, &veg_sh, &[vertex_layout(), instance_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
+        // Vegetation reuses the terrain pipeline: baked plant meshes are ordinary
+        // world-space triangles, lit and fogged exactly like the ground.
 
         // Overlay pipeline: no bind groups (pure screen-space), alpha blended.
         let overlay_sh = shader(&device, "overlay", include_str!("shaders/overlay.wgsl"));
@@ -355,11 +323,6 @@ impl Renderer {
             wgpu::PolygonMode::Fill,
         );
 
-        let tm = mesh::tree_mesh();
-        let sm = mesh::shrub_mesh();
-        let tree_mesh = GpuMesh::upload(&device, &tm.vertices, &tm.indices);
-        let shrub_mesh = GpuMesh::upload(&device, &sm.vertices, &sm.indices);
-
         Ok(Self {
             surface,
             device,
@@ -372,9 +335,6 @@ impl Renderer {
             sky_pipeline,
             terrain_pipeline,
             terrain_wire,
-            veg_pipeline,
-            tree_mesh,
-            shrub_mesh,
             overlay_pipeline,
             overlay_quad,
             overlay_instances: None,
@@ -447,9 +407,9 @@ impl Renderer {
 
     pub fn upload_chunk(&mut self, key: ChunkKey, cpu: CpuChunk) {
         let terrain = GpuMesh::upload(&self.device, &cpu.vertices, &cpu.indices);
-        let trees = InstanceBuf::upload(&self.device, &cpu.trees);
-        let shrubs = InstanceBuf::upload(&self.device, &cpu.shrubs);
-        self.chunks.insert(key, GpuChunk { terrain, trees, shrubs });
+        let veg = (!cpu.veg.indices.is_empty())
+            .then(|| GpuMesh::upload(&self.device, &cpu.veg.vertices, &cpu.veg.indices));
+        self.chunks.insert(key, GpuChunk { terrain, veg });
     }
 
     /// Drop chunks no longer needed, keeping memory bounded. Roots and anything
@@ -541,17 +501,16 @@ impl Renderer {
                 }
             }
 
-            // Vegetation (skip in wireframe mode to keep the debug view legible).
+            // Vegetation: each chunk's baked plant mesh, drawn with the terrain
+            // pipeline (same lit/fogged world-space triangles). Skipped in
+            // wireframe mode to keep the debug view legible.
             if !self.wireframe {
-                pass.set_pipeline(&self.veg_pipeline);
+                pass.set_pipeline(&self.terrain_pipeline);
                 for key in draw {
-                    if let Some(chunk) = self.chunks.get(key) {
-                        if let Some(trees) = &chunk.trees {
-                            draw_instanced(&mut pass, &self.tree_mesh, trees);
-                        }
-                        if let Some(shrubs) = &chunk.shrubs {
-                            draw_instanced(&mut pass, &self.shrub_mesh, shrubs);
-                        }
+                    if let Some(GpuChunk { veg: Some(veg), .. }) = self.chunks.get(key) {
+                        pass.set_vertex_buffer(0, veg.vbuf.slice(..));
+                        pass.set_index_buffer(veg.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..veg.count, 0, 0..1);
                     }
                 }
             }
@@ -579,13 +538,6 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
         frame.present();
     }
-}
-
-fn draw_instanced<'a>(pass: &mut wgpu::RenderPass<'a>, base: &'a GpuMesh, inst: &'a InstanceBuf) {
-    pass.set_vertex_buffer(0, base.vbuf.slice(..));
-    pass.set_vertex_buffer(1, inst.buf.slice(..));
-    pass.set_index_buffer(base.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-    pass.draw_indexed(0..base.count, 0, 0..inst.count);
 }
 
 /// Planet image shown in the help overlay, baked into the binary.
@@ -819,11 +771,9 @@ mod smoke {
 
         let sky_sh = shader(&device, "sky", include_str!("shaders/sky.wgsl"));
         let terrain_sh = shader(&device, "terrain", include_str!("shaders/terrain.wgsl"));
-        let veg_sh = shader(&device, "veg", include_str!("shaders/vegetation.wgsl"));
 
         let sky_p = make_pipeline(&device, &layout, &sky_sh, &[], format, PassKind::Sky, wgpu::PolygonMode::Fill);
         let terrain_p = make_pipeline(&device, &layout, &terrain_sh, &[vertex_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
-        let veg_p = make_pipeline(&device, &layout, &veg_sh, &[vertex_layout(), instance_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
 
         // Overlay pipeline (no bind groups) + its geometry.
         let overlay_sh = shader(&device, "overlay", include_str!("shaders/overlay.wgsl"));
@@ -892,14 +842,13 @@ mod smoke {
         });
         let overlay_count = overlay_geo.quads.len() as u32;
 
-        // One real chunk + base meshes.
+        // One real chunk, including its baked procedural vegetation.
         let planet = Planet::new(7);
         let key = ChunkKey { face: 2, level: 8, i: 128, j: 128 };
-        let cpu = CpuChunk::build(&planet, key, &mesh::MeshConfig::standard());
+        let cpu = CpuChunk::build(&planet, key, &crate::mesh::MeshConfig::standard());
         let terrain = GpuMesh::upload(&device, &cpu.vertices, &cpu.indices);
-        let trees = InstanceBuf::upload(&device, &cpu.trees);
-        let tm = mesh::tree_mesh();
-        let tree_mesh = GpuMesh::upload(&device, &tm.vertices, &tm.indices);
+        let veg = (!cpu.veg.indices.is_empty())
+            .then(|| GpuMesh::upload(&device, &cpu.veg.vertices, &cpu.veg.indices));
 
         // Camera looking at the chunk from above. Sit well clear of any peak so
         // the eye is never underground.
@@ -968,9 +917,11 @@ mod smoke {
             pass.set_vertex_buffer(0, terrain.vbuf.slice(..));
             pass.set_index_buffer(terrain.ibuf.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..terrain.count, 0, 0..1);
-            if let Some(t) = &trees {
-                pass.set_pipeline(&veg_p);
-                draw_instanced(&mut pass, &tree_mesh, t);
+            // Baked vegetation, drawn with the terrain pipeline.
+            if let Some(veg) = &veg {
+                pass.set_vertex_buffer(0, veg.vbuf.slice(..));
+                pass.set_index_buffer(veg.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..veg.count, 0, 0..1);
             }
             // Overlay on top — validates the overlay shader/pipeline/layout.
             pass.set_pipeline(&overlay_p);
@@ -1044,5 +995,267 @@ mod smoke {
         encoder.set_depth(png::BitDepth::Eight);
         encoder.write_header().unwrap().write_image_data(&rgba).expect("write png");
         eprintln!("wrote framebuffer to {}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod gallery {
+    //! Headless catalogue + in-situ renders of the procedural flora, dumped to
+    //! PNGs you can eyeball. Not correctness assertions — a way to *see* the plants
+    //! and iterate on how they look. Skip cleanly if no GPU adapter is present.
+    use super::*;
+    use crate::flora::Flora;
+    use crate::lod::ChunkKey;
+    use crate::mesh::{CpuChunk, MeshConfig};
+    use crate::planet::{self, Biome, Planet};
+    use glam::{Mat4, Vec3};
+
+    /// Render a world-space mesh with the real sky + terrain shaders from a given
+    /// camera and save it to `<tempdir>/<name>`. Returns false if no GPU is present.
+    fn render_and_save(verts: &[Vertex], idx: &[u32], eye: Vec3, target: Vec3, up: Vec3, fog: f32, name: &str) -> bool {
+        let mut idesc = wgpu::InstanceDescriptor::new_without_display_handle();
+        idesc.backends = wgpu::Backends::METAL | wgpu::Backends::DX12 | wgpu::Backends::VULKAN | wgpu::Backends::GL;
+        let instance = wgpu::Instance::new(idesc);
+        let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        })) {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("gallery: no GPU adapter available; skipping");
+                return false;
+            }
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("gallery"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            trace: wgpu::Trace::Off,
+        }))
+        .expect("device");
+
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let (w, h) = (1600u32, 800u32);
+
+        let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("g"),
+            size: std::mem::size_of::<Globals>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            }],
+        });
+        let globals_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals_buf.as_entire_binding() }],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+
+        let sky_sh = shader(&device, "sky", include_str!("shaders/sky.wgsl"));
+        let terrain_sh = shader(&device, "terrain", include_str!("shaders/terrain.wgsl"));
+        let sky_p = make_pipeline(&device, &layout, &sky_sh, &[], format, PassKind::Sky, wgpu::PolygonMode::Fill);
+        let terrain_p = make_pipeline(&device, &layout, &terrain_sh, &[vertex_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
+
+        let mesh = GpuMesh::upload(&device, verts, idx);
+
+        let view = Mat4::look_at_rh(eye, target, up);
+        let far = (eye - target).length() * 8.0 + 200.0;
+        let proj = Mat4::perspective_rh(55f32.to_radians(), w as f32 / h as f32, 0.4, far);
+        let vp = proj * view;
+        let sun = Vec3::new(0.4, 0.85, 0.5).normalize();
+        let g = Globals {
+            view_proj: vp.to_cols_array_2d(),
+            inv_view_proj: vp.inverse().to_cols_array_2d(),
+            camera_pos: [eye.x, eye.y, eye.z, 0.0],
+            sun_dir: [sun.x, sun.y, sun.z, 0.42], // w = ambient
+            params: [fog, -1000.0, 0.0, 0.0],     // radius < 0 so nothing reads as water
+            atmosphere: [0.55, 0.72, 0.96, 1.0],
+        };
+        queue.write_buffer(&globals_buf, 0, bytemuck::bytes_of(&g));
+
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gallery-color"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth_view = create_depth(&device, w, h);
+        let row_bytes = (w * 4).div_ceil(256) * 256;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: (row_bytes * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.55, g: 0.72, b: 0.96, a: 1.0 }), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, &globals_bind, &[]);
+            pass.set_pipeline(&sky_p);
+            pass.draw(0..3, 0..1);
+            pass.set_pipeline(&terrain_p);
+            pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
+            pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.count, 0, 0..1);
+        }
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &color, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row_bytes), rows_per_image: Some(h) },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit(Some(enc.finish()));
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range();
+        let mut rgba = Vec::with_capacity((w * 4 * h) as usize);
+        for r in 0..h {
+            let start = (r * row_bytes) as usize;
+            rgba.extend_from_slice(&data[start..start + (w * 4) as usize]);
+        }
+        let path = std::env::temp_dir().join(name);
+        let file = std::fs::File::create(&path).expect("create png");
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header().unwrap().write_image_data(&rgba).expect("write png");
+        eprintln!("wrote {}", path.display());
+        true
+    }
+
+    /// Append a local-space mesh to a scene buffer at `off`, scaled by `scale`.
+    fn add(verts: &mut Vec<Vertex>, idx: &mut Vec<u32>, src: &crate::mesh::MeshData, off: Vec3, scale: f32) {
+        let base = verts.len() as u32;
+        for v in &src.vertices {
+            let p = Vec3::from(v.pos) * scale + off;
+            verts.push(Vertex { pos: p.into(), normal: v.normal, color: v.color });
+        }
+        idx.extend(src.indices.iter().map(|&i| base + i));
+    }
+
+    #[test]
+    fn flora_gallery_renders() {
+        // A grid of species per biome on a flat ground: harsh/small near, lush/big far.
+        let flora = Flora::generate(7);
+        let rows = [
+            Biome::Tundra,
+            Biome::Desert,
+            Biome::Beach,
+            Biome::Grassland,
+            Biome::BorealForest,
+            Biome::TemperateForest,
+            Biome::TropicalForest,
+        ];
+        let cols = 8usize;
+        let (sx, sz) = (5.0f32, 6.5f32);
+        let mut verts: Vec<Vertex> = Vec::new();
+        let mut idx: Vec<u32> = Vec::new();
+
+        let gx = cols as f32 * sx * 0.5 + 4.0;
+        let (gz0, gz1) = (-6.0, rows.len() as f32 * sz + 4.0);
+        let gb = verts.len() as u32;
+        for &(x, z) in &[(-gx, gz0), (gx, gz0), (-gx, gz1), (gx, gz1)] {
+            verts.push(Vertex { pos: [x, 0.0, z], normal: [0.0, 1.0, 0.0], color: [0.28, 0.32, 0.19] });
+        }
+        idx.extend_from_slice(&[gb, gb + 2, gb + 1, gb + 1, gb + 2, gb + 3]);
+
+        for (r, biome) in rows.iter().enumerate() {
+            for c in 0..cols {
+                let hash = (c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (r as u64).wrapping_mul(0x0100_0000_01B3) ^ 0x5151_5151;
+                let Some(id) = flora.pick(*biome, hash) else { continue };
+                let off = Vec3::new((c as f32 - (cols as f32 - 1.0) * 0.5) * sx, 0.0, r as f32 * sz);
+                add(&mut verts, &mut idx, &flora.species(id).mesh, off, 1.0);
+            }
+        }
+
+        let eye = Vec3::new(0.0, 11.0, -15.0);
+        let target = Vec3::new(0.0, 3.0, rows.len() as f32 * sz * 0.45);
+        render_and_save(&verts, &idx, eye, target, Vec3::Y, 0.0, "planet_flora_gallery.png");
+    }
+
+    #[test]
+    #[ignore = "slow visual tool (scans chunks for a forest); run explicitly with --ignored"]
+    fn terrain_closeup_renders() {
+        // Find the most heavily-vegetated chunk among a scan, then frame it from
+        // just above treetop height to show clustering + terrain integration.
+        let planet = Planet::new(7);
+        let cfg = MeshConfig::new(48, 0, 700); // grid, min_level=0 (veg anywhere), density
+        let level = 14u32;
+        let span = 1u32 << level;
+        let mut best: Option<(ChunkKey, CpuChunk)> = None;
+        for face in [2u8, 4, 0, 5] {
+            for gi in 1..5u32 {
+                for gj in 1..5u32 {
+                    let key = ChunkKey { face, level, i: span * gi / 6, j: span * gj / 6 };
+                    let cpu = CpuChunk::build(&planet, key, &cfg);
+                    let n = cpu.veg.vertices.len();
+                    if n > best.as_ref().map_or(0, |(_, c)| c.veg.vertices.len()) {
+                        best = Some((key, cpu));
+                    }
+                }
+            }
+        }
+        let Some((key, cpu)) = best else { return };
+        if cpu.veg.vertices.is_empty() {
+            eprintln!("closeup: scan found no vegetated chunk; skipping");
+            return;
+        }
+        eprintln!("closeup: chunk {:?} with {} veg verts", key, cpu.veg.vertices.len());
+
+        // Combine terrain + baked veg (both already world-space).
+        let mut verts = cpu.vertices.clone();
+        let mut idx = cpu.indices.clone();
+        let base = verts.len() as u32;
+        verts.extend_from_slice(&cpu.veg.vertices);
+        idx.extend(cpu.veg.indices.iter().map(|&i| base + i));
+
+        // Camera: above ground, behind the chunk centre, looking across it.
+        let cdir = key.center_dir();
+        let center = cdir * planet.surface_radius(cdir);
+        let (t, _) = planet::tangent_basis(cdir);
+        let eye = center + cdir * 22.0 - t * 55.0;
+        let target = center + t * 20.0 + cdir * 6.0;
+        render_and_save(&verts, &idx, eye, target, cdir, 0.0, "planet_flora_closeup.png");
     }
 }

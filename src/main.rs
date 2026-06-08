@@ -18,6 +18,7 @@
 
 mod audio;
 mod camera;
+mod flora;
 mod font8x8;
 mod gfx;
 mod lod;
@@ -257,7 +258,7 @@ impl App {
         let polled = streamer.poll();
         let uploads = polled.len();
         for (key, cpu) in polled {
-            tracing::trace!(?key, verts = cpu.vertices.len(), trees = cpu.trees.len(), "chunk uploaded");
+            tracing::trace!(?key, verts = cpu.vertices.len(), veg_verts = cpu.veg.vertices.len(), "chunk uploaded");
             renderer.upload_chunk(key, cpu);
         }
 
