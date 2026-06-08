@@ -7,7 +7,7 @@ use crate::flora;
 use crate::lod::ChunkKey;
 use crate::planet::{self, Planet, Biome, FACES, PLANET_RADIUS};
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat3, Mat4, Vec3};
+use glam::{Mat4, Vec3};
 use rand::{RngExt, SeedableRng};
 use rand::rngs::StdRng;
 use std::f32::consts::TAU;
@@ -62,14 +62,33 @@ pub struct Vertex {
     pub color: [f32; 3],
 }
 
-/// Everything a worker produces for one chunk: the terrain mesh and a single
-/// baked vegetation mesh (every plant on the chunk, in world space, ready to draw
-/// in one call). Procedural per-planet species are baked in here rather than
-/// instanced, so a chunk can carry unlimited plant variety at no extra draw cost.
+/// One planted instance: the local→world transform (columns of a `Mat4`) and a
+/// colour tint. The renderer draws a species' shared base mesh once per instance,
+/// so a chunk stores ~80 bytes per plant instead of a baked copy of its geometry.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct VegInstance {
+    pub model: [[f32; 4]; 4],
+    pub tint: [f32; 4], // rgb tint; a unused
+}
+
+/// A chunk's vegetation as instances grouped by species: `instances` is one flat
+/// buffer, and `draws` is a `(species_id, start, count)` run per species so the
+/// renderer issues one instanced draw of each species' base mesh.
+#[derive(Default)]
+pub struct VegChunk {
+    pub instances: Vec<VegInstance>,
+    pub draws: Vec<(u32, u32, u32)>,
+}
+
+/// Everything a worker produces for one chunk: the terrain mesh and its vegetation
+/// as per-species instances (drawn against the shared base meshes the renderer holds
+/// — see `crate::flora`). Species geometry is *not* baked in, so a chunk's veg costs
+/// only a handful of bytes per plant.
 pub struct CpuChunk {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
-    pub veg: MeshData,
+    pub veg: VegChunk,
 }
 
 // Crack-hiding skirts around each chunk edge.
@@ -211,14 +230,14 @@ fn place_vegetation(
     size: f32,
     min_level: u32,
     density: usize,
-) -> MeshData {
-    let mut veg = MeshData { vertices: Vec::new(), indices: Vec::new() };
+) -> VegChunk {
     if key.level < min_level {
-        return veg;
+        return VegChunk::default();
     }
 
     let mut rng = StdRng::seed_from_u64(key.hash(planet.seed));
     let mut presence = [0.0f32; flora::SPECIES_PER_BIOME]; // scratch, refilled per attempt
+    let mut planted: Vec<(u32, VegInstance)> = Vec::new();
     for _ in 0..density {
         let u = u0 + size * rng.random::<f32>();
         let v = v0 + size * rng.random::<f32>();
@@ -266,32 +285,56 @@ fn place_vegetation(
         }
         let species = planet.flora.species(chosen);
 
-        // Plant it: upright on the surface, with a yaw spin and a size jitter.
+        // Plant it: upright on the surface, with a yaw spin and a size jitter — emit
+        // an instance (transform + tint) rather than baking the geometry.
         let up = dir;
         let yaw = rng.random_range(0.0..TAU);
         let scale = rng.random_range(species.scale_min..species.scale_max);
         let pos = up * (PLANET_RADIUS + s.height - VEG_SINK);
         let rot = planet::upright_rotation(up, yaw);
         let model = Mat4::from_scale_rotation_translation(Vec3::splat(scale), rot, pos);
-        let nmat = Mat3::from_quat(rot);
-        let tint = Vec3::splat(1.0 + (rng.random::<f32>() - 0.5) * VEG_TINT_JITTER);
-        bake_plant(&mut veg, &species.mesh, model, nmat, tint);
+        let t = 1.0 + (rng.random::<f32>() - 0.5) * VEG_TINT_JITTER;
+        planted.push((chosen, VegInstance { model: model.to_cols_array_2d(), tint: [t, t, t, 1.0] }));
     }
 
+    // Group instances by species into contiguous runs, one instanced draw each.
+    planted.sort_by_key(|(id, _)| *id);
+    let mut veg = VegChunk::default();
+    for (id, inst) in planted {
+        let start = veg.instances.len() as u32;
+        veg.instances.push(inst);
+        match veg.draws.last_mut() {
+            Some((sid, _, count)) if *sid == id => *count += 1,
+            _ => veg.draws.push((id, start, 1)),
+        }
+    }
     veg
 }
 
-/// Append one plant's local-space mesh into a chunk's vegetation mesh, baked to
-/// world space (positions via `model`, normals via the rotation `nmat`), tinted.
-fn bake_plant(dst: &mut MeshData, src: &MeshData, model: Mat4, nmat: Mat3, tint: Vec3) {
-    let base = dst.vertices.len() as u32;
-    for v in &src.vertices {
-        let p = model.transform_point3(Vec3::from(v.pos));
-        let n = (nmat * Vec3::from(v.normal)).normalize_or_zero();
-        let c = (Vec3::from(v.color) * tint).clamp(Vec3::ZERO, Vec3::ONE);
-        dst.vertices.push(Vertex { pos: p.into(), normal: n.into(), color: c.into() });
+/// Bake a chunk's instances back into one world-space mesh — for the visual tests
+/// only (at runtime the renderer draws them instanced). Mirrors `vegetation.wgsl`.
+#[cfg(test)]
+impl VegChunk {
+    pub fn bake(&self, flora: &crate::flora::Flora) -> MeshData {
+        let mut m = MeshData { vertices: Vec::new(), indices: Vec::new() };
+        for &(species, start, count) in &self.draws {
+            let src = &flora.species(species).mesh;
+            for inst in &self.instances[start as usize..(start + count) as usize] {
+                let model = Mat4::from_cols_array_2d(&inst.model);
+                let nmat = glam::Mat3::from_mat4(model);
+                let tint = Vec3::new(inst.tint[0], inst.tint[1], inst.tint[2]);
+                let base = m.vertices.len() as u32;
+                for v in &src.vertices {
+                    let p = model.transform_point3(Vec3::from(v.pos));
+                    let n = (nmat * Vec3::from(v.normal)).normalize_or_zero();
+                    let c = (Vec3::from(v.color) * tint).clamp(Vec3::ZERO, Vec3::ONE);
+                    m.vertices.push(Vertex { pos: p.into(), normal: n.into(), color: c.into() });
+                }
+                m.indices.extend(src.indices.iter().map(|&i| base + i));
+            }
+        }
+        m
     }
-    dst.indices.extend(src.indices.iter().map(|&i| base + i));
 }
 
 /// Linear-decay presence of one species at a point: 1 at its nearest seed point,

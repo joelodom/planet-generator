@@ -273,7 +273,7 @@ impl App {
         let polled = streamer.poll();
         let uploads = polled.len();
         for (key, cpu) in polled {
-            tracing::trace!(?key, verts = cpu.vertices.len(), veg_verts = cpu.veg.vertices.len(), "chunk uploaded");
+            tracing::trace!(?key, verts = cpu.vertices.len(), veg_instances = cpu.veg.instances.len(), "chunk uploaded");
             renderer.upload_chunk(key, cpu);
         }
 
@@ -281,22 +281,15 @@ impl App {
         let sel = lod::select(&self.planet, cam_pos, self.graphics.split_factor(), &|k| renderer.has_chunk(k));
         let draw_count = sel.draw.len();
 
-        // Request the nearest wanted chunks first — but only while under the memory
-        // budget. Over-committing past what fits makes eviction drop the chunks we
-        // need next frame, collapsing the LOD so the scene flashes between full detail
-        // and bare root chunks (worst in dense forest at high detail). Throttling
-        // keeps it stable: draw what fits, nearest first, streaming more only as
-        // eviction frees room.
-        if renderer.resident_bytes() < self.graphics.mem_budget_bytes() {
-            let mut want = sel.want;
-            want.sort_by(|a, b| {
-                let da = (a.center_dir() * self.planet.surface_radius(a.center_dir()) - cam_pos).length_squared();
-                let db = (b.center_dir() * self.planet.surface_radius(b.center_dir()) - cam_pos).length_squared();
-                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            for key in want.into_iter().take(MAX_REQUESTS_PER_FRAME) {
-                streamer.request(key);
-            }
+        // Request the nearest wanted chunks first.
+        let mut want = sel.want;
+        want.sort_by(|a, b| {
+            let da = (a.center_dir() * self.planet.surface_radius(a.center_dir()) - cam_pos).length_squared();
+            let db = (b.center_dir() * self.planet.surface_radius(b.center_dir()) - cam_pos).length_squared();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for key in want.into_iter().take(MAX_REQUESTS_PER_FRAME) {
+            streamer.request(key);
         }
 
         let keep: std::collections::HashSet<_> = sel.draw.iter().copied().collect();
@@ -422,7 +415,13 @@ impl ApplicationHandler for App {
             .with_fullscreen(Some(Fullscreen::Borderless(None)));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
 
-        let mut renderer = pollster::block_on(Renderer::new(window.clone())).expect("renderer init");
+        let mut renderer = {
+            // Per-species base meshes for instanced vegetation (uploaded once).
+            let veg_meshes: Vec<&mesh::MeshData> = (0..self.planet.flora.species_count())
+                .map(|i| &self.planet.flora.species(i as u32).mesh)
+                .collect();
+            pollster::block_on(Renderer::new(window.clone(), &veg_meshes)).expect("renderer init")
+        };
         self.camera.set_aspect(renderer.size.0, renderer.size.1);
         let (lines, hl) = overlay::menu(&self.graphics, self.menu_tab, self.menu_sel);
         renderer.set_overlay(lines, hl);

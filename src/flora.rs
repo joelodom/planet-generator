@@ -131,6 +131,12 @@ impl Flora {
         &self.species[id as usize]
     }
 
+    /// How many species exist (ids `0..species_count`). The renderer uploads each
+    /// one's base mesh once for instanced vegetation drawing.
+    pub fn species_count(&self) -> usize {
+        self.species.len()
+    }
+
     /// The species ids that grow in `biome` (empty if barren). The mesher evaluates
     /// each one's clustering at a point to decide which (if any) grows there.
     pub fn biome_species(&self, biome: Biome) -> &[u32] {

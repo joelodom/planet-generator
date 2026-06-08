@@ -152,14 +152,15 @@ big difference" at the target the project is explicitly built for.
 
 ### 🟡 Medium
 
-**M1 — Vegetation is baked per-chunk, not instanced.** _[Performance • effort L]_
-Each chunk bakes every plant into a unique world-space vertex buffer
-(`mesh.rs:266` `bake_plant`). The trade — unlimited variety + 1 draw/chunk — is
-deliberate and well-documented, but memory and upload bandwidth scale with *total
-plant count* (density 750 × many chunks at Ultra). This is the dominant memory
-consumer at high detail and overlaps H2. **Fix:** when pushing density on the
-5090, revisit per-species instancing (base mesh + per-instance transform buffer);
-the species library is bounded (~850 meshes) so the base-mesh set is small.
+**M1 — Vegetation is baked per-chunk, not instanced. ✅ FIXED (2026-06-08).** _[Performance • effort L]_
+Each chunk baked every plant into a unique world-space vertex buffer (`bake_plant`).
+The trade — unlimited variety + 1 draw/chunk — was deliberate, but memory scaled with
+*total plant count*, making it the dominant memory consumer and the cause of a
+high-detail "treetop flashing" thrash (the baked covering exceeded the memory budget).
+**Fixed by per-species instancing:** each species' base mesh is uploaded once and
+drawn with a per-instance transform + tint (`shaders/vegetation.wgsl`,
+`mesh::VegChunk`) — **~95× less veg memory** (a dense chunk: ~54 KB of instances vs
+~5 MB baked), so the covering fits the budget and density went back to full.
 
 **M2 — Eviction can thrash at the budget ceiling.** _[Performance • effort M]_
 `evict` keeps only the currently-drawn set + roots (`gfx.rs:417-423`; `keep` is

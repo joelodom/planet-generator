@@ -105,8 +105,8 @@ fn chunk_build_is_deterministic() {
     let a = CpuChunk::build(&p, key, &cfg);
     let b = CpuChunk::build(&p, key, &cfg);
     assert_eq!(a.vertices.len(), b.vertices.len());
-    assert_eq!(a.veg.vertices.len(), b.veg.vertices.len());
-    assert_eq!(a.veg.indices.len(), b.veg.indices.len());
+    assert_eq!(a.veg.instances.len(), b.veg.instances.len());
+    assert_eq!(a.veg.draws.len(), b.veg.draws.len());
     if let (Some(x), Some(y)) = (a.vertices.first(), b.vertices.first()) {
         assert_eq!(x.pos, y.pos);
     }

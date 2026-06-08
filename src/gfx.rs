@@ -7,7 +7,7 @@
 //! the rendering layer a thin, replaceable slab beneath the simulation.
 
 use crate::lod::ChunkKey;
-use crate::mesh::{CpuChunk, Vertex};
+use crate::mesh::{CpuChunk, MeshData, VegInstance, Vertex};
 use crate::overlay::{self, OverlayInstance};
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
@@ -58,15 +58,20 @@ fn mesh_bytes(verts: usize, indices: usize) -> usize {
     verts * std::mem::size_of::<Vertex>() + indices * std::mem::size_of::<u32>()
 }
 
-/// A terrain chunk plus its baked vegetation mesh, all GPU-resident. Vegetation
-/// is a single world-space mesh (grown by the worker from this planet's procedural
-/// species), so it draws in one call with the terrain pipeline — no instancing, no
-/// per-species state, unlimited plant variety per chunk.
+/// A chunk's vegetation on the GPU: one instance buffer plus a `(species, start,
+/// count)` run per species. Each run is one instanced draw of that species' shared
+/// base mesh (held by the renderer), so the chunk stores only the instances.
+struct GpuVeg {
+    instances: wgpu::Buffer,
+    draws: Vec<(u32, u32, u32)>,
+}
+
+/// A terrain chunk plus its vegetation instances, all GPU-resident.
 struct GpuChunk {
     terrain: GpuMesh,
-    veg: Option<GpuMesh>,
-    /// Approximate GPU bytes this chunk holds (terrain + veg vertex/index data),
-    /// summed into `Renderer.resident_bytes` so eviction can honour a real budget.
+    veg: Option<GpuVeg>,
+    /// Approximate GPU bytes this chunk holds (terrain mesh + veg instances), summed
+    /// into `Renderer.resident_bytes` so eviction can honour a real budget.
     bytes: usize,
     /// Renderer tick when this chunk was last drawn or uploaded — eviction keeps the
     /// most-recently-used and drops the oldest first.
@@ -81,6 +86,18 @@ fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
         array_stride: std::mem::size_of::<Vertex>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &VERT_ATTRS,
+    }
+}
+
+// Per-instance vegetation attributes: the 4 columns of the model matrix + a tint.
+const VEG_INSTANCE_ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+    3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4];
+
+fn veg_instance_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<VegInstance>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &VEG_INSTANCE_ATTRS,
     }
 }
 
@@ -123,6 +140,10 @@ pub struct Renderer {
     terrain_pipeline: wgpu::RenderPipeline,
     terrain_wire: Option<wgpu::RenderPipeline>,
 
+    // Vegetation: one base mesh per species (uploaded once), drawn instanced.
+    veg_pipeline: wgpu::RenderPipeline,
+    species_meshes: Vec<GpuMesh>,
+
     overlay_pipeline: wgpu::RenderPipeline,
     overlay_quad: wgpu::Buffer,
     overlay_instances: Option<(wgpu::Buffer, u32)>,
@@ -146,7 +167,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>) -> anyhow::Result<Self> {
+    pub async fn new(window: Arc<Window>, veg_meshes: &[&MeshData]) -> anyhow::Result<Self> {
         let size = window.inner_size();
         let size = (size.width.max(1), size.height.max(1));
 
@@ -268,8 +289,14 @@ impl Renderer {
         } else {
             None
         };
-        // Vegetation reuses the terrain pipeline: baked plant meshes are ordinary
-        // world-space triangles, lit and fogged exactly like the ground.
+        // Vegetation: instanced plants. Upload each species' base mesh once, plus a
+        // pipeline that transforms them per-instance (model matrix + tint).
+        let veg_sh = shader(&device, "vegetation", include_str!("shaders/vegetation.wgsl"));
+        let veg_pipeline = make_pipeline(&device, &pipeline_layout, &veg_sh, &[vertex_layout(), veg_instance_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
+        let species_meshes: Vec<GpuMesh> = veg_meshes
+            .iter()
+            .map(|m| GpuMesh::upload(&device, &m.vertices, &m.indices))
+            .collect();
 
         // Overlay pipeline: no bind groups (pure screen-space), alpha blended.
         let overlay_sh = shader(&device, "overlay", include_str!("shaders/overlay.wgsl"));
@@ -352,6 +379,8 @@ impl Renderer {
             sky_pipeline,
             terrain_pipeline,
             terrain_wire,
+            veg_pipeline,
+            species_meshes,
             overlay_pipeline,
             overlay_quad,
             overlay_instances: None,
@@ -425,11 +454,18 @@ impl Renderer {
     }
 
     pub fn upload_chunk(&mut self, key: ChunkKey, cpu: CpuChunk) {
-        let bytes = mesh_bytes(cpu.vertices.len(), cpu.indices.len())
-            + mesh_bytes(cpu.veg.vertices.len(), cpu.veg.indices.len());
-        let terrain = GpuMesh::upload(&self.device, &cpu.vertices, &cpu.indices);
-        let veg = (!cpu.veg.indices.is_empty())
-            .then(|| GpuMesh::upload(&self.device, &cpu.veg.vertices, &cpu.veg.indices));
+        let CpuChunk { vertices, indices, veg } = cpu;
+        let bytes =
+            mesh_bytes(vertices.len(), indices.len()) + veg.instances.len() * std::mem::size_of::<VegInstance>();
+        let terrain = GpuMesh::upload(&self.device, &vertices, &indices);
+        let veg = (!veg.instances.is_empty()).then(|| GpuVeg {
+            instances: self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("veg-instances"),
+                contents: bytemuck::cast_slice(&veg.instances),
+                usage: wgpu::BufferUsages::VERTEX,
+            }),
+            draws: veg.draws,
+        });
         // Replacing a key frees the old chunk's buffers — discount its bytes first.
         if let Some(old) = self.chunks.insert(key, GpuChunk { terrain, veg, bytes, last_used: self.tick }) {
             self.resident_bytes -= old.bytes;
@@ -564,12 +600,16 @@ impl Renderer {
             // pipeline (same lit/fogged world-space triangles). Skipped in
             // wireframe mode to keep the debug view legible.
             if !self.wireframe {
-                pass.set_pipeline(&self.terrain_pipeline);
+                pass.set_pipeline(&self.veg_pipeline);
                 for key in draw {
                     if let Some(GpuChunk { veg: Some(veg), .. }) = self.chunks.get(key) {
-                        pass.set_vertex_buffer(0, veg.vbuf.slice(..));
-                        pass.set_index_buffer(veg.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(0..veg.count, 0, 0..1);
+                        pass.set_vertex_buffer(1, veg.instances.slice(..));
+                        for &(species, start, count) in &veg.draws {
+                            let base = &self.species_meshes[species as usize];
+                            pass.set_vertex_buffer(0, base.vbuf.slice(..));
+                            pass.set_index_buffer(base.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..base.count, 0, start..start + count);
+                        }
                     }
                 }
             }
@@ -833,6 +873,8 @@ mod smoke {
 
         let sky_p = make_pipeline(&device, &layout, &sky_sh, &[], format, PassKind::Sky, wgpu::PolygonMode::Fill);
         let terrain_p = make_pipeline(&device, &layout, &terrain_sh, &[vertex_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
+        let veg_sh = shader(&device, "vegetation", include_str!("shaders/vegetation.wgsl"));
+        let veg_p = make_pipeline(&device, &layout, &veg_sh, &[vertex_layout(), veg_instance_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
 
         // Overlay pipeline (no bind groups) + its geometry.
         let overlay_sh = shader(&device, "overlay", include_str!("shaders/overlay.wgsl"));
@@ -906,8 +948,25 @@ mod smoke {
         let key = ChunkKey { face: 2, level: 8, i: 128, j: 128 };
         let cpu = CpuChunk::build(&planet, key, &crate::mesh::MeshConfig::standard());
         let terrain = GpuMesh::upload(&device, &cpu.vertices, &cpu.indices);
-        let veg = (!cpu.veg.indices.is_empty())
-            .then(|| GpuMesh::upload(&device, &cpu.veg.vertices, &cpu.veg.indices));
+        // Vegetation: per-species base meshes + a synthetic instance at the chunk
+        // centre, to validate the instanced pipeline/draw (real per-chunk placement
+        // is exercised visually by the closeup render).
+        let species_meshes: Vec<GpuMesh> = (0..planet.flora.species_count())
+            .map(|i| {
+                let m = &planet.flora.species(i as u32).mesh;
+                GpuMesh::upload(&device, &m.vertices, &m.indices)
+            })
+            .collect();
+        let veg_dir = key.center_dir();
+        let veg_inst = VegInstance {
+            model: glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(40.0), glam::Quat::IDENTITY, veg_dir * planet.surface_radius(veg_dir)).to_cols_array_2d(),
+            tint: [1.0, 1.0, 1.0, 1.0],
+        };
+        let veg_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[veg_inst]),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
 
         // Camera looking at the chunk from above. Sit well clear of any peak so
         // the eye is never underground.
@@ -976,11 +1035,13 @@ mod smoke {
             pass.set_vertex_buffer(0, terrain.vbuf.slice(..));
             pass.set_index_buffer(terrain.ibuf.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..terrain.count, 0, 0..1);
-            // Baked vegetation, drawn with the terrain pipeline.
-            if let Some(veg) = &veg {
-                pass.set_vertex_buffer(0, veg.vbuf.slice(..));
-                pass.set_index_buffer(veg.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..veg.count, 0, 0..1);
+            // Vegetation: instanced (validates vegetation.wgsl + the instanced draw).
+            if let Some(base) = species_meshes.first() {
+                pass.set_pipeline(&veg_p);
+                pass.set_vertex_buffer(1, veg_buf.slice(..));
+                pass.set_vertex_buffer(0, base.vbuf.slice(..));
+                pass.set_index_buffer(base.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..base.count, 0, 0..1);
             }
             // Overlay on top — validates the overlay shader/pipeline/layout.
             pass.set_pipeline(&overlay_p);
@@ -1292,26 +1353,28 @@ mod gallery {
                 for gj in 1..5u32 {
                     let key = ChunkKey { face, level, i: span * gi / 6, j: span * gj / 6 };
                     let cpu = CpuChunk::build(&planet, key, &cfg);
-                    let n = cpu.veg.vertices.len();
-                    if n > best.as_ref().map_or(0, |(_, c)| c.veg.vertices.len()) {
+                    let n = cpu.veg.instances.len();
+                    if n > best.as_ref().map_or(0, |(_, c)| c.veg.instances.len()) {
                         best = Some((key, cpu));
                     }
                 }
             }
         }
         let Some((key, cpu)) = best else { return };
-        if cpu.veg.vertices.is_empty() {
+        if cpu.veg.instances.is_empty() {
             eprintln!("closeup: scan found no vegetated chunk; skipping");
             return;
         }
-        eprintln!("closeup: chunk {:?} with {} veg verts", key, cpu.veg.vertices.len());
+        eprintln!("closeup: chunk {:?} with {} veg instances", key, cpu.veg.instances.len());
 
-        // Combine terrain + baked veg (both already world-space).
+        // Combine terrain + vegetation. The instances are baked back to world-space
+        // verts just for this offscreen render; the live renderer draws them instanced.
         let mut verts = cpu.vertices.clone();
         let mut idx = cpu.indices.clone();
+        let veg = cpu.veg.bake(&planet.flora);
         let base = verts.len() as u32;
-        verts.extend_from_slice(&cpu.veg.vertices);
-        idx.extend(cpu.veg.indices.iter().map(|&i| base + i));
+        verts.extend_from_slice(&veg.vertices);
+        idx.extend(veg.indices.iter().map(|&i| base + i));
 
         // Camera: above ground, behind the chunk centre, looking across it.
         let cdir = key.center_dir();

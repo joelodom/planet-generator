@@ -23,27 +23,26 @@ const GRID_MAX: u32 = 88;
 const VEG_LEVEL_NEAR: u32 = 15; // veg only on small/near chunks (low detail) ...
 const VEG_LEVEL_FAR: u32 = 11; // ... out to bigger/farther chunks (high detail)
 const DENSITY_MIN: u32 = 30; // vegetation attempts per chunk
-// Capped so a fully-subdivided dense forest's *drawn* chunks fit the memory budget:
-// plants baked into each chunk mesh are the dominant cost, and a covering that
-// overshoots the budget forces eviction of chunks we need this frame, thrashing the
-// LOD (the treetop flashing). Vegetation instancing (BACKLOG.md, High) is what lets
-// this go back up without the memory blow-up.
-const DENSITY_MAX: u32 = 250;
+// Vegetation is instanced now (each plant is ~80 bytes, not a baked mesh), so density
+// is cheap on GPU memory again. The CPU cost of placement still scales with this.
+const DENSITY_MAX: u32 = 750;
 
 const DETAIL_STEP: f32 = 0.05;
 
 // Memory budget for resident geometry, in MB. The low end suits a 2–4 GB laptop
 // GPU; the high end gives a 5090 room to keep a lot of fine geometry resident.
 const MEM_MIN_MB: u32 = 256;
-const MEM_MAX_MB: u32 = 8_192; // 8 GB
+const MEM_MAX_MB: u32 = 16_384; // 16 GB — for big unified-memory Macs / the 5090 box
 const MEM_STEP_MB: u32 = 256;
 
-/// (name, detail 0..1, memory budget MB) — tiers from a cheap laptop GPU to a 5090.
+/// (name, detail 0..1, memory budget MB) — tiers from a cheap laptop to a 5090. With
+/// instanced vegetation the budget is mostly terrain + cache, so these run liberal:
+/// an 18 GB Mac has ample room for High at 8 GB.
 const PRESETS: [(&str, f32, u32); 4] = [
-    ("Low", 0.10, 512),     // weak/integrated laptop GPU
-    ("Medium", 0.35, 1_536), // decent laptop / entry desktop
-    ("High", 0.65, 4_096),   // solid gaming GPU
-    ("Ultra", 1.00, MEM_MAX_MB), // 5090 — maxes out everything
+    ("Low", 0.10, 1_024),    // weak/integrated laptop GPU
+    ("Medium", 0.35, 3_072), // decent laptop / entry desktop
+    ("High", 0.65, 8_192),   // solid gaming GPU / 16 GB+ unified memory
+    ("Ultra", 1.00, MEM_MAX_MB), // 5090 / 32 GB+ — maxes out everything
 ];
 const DEFAULT_PRESET: usize = 2; // High
 const CUSTOM: &str = "Custom";
