@@ -4,8 +4,8 @@
 //! reshuffled and played again — forever. A reshuffle never starts on the track
 //! that just finished, so you don't hear the same song twice in a row.
 //!
-//! Adding music is a one-liner: drop an mp3 in `assets/` and add a `(name, bytes)`
-//! entry to [`TRACKS`]. Everything is embedded so the app stays self-contained.
+//! Adding music is a one-liner: drop an mp3 in `assets/` and add an `include_bytes!`
+//! line to [`TRACKS`]. Everything is embedded so the app stays self-contained.
 //!
 //! Audio is best-effort: with no output device the app simply runs silent.
 
@@ -15,13 +15,16 @@ use std::io::Cursor;
 
 /// The playlist. Order here is irrelevant (it's always shuffled). To add a song,
 /// put the mp3 in `assets/` and add a line below.
-const TRACKS: &[(&str, &[u8])] = &[
-    ("soundtrack", include_bytes!("../assets/soundtrack.mp3")),
-    ("Atlas of Dawn", include_bytes!("../assets/soundtrack2.mp3")),
-    ("Silver Crown March", include_bytes!("../assets/soundtrack3.mp3")),
-    ("Trail in Pine", include_bytes!("../assets/soundtrack4.mp3")),
-    ("Trailside Drift", include_bytes!("../assets/soundtrack5.mp3")),
-    ("Paper Kite Morning", include_bytes!("../assets/soundtrack6.mp3")),
+const TRACKS: &[&[u8]] = &[
+    include_bytes!("../assets/soundtrack.mp3"),
+    include_bytes!("../assets/soundtrack2.mp3"),
+    include_bytes!("../assets/soundtrack3.mp3"),
+    include_bytes!("../assets/soundtrack4.mp3"),
+    include_bytes!("../assets/soundtrack5.mp3"),
+    include_bytes!("../assets/soundtrack6.mp3"),
+    include_bytes!("../assets/soundtrack7.mp3"),
+    include_bytes!("../assets/soundtrack8.mp3"),
+    include_bytes!("../assets/soundtrack9.mp3"),
 ];
 
 /// Holds the audio output alive and drives the playlist. Drop to stop playback.
@@ -80,18 +83,17 @@ impl Audio {
 
         let mut queued_last = self.last_played;
         for &i in &order {
-            match rodio::Decoder::new(Cursor::new(TRACKS[i].1)) {
+            match rodio::Decoder::new(Cursor::new(TRACKS[i])) {
                 Ok(src) => {
                     self.player.append(src);
                     queued_last = Some(i);
                 }
-                Err(e) => tracing::warn!(track = TRACKS[i].0, error = %e, "audio: failed to decode track; skipping"),
+                Err(e) => tracing::warn!(track = i, error = %e, "audio: failed to decode track; skipping"),
             }
         }
         self.last_played = queued_last;
 
-        let names: Vec<&str> = order.iter().map(|&i| TRACKS[i].0).collect();
-        tracing::info!(order = ?names, "soundtrack playlist shuffled");
+        tracing::info!(order = ?order, "soundtrack playlist shuffled");
     }
 }
 
@@ -103,11 +105,11 @@ mod tests {
     #[test]
     fn all_tracks_decode() {
         assert!(TRACKS.len() >= 2, "playlist should have multiple tracks");
-        for (name, bytes) in TRACKS {
+        for (i, bytes) in TRACKS.iter().enumerate() {
             let d = rodio::Decoder::new(std::io::Cursor::new(*bytes))
-                .unwrap_or_else(|e| panic!("decode {name}: {e}"));
-            assert!(d.sample_rate().get() > 0, "{name} has no sample rate");
-            assert!(d.channels().get() >= 1, "{name} has no channels");
+                .unwrap_or_else(|e| panic!("decode track {i}: {e}"));
+            assert!(d.sample_rate().get() > 0, "track {i} has no sample rate");
+            assert!(d.channels().get() >= 1, "track {i} has no channels");
         }
     }
 }
