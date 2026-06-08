@@ -95,12 +95,29 @@ pub struct CpuChunk {
 const SKIRT_DEPTH_FACTOR: f32 = 3.0; // skirt depth ≈ this × a terrain quad's width
 const SKIRT_MIN_DEPTH: f32 = 2.0; // render units
 
-// Vegetation scatter. Density (attempts per chunk) and the min LOD level are
-// runtime settings (see MeshConfig); the rest is fixed tuning.
+// Vegetation scatter. The density knob and min LOD level are runtime settings (see
+// MeshConfig); the rest is fixed tuning.
 const VEG_MIN_GROUND_HEIGHT: f32 = 1.0; // skip water/waterline (render units)
 const VEG_MAX_STEEPNESS: f32 = 0.5; // skip cliffs
-const VEG_SINK: f32 = 0.15; // bury each plant's base this deep to hide the seam
+const VEG_SINK: f32 = 0.15; // bury a full-size plant's base this deep to hide the seam (× scale)
 const VEG_TINT_JITTER: f32 = 0.06; // ± per-plant brightness so a stand isn't uniform
+
+// Area-proportional placement. The old model made a flat `density` attempts for
+// EVERY chunk regardless of size, so a fine near chunk packed the same count into
+// ~1/4-per-LOD-level the ground area of a coarse far one — the near-field "wall of
+// trees", and a total plant count that ballooned as you zoomed in. Instead we scale
+// attempts by the chunk's actual ground area, so *areal* plant density is
+// LOD-independent (a patch looks as dense from orbit as underfoot), and cap it so a
+// large coarse chunk can't request tens of thousands of plants.
+const VEG_REFERENCE_AREA: f32 = 1_100.0; // ground area (unit²; ≈1.1 ha) at which `density` == raw attempts
+const VEG_MAX_ATTEMPTS: usize = 384; // per-chunk attempt (hence instance) cap — bounds CPU + Pool-B memory
+
+// Per-plant age/size: a reverse-J distribution (many young/small, few mature) drawn
+// as a skewed power law, so a stand isn't all one size — and, since most plants come
+// out small, scenes read more open. Multiplies the species' mature size on top of
+// the fine ± scale jitter.
+const VEG_AGE_MIN: f32 = 0.45; // youngest plant = this × the species' mature size
+const VEG_AGE_SKEW: f32 = 1.8; // >1 skews the population toward young/small
 
 // Per-species clustering. Each species (see `flora`) has its own linear-decay
 // radius: certain at a seed point, fading to zero that far out. A species' seed
@@ -217,9 +234,20 @@ impl CpuChunk {
     }
 }
 
+/// Area-proportional, capped placement-attempt count for a chunk of face-space edge
+/// `size` (cube coords, where a full face spans `[-1, 1]`) at detail `density`.
+/// Ground area ≈ `(size · PLANET_RADIUS)²`; attempts scale with it against
+/// [`VEG_REFERENCE_AREA`] so areal density is LOD-independent, capped by
+/// [`VEG_MAX_ATTEMPTS`].
+fn veg_attempts(size: f32, density: usize) -> usize {
+    let area = (size * PLANET_RADIUS).powi(2);
+    ((density as f32 * area / VEG_REFERENCE_AREA).round() as usize).min(VEG_MAX_ATTEMPTS)
+}
+
 /// Deterministically scatter vegetation across a chunk according to biome rules.
 /// Seeded by the chunk key so the same ground always grows the same plants.
-/// `min_level` gates how far out plants appear; `density` is attempts per chunk.
+/// `min_level` gates how far out plants appear; `density` sets the areal placement
+/// rate, turned into a capped, area-proportional attempt count (see [`veg_attempts`]).
 #[allow(clippy::too_many_arguments)]
 fn place_vegetation(
     planet: &Planet,
@@ -238,7 +266,7 @@ fn place_vegetation(
     let mut rng = StdRng::seed_from_u64(key.hash(planet.seed));
     let mut presence = [0.0f32; flora::SPECIES_PER_BIOME]; // scratch, refilled per attempt
     let mut planted: Vec<(u32, VegInstance)> = Vec::new();
-    for _ in 0..density {
+    for _ in 0..veg_attempts(size, density) {
         let u = u0 + size * rng.random::<f32>();
         let v = v0 + size * rng.random::<f32>();
         let cube = face.base + face.right * u + face.up * v;
@@ -289,8 +317,12 @@ fn place_vegetation(
         // an instance (transform + tint) rather than baking the geometry.
         let up = dir;
         let yaw = rng.random_range(0.0..TAU);
-        let scale = rng.random_range(species.scale_min..species.scale_max);
-        let pos = up * (PLANET_RADIUS + s.height - VEG_SINK);
+        // Reverse-J age: most plants young/small, a few mature (see VEG_AGE_*).
+        let age = VEG_AGE_MIN + (1.0 - VEG_AGE_MIN) * rng.random::<f32>().powf(VEG_AGE_SKEW);
+        let scale = rng.random_range(species.scale_min..species.scale_max) * age;
+        // Sink the base to hide the ground seam, scaled by the plant so a small young
+        // one isn't buried whole (the seam to hide scales with the plant's footprint).
+        let pos = up * (PLANET_RADIUS + s.height - VEG_SINK * scale);
         let rot = planet::upright_rotation(up, yaw);
         let model = Mat4::from_scale_rotation_translation(Vec3::splat(scale), rot, pos);
         let t = 1.0 + (rng.random::<f32>() - 0.5) * VEG_TINT_JITTER;
@@ -440,5 +472,24 @@ mod tests {
         // Across the same 50 m steps the tiny species varies far faster than the broad
         // one (clusters at metres, not hundreds of km).
         assert!(small_var > big_var * 5.0, "small-radius species should vary far faster ({small_var:.1} vs {big_var:.1})");
+    }
+
+    #[test]
+    fn veg_attempts_scale_with_area_and_cap() {
+        // Edge length (cube coords) of a chunk at a given LOD level: a face spans [-1, 1].
+        let edge = |level: u32| 2.0 / (1u32 << level) as f32;
+
+        // Doubling the LOD edge quadruples ground area, so ~4× the attempts — i.e.
+        // areal density is LOD-independent (the whole point of the redesign).
+        let fine = veg_attempts(edge(16), 100);
+        let coarse = veg_attempts(edge(15), 100);
+        assert!(fine > 0, "a fine chunk should still get some attempts");
+        assert!((coarse as f32 / fine as f32 - 4.0).abs() < 0.5, "≈4× area ⇒ ≈4× attempts ({fine} → {coarse})");
+
+        // A large coarse chunk is bounded by the cap, never tens of thousands.
+        assert_eq!(veg_attempts(edge(10), 750), VEG_MAX_ATTEMPTS, "coarse chunk must hit the cap");
+
+        // Zero density ⇒ no vegetation.
+        assert_eq!(veg_attempts(edge(16), 0), 0);
     }
 }
