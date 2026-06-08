@@ -3,7 +3,11 @@
 //! unit-testable; the renderer just uploads the instances and draws them.
 
 use crate::font8x8::FONT8X8;
+use crate::settings::Graphics;
 use bytemuck::{Pod, Zeroable};
+
+/// Width (chars) of a settings slider bar, e.g. `[####------]`.
+const BAR_WIDTH: usize = 10;
 
 /// One solid-color rectangle in normalized device coordinates. `rect` is
 /// `(x, y, w, h)` where `(x, y)` is the top-left and `h` is negative (NDC y is
@@ -25,31 +29,69 @@ impl OverlayInstance {
     }
 }
 
-/// The help text. Composed here so the build version/date (stamped via `build.rs`)
-/// show on the overlay exactly as in the logs.
-pub fn help_lines() -> Vec<String> {
+/// Title + build stamp (matches the log) — shown at the top of the overlay.
+fn header_lines() -> Vec<String> {
     let built = env!("BUILD_DATE").replace('T', " ").replace('Z', " UTC");
-    // Quit shortcut differs by platform (Cmd on macOS, Ctrl elsewhere).
-    let quit = if cfg!(target_os = "macos") { "Cmd-Q" } else { "Ctrl-Q" };
     vec![
         "PLANET EXPLORER".to_string(),
-        format!("version {}    build {}", env!("CARGO_PKG_VERSION"), env!("GIT_HASH")),
+        format!("version {}   build {}", env!("CARGO_PKG_VERSION"), env!("GIT_HASH")),
         format!("built {built}"),
-        String::new(),
-        "CONTROLS  (Google Earth style, keyboard)".to_string(),
-        "Arrow keys    pan across the surface".to_string(),
-        "W / S  (+ -)  zoom in / out".to_string(),
-        "A / D         rotate (spin) the view".to_string(),
-        "Q / E         tilt (top-down <-> horizon)".to_string(),
-        "Shift         move faster (hold)".to_string(),
-        "T             guided tour (relaxing autopilot)".to_string(),
-        "R             teleport to a random spot".to_string(),
-        "P             print location to the log".to_string(),
-        "G             toggle wireframe".to_string(),
-        String::new(),
-        "ESC           toggle this help".to_string(),
-        format!("{quit:<13} quit  (or close the window)"),
     ]
+}
+
+/// The key-bindings block.
+fn control_lines() -> Vec<String> {
+    let quit = if cfg!(target_os = "macos") { "Cmd-Q" } else { "Ctrl-Q" };
+    vec![
+        "CONTROLS  (Google Earth style, keyboard)".to_string(),
+        "Arrow keys    pan  /  move + adjust settings".to_string(),
+        "W / S  (+ -)  zoom in / out".to_string(),
+        "A / D         rotate     Q / E   tilt".to_string(),
+        "Shift         move faster (hold)".to_string(),
+        "T  tour    R  teleport    P  location    G  wireframe".to_string(),
+        format!("ESC  close menu              {quit}  quit"),
+    ]
+}
+
+/// Plain help text (no live settings) — used by the offscreen smoke test.
+#[cfg(test)]
+pub fn help_lines() -> Vec<String> {
+    let mut v = header_lines();
+    v.push(String::new());
+    v.extend(control_lines());
+    v
+}
+
+fn bar(frac: f32) -> String {
+    let fill = (frac.clamp(0.0, 1.0) * BAR_WIDTH as f32).round() as usize;
+    let mut s = String::with_capacity(BAR_WIDTH + 2);
+    s.push('[');
+    for i in 0..BAR_WIDTH {
+        s.push(if i < fill { '#' } else { '-' });
+    }
+    s.push(']');
+    s
+}
+
+/// Build the full ESC menu — graphics settings (with sliders) above the controls
+/// — and the row index that should be highlighted (the selected setting).
+pub fn menu(graphics: &Graphics, selected: usize) -> (Vec<String>, usize) {
+    let mut lines = header_lines();
+    lines.push(String::new());
+    lines.push("GRAPHICS   up/down: select    left/right: adjust".to_string());
+    let settings_start = lines.len();
+    for (i, row) in graphics.rows().iter().enumerate() {
+        let marker = if i == selected { '>' } else { ' ' };
+        let body = match row.frac {
+            Some(f) => format!("{}  {:>6}", bar(f), row.value),
+            None => format!("  < {} >", row.value),
+        };
+        lines.push(format!("{} {:<15} {}", marker, row.label, body));
+    }
+    let highlight = settings_start + selected;
+    lines.push(String::new());
+    lines.extend(control_lines());
+    (lines, highlight)
 }
 
 /// Result of laying out the help overlay: solid-color quads (backdrop, panel,
@@ -69,11 +111,13 @@ const SCALE_MIN: f32 = 2.0; // smallest/largest integer pixel scale tried
 const SCALE_MAX: f32 = 5.0;
 const FIT_FRACTION: f32 = 0.9; // the group must fit within this fraction of the screen
 const IMG_HEIGHT_FRACTION: f32 = 0.94; // planet disc a touch shorter than the text block
+const IMG_MAX_ROWS: f32 = 11.0; // cap the disc so a tall settings panel isn't dwarfed
 const BORDER_PX: f32 = 2.0; // panel border thickness (unscaled)
 
 /// Lay out `lines` centered on a `screen_w` x `screen_h` surface, with the planet
-/// image to the right of the text inside one bordered panel.
-pub fn layout(lines: &[String], screen_w: u32, screen_h: u32) -> OverlayGeometry {
+/// image to the right of the text inside one bordered panel. `highlight` is the
+/// index of a row to draw as the selected setting (use `usize::MAX` for none).
+pub fn layout(lines: &[String], highlight: usize, screen_w: u32, screen_h: u32) -> OverlayGeometry {
     let sw = screen_w.max(1) as f32;
     let sh = screen_h.max(1) as f32;
 
@@ -96,7 +140,7 @@ pub fn layout(lines: &[String], screen_w: u32, screen_h: u32) -> OverlayGeometry
     let line_h = LINE_PX * scale;
     let block_w = cols * char_adv;
     let block_h = rows * line_h;
-    let img = block_h * IMG_HEIGHT_FRACTION; // planet disc, a touch shorter than the text block
+    let img = (block_h * IMG_HEIGHT_FRACTION).min(IMG_MAX_ROWS * line_h); // capped planet disc
     let gap = GAP_CELLS * char_adv;
     let group_w = block_w + gap + img;
 
@@ -117,9 +161,16 @@ pub fn layout(lines: &[String], screen_w: u32, screen_h: u32) -> OverlayGeometry
 
     let title = [0.55, 0.80, 1.0, 1.0];
     let body = [0.92, 0.95, 1.0, 1.0];
+    let accent = [1.0, 0.86, 0.35, 1.0]; // selected settings row
+
+    // Highlight bar behind the selected row.
+    if highlight < lines.len() {
+        let hy = oy + highlight as f32 * line_h;
+        push(ox - pad * 0.5, hy - line_h * 0.1, block_w + pad, line_h, [0.20, 0.34, 0.52, 0.85]);
+    }
 
     for (r, line) in lines.iter().enumerate() {
-        let color = if r == 0 { title } else { body };
+        let color = if r == highlight { accent } else if r == 0 { title } else { body };
         let base_y = oy + r as f32 * line_h;
         for (k, ch) in line.chars().enumerate() {
             let code = ch as usize;
@@ -154,7 +205,7 @@ mod tests {
     #[test]
     fn layout_is_nonempty_and_in_ndc() {
         let lines = help_lines();
-        let geo = layout(&lines, 1280, 800);
+        let geo = layout(&lines, usize::MAX, 1280, 800);
         // Backdrop + border + panel + many glyph pixels.
         assert!(geo.quads.len() > 1000, "expected substantial text geometry, got {}", geo.quads.len());
         for q in geo.quads.iter().chain(std::iter::once(&geo.image)) {
@@ -171,7 +222,7 @@ mod tests {
     fn scales_down_for_tiny_windows() {
         // A tiny surface must still produce geometry without panicking.
         let lines = help_lines();
-        let geo = layout(&lines, 320, 240);
+        let geo = layout(&lines, usize::MAX, 320, 240);
         assert!(!geo.quads.is_empty());
     }
 }

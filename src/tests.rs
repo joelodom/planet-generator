@@ -78,7 +78,7 @@ fn chunk_mesh_is_well_formed() {
     let p = Planet::new(99);
     // A deep chunk where vegetation should appear.
     let key = ChunkKey { face: 2, level: 7, i: 40, j: 40 };
-    let c = CpuChunk::build(&p, key);
+    let c = CpuChunk::build(&p, key, &crate::mesh::MeshConfig::standard());
     assert!(!c.vertices.is_empty() && !c.indices.is_empty());
     assert_eq!(c.indices.len() % 3, 0, "indices must form triangles");
     let vmax = c.vertices.len() as u32;
@@ -101,8 +101,9 @@ fn chunk_mesh_is_well_formed() {
 fn chunk_build_is_deterministic() {
     let p = Planet::new(5);
     let key = ChunkKey { face: 0, level: 6, i: 10, j: 20 };
-    let a = CpuChunk::build(&p, key);
-    let b = CpuChunk::build(&p, key);
+    let cfg = crate::mesh::MeshConfig::standard();
+    let a = CpuChunk::build(&p, key, &cfg);
+    let b = CpuChunk::build(&p, key, &cfg);
     assert_eq!(a.vertices.len(), b.vertices.len());
     assert_eq!(a.trees.len(), b.trees.len());
     assert_eq!(a.shrubs.len(), b.shrubs.len());
@@ -117,10 +118,10 @@ fn lod_selection_covers_visible_world() {
     // From orbit, with all roots "ready", we should draw something and not panic.
     let cam = Vec3::new(0.0, 0.0, 1.0) * (PLANET_RADIUS + 2000.0);
     let roots: std::collections::HashSet<_> = ChunkKey::roots().into_iter().collect();
-    let sel = lod::select(&p, cam, &|k| roots.contains(&k));
+    let sel = lod::select(&p, cam, 1.7, &|k| roots.contains(&k));
     assert!(!sel.draw.is_empty(), "should draw visible roots from orbit");
     // Closer in, it should want finer chunks than it currently has.
     let near = Vec3::new(0.0, 0.0, 1.0) * (PLANET_RADIUS + 30.0);
-    let sel2 = lod::select(&p, near, &|k| roots.contains(&k));
+    let sel2 = lod::select(&p, near, 1.7, &|k| roots.contains(&k));
     assert!(!sel2.want.is_empty(), "near the surface it should request detail");
 }

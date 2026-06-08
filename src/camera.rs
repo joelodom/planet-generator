@@ -174,6 +174,11 @@ impl Camera {
         self.aspect = (w.max(1) as f32) / (h.max(1) as f32);
     }
 
+    /// Release every held movement key (used when the settings menu grabs input).
+    pub fn release_keys(&mut self) {
+        self.keys = Keys::default();
+    }
+
     pub fn key(&mut self, code: KeyAction, pressed: bool) {
         match code {
             KeyAction::PanForward => self.keys.pan_fwd = pressed,

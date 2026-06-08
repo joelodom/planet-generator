@@ -25,6 +25,7 @@ mod logging;
 mod mesh;
 mod overlay;
 mod planet;
+mod settings;
 mod tour;
 mod units;
 #[cfg(test)]
@@ -46,9 +47,8 @@ use winit::window::{Window, WindowId};
 
 const SUN_AMBIENT: f32 = 0.32;
 /// Cap chunk requests per frame so a fast camera can't flood the work queue.
-const MAX_REQUESTS_PER_FRAME: usize = 48;
-/// Soft limit on resident GPU chunks before far ones get evicted.
-const CHUNK_CACHE_LIMIT: usize = 1800;
+/// (The resident-chunk cap is a runtime graphics setting — see `settings.rs`.)
+const MAX_REQUESTS_PER_FRAME: usize = 64;
 
 /// Soundtrack playback volume (0..1).
 const AUDIO_VOLUME: f32 = 0.5;
@@ -157,7 +157,7 @@ fn print_controls() {
          R               teleport to a random spot\n  \
          P               print location & seed\n  \
          G               toggle wireframe\n  \
-         Esc             toggle help overlay\n  \
+         Esc             graphics settings + help (arrows adjust)\n  \
          {quit} / close  quit\n"
     );
 }
@@ -177,6 +177,14 @@ struct App {
     units: units::Units,
     tour: Option<tour::Tour>,
 
+    // Graphics settings + the ESC settings menu.
+    graphics: settings::Graphics,
+    mesh_cfg: Arc<mesh::MeshConfig>,
+    menu_open: bool,
+    menu_sel: usize,
+    /// Rebuild-relevant settings captured when the menu opened, to detect change.
+    menu_open_sig: (u32, u32, u32),
+
     // Performance sampling (aggregated, logged at DEBUG every couple seconds).
     perf_accum: f32,
     perf_frames: u32,
@@ -190,6 +198,8 @@ impl App {
         // Start in orbit above a pleasant mid-latitude.
         let anchor = Vec3::new(0.4, 0.5, 0.77).normalize();
         let camera = Camera::new(&planet, anchor);
+        let graphics = settings::Graphics::default();
+        let mesh_cfg = mesh::MeshConfig::new(graphics.mesh_res, graphics.veg_min_level, graphics.veg_density);
         Self {
             seed,
             planet,
@@ -204,6 +214,11 @@ impl App {
             audio: None,
             units,
             tour: None,
+            graphics,
+            mesh_cfg,
+            menu_open: false,
+            menu_sel: 0,
+            menu_open_sig: (0, 0, 0),
             perf_accum: 0.0,
             perf_frames: 0,
             frame_ms_max: 0.0,
@@ -230,7 +245,9 @@ impl App {
         // state — not Shift key events, which can get stuck on at launch.)
         if let Some(tour) = &mut self.tour {
             tour.update(dt, &self.planet, &mut self.camera);
-        } else {
+        } else if !self.menu_open {
+            // The camera is frozen while the settings menu is open (the arrow keys
+            // drive the menu instead).
             self.camera.key(KeyAction::Boost, self.mods.shift_key());
             self.camera.update(dt, &self.planet);
         }
@@ -243,7 +260,7 @@ impl App {
         }
 
         let cam_pos = self.camera.position(&self.planet);
-        let sel = lod::select(&self.planet, cam_pos, &|k| renderer.has_chunk(k));
+        let sel = lod::select(&self.planet, cam_pos, self.graphics.terrain_detail, &|k| renderer.has_chunk(k));
         let draw_count = sel.draw.len();
 
         // Request the nearest wanted chunks first.
@@ -258,7 +275,7 @@ impl App {
         }
 
         let keep: std::collections::HashSet<_> = sel.draw.iter().copied().collect();
-        renderer.evict(&keep, CHUNK_CACHE_LIMIT);
+        renderer.evict(&keep, self.graphics.chunk_budget);
 
         // Assemble the per-frame uniforms.
         let (view_proj, _view, pos) = self.camera.view_proj(&self.planet);
@@ -376,16 +393,17 @@ impl ApplicationHandler for App {
 
         let mut renderer = pollster::block_on(Renderer::new(window.clone())).expect("renderer init");
         self.camera.set_aspect(renderer.size.0, renderer.size.1);
-        renderer.set_overlay_lines(overlay::help_lines());
+        let (lines, hl) = overlay::menu(&self.graphics, self.menu_sel);
+        renderer.set_overlay(lines, hl);
 
         // Generate the six root chunks up front so there's always a planet to see.
         for root in lod::ChunkKey::roots() {
-            let cpu = mesh::CpuChunk::build(&self.planet, root);
+            let cpu = mesh::CpuChunk::build(&self.planet, root, &self.mesh_cfg);
             renderer.upload_chunk(root, cpu);
         }
 
         let threads = std::thread::available_parallelism().map(|n| n.get().saturating_sub(1)).unwrap_or(3).max(1);
-        let streamer = Streamer::new(self.planet.clone(), threads);
+        let streamer = Streamer::new(self.planet.clone(), threads, self.mesh_cfg.clone());
 
         info!(
             window_size = ?(renderer.size.0, renderer.size.1),
@@ -434,9 +452,96 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// Push the current settings/selection into the overlay geometry.
+    fn refresh_overlay(&mut self) {
+        let (lines, hl) = overlay::menu(&self.graphics, self.menu_sel);
+        if let Some(r) = &mut self.renderer {
+            r.set_overlay(lines, hl);
+        }
+    }
+
+    fn open_menu(&mut self) {
+        self.menu_open = true;
+        self.menu_open_sig = self.graphics.rebuild_signature();
+        self.camera.release_keys(); // don't keep drifting on a held key
+        self.refresh_overlay();
+        if let Some(r) = &mut self.renderer {
+            r.set_overlay_visible(true);
+        }
+        info!(action = "menu", preset = self.graphics.preset, "graphics menu opened");
+    }
+
+    fn close_menu(&mut self) {
+        self.menu_open = false;
+        if let Some(r) = &mut self.renderer {
+            r.set_overlay_visible(false);
+        }
+        // Settings baked into geometry only take effect on a rebuild.
+        if self.graphics.rebuild_signature() != self.menu_open_sig {
+            self.apply_rebuild();
+        }
+        info!(action = "menu", preset = self.graphics.preset, "graphics menu closed");
+    }
+
+    fn menu_move(&mut self, dir: i32) {
+        let n = settings::ROW_COUNT as i32;
+        self.menu_sel = (self.menu_sel as i32 + dir).rem_euclid(n) as usize;
+        self.refresh_overlay();
+    }
+
+    fn menu_adjust(&mut self, dir: i32) {
+        self.graphics.adjust(self.menu_sel, dir);
+        // Terrain detail and memory budget are read fresh every frame, so they
+        // apply live; mesh/vegetation changes are applied on close (they rebuild).
+        self.refresh_overlay();
+    }
+
+    /// Re-mesh the world at the current mesh/vegetation settings.
+    fn apply_rebuild(&mut self) {
+        let g = self.graphics;
+        self.mesh_cfg.set(g.mesh_res, g.veg_min_level, g.veg_density);
+        if let Some(s) = &mut self.streamer {
+            s.clear();
+        }
+        if let Some(r) = &mut self.renderer {
+            r.clear_chunks();
+            // Rebuild the roots immediately so there's never a blank frame.
+            for root in lod::ChunkKey::roots() {
+                let cpu = mesh::CpuChunk::build(&self.planet, root, &self.mesh_cfg);
+                r.upload_chunk(root, cpu);
+            }
+        }
+        info!(
+            grid = g.mesh_res,
+            veg_min_level = g.veg_min_level,
+            veg_density = g.veg_density,
+            "rebuilding world at new detail settings"
+        );
+    }
+
     fn handle_key(&mut self, event_loop: &ActiveEventLoop, ev: winit::event::KeyEvent) {
         let pressed = ev.state == ElementState::Pressed;
         let PhysicalKey::Code(code) = ev.physical_key else { return };
+
+        // While the settings menu is open the arrow keys drive it (not the
+        // camera); Esc closes it. Auto-repeat is allowed for the sliders.
+        if self.menu_open {
+            if pressed {
+                match code {
+                    KeyCode::Escape if !ev.repeat => self.close_menu(),
+                    KeyCode::ArrowUp => self.menu_move(-1),
+                    KeyCode::ArrowDown => self.menu_move(1),
+                    KeyCode::ArrowLeft => self.menu_adjust(-1),
+                    KeyCode::ArrowRight => self.menu_adjust(1),
+                    KeyCode::KeyQ if self.mods.super_key() || self.mods.control_key() => {
+                        info!("quit shortcut; exiting");
+                        event_loop.exit();
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
 
         // Continuous controls — Google Earth style: arrows pan, W/S zoom,
         // A/D rotate, Q/E tilt, Shift to move faster.
@@ -477,12 +582,7 @@ impl App {
         }
 
         match code {
-            KeyCode::Escape => {
-                debug!(action = "help", "toggled help overlay");
-                if let Some(r) = &mut self.renderer {
-                    r.toggle_overlay();
-                }
-            }
+            KeyCode::Escape => self.open_menu(),
             KeyCode::KeyR => {
                 self.camera.teleport(&self.planet, random_unit());
                 let (lat, lon) = self.camera.lat_lon();

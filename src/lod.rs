@@ -20,10 +20,6 @@ use std::thread::JoinHandle;
 /// ~8 m — about the f32 precision floor for absolute-coordinate rendering.
 pub const MAX_LEVEL: u32 = 16;
 
-/// How eagerly chunks subdivide. A node splits when the camera is within
-/// `SPLIT_FACTOR * node_world_size` of it. Higher = more detail, more chunks.
-pub const SPLIT_FACTOR: f32 = 1.7;
-
 /// Extra angular slack (radians) on the horizon cull, so chunks right at the
 /// limb aren't popped a frame early.
 const HORIZON_CULL_MARGIN: f32 = 0.06;
@@ -96,20 +92,21 @@ pub struct Selection {
 }
 
 /// Walk all six faces and decide what to draw / request, given a predicate that
-/// reports which chunks are already resident on the GPU.
-pub fn select(planet: &Planet, cam: Vec3, ready: &dyn Fn(ChunkKey) -> bool) -> Selection {
+/// reports which chunks are already resident on the GPU. `split_factor` controls
+/// how eagerly nodes subdivide (higher = more detail, more chunks).
+pub fn select(planet: &Planet, cam: Vec3, split_factor: f32, ready: &dyn Fn(ChunkKey) -> bool) -> Selection {
     let mut sel = Selection { draw: Vec::new(), want: Vec::new() };
     let cam_len = cam.length();
     // Angular radius of the horizon cone as seen from the camera. Anything more
     // than this far around the sphere is occluded by the planet itself.
     let horizon = if cam_len > PLANET_RADIUS { (PLANET_RADIUS / cam_len).acos() } else { std::f32::consts::PI };
     for root in ChunkKey::roots() {
-        select_node(root, planet, cam, horizon, ready, &mut sel);
+        select_node(root, planet, cam, horizon, split_factor, ready, &mut sel);
     }
     sel
 }
 
-fn select_node(node: ChunkKey, planet: &Planet, cam: Vec3, horizon: f32, ready: &dyn Fn(ChunkKey) -> bool, sel: &mut Selection) {
+fn select_node(node: ChunkKey, planet: &Planet, cam: Vec3, horizon: f32, split_factor: f32, ready: &dyn Fn(ChunkKey) -> bool, sel: &mut Selection) {
     // Horizon cull: skip nodes fully behind the planet's bulge.
     let center_dir = node.center_dir();
     let ang = center_dir.angle_between(cam.normalize_or_zero());
@@ -120,13 +117,13 @@ fn select_node(node: ChunkKey, planet: &Planet, cam: Vec3, horizon: f32, ready: 
 
     let center = center_dir * planet.surface_radius(center_dir);
     let dist = (center - cam).length();
-    let split = dist < SPLIT_FACTOR * node.world_size() && node.level < MAX_LEVEL;
+    let split = dist < split_factor * node.world_size() && node.level < MAX_LEVEL;
 
     if split {
         let kids = node.children();
         if kids.iter().all(|k| ready(*k)) {
             for k in kids {
-                select_node(k, planet, cam, horizon, ready, sel);
+                select_node(k, planet, cam, horizon, split_factor, ready, sel);
             }
             return;
         }
@@ -155,7 +152,7 @@ struct Queue {
 }
 
 struct QueueInner {
-    jobs: VecDeque<ChunkKey>,
+    jobs: VecDeque<(u32, ChunkKey)>, // (generation, key)
     queued: HashSet<ChunkKey>,
     shutdown: bool,
 }
@@ -163,13 +160,16 @@ struct QueueInner {
 /// Owns the worker threads and tracks which chunks are in flight.
 pub struct Streamer {
     queue: Arc<Queue>,
-    results: Receiver<(ChunkKey, CpuChunk)>,
+    results: Receiver<(u32, ChunkKey, CpuChunk)>,
     pending: HashSet<ChunkKey>,
     handles: Vec<JoinHandle<()>>,
+    /// Bumped on `clear()`; results from an older generation are discarded so a
+    /// detail-settings change can't leave stale chunks around.
+    generation: u32,
 }
 
 impl Streamer {
-    pub fn new(planet: Arc<Planet>, threads: usize) -> Self {
+    pub fn new(planet: Arc<Planet>, threads: usize, cfg: Arc<crate::mesh::MeshConfig>) -> Self {
         let queue = Arc::new(Queue {
             inner: Mutex::new(QueueInner { jobs: VecDeque::new(), queued: HashSet::new(), shutdown: false }),
             cv: Condvar::new(),
@@ -178,10 +178,10 @@ impl Streamer {
         let mut handles = Vec::new();
         let n = threads.max(1);
         for i in 0..n {
-            handles.push(spawn_worker(i, queue.clone(), planet.clone(), tx.clone()));
+            handles.push(spawn_worker(i, queue.clone(), planet.clone(), cfg.clone(), tx.clone()));
         }
         tracing::info!(workers = n, "chunk meshing pool started");
-        Self { queue, results, pending: HashSet::new(), handles }
+        Self { queue, results, pending: HashSet::new(), handles, generation: 0 }
     }
 
     /// Queue a chunk for meshing if it isn't already in flight.
@@ -191,23 +191,36 @@ impl Streamer {
         }
         let mut inner = self.queue.inner.lock().unwrap();
         if inner.queued.insert(key) {
-            inner.jobs.push_back(key);
+            inner.jobs.push_back((self.generation, key));
             self.pending.insert(key);
             self.queue.cv.notify_one();
         }
     }
 
-    /// Drain finished chunks. Returned chunks have left the in-flight set.
+    /// Drain finished chunks. Returned chunks have left the in-flight set; results
+    /// built before the last `clear()` are dropped.
     pub fn poll(&mut self) -> Vec<(ChunkKey, CpuChunk)> {
         let mut out = Vec::new();
-        while let Ok((key, chunk)) = self.results.try_recv() {
+        while let Ok((built_gen, key, chunk)) = self.results.try_recv() {
             self.pending.remove(&key);
-            out.push((key, chunk));
+            if built_gen == self.generation {
+                out.push((key, chunk));
+            }
         }
         out
     }
 
-    #[allow(dead_code)]
+    /// Drop all queued/in-flight work and force everything requested afterward to
+    /// be rebuilt — used when a detail setting that's baked into geometry changes.
+    pub fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        let mut inner = self.queue.inner.lock().unwrap();
+        inner.jobs.clear();
+        inner.queued.clear();
+        drop(inner);
+        self.pending.clear();
+    }
+
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }
@@ -226,25 +239,31 @@ impl Drop for Streamer {
     }
 }
 
-fn spawn_worker(id: usize, queue: Arc<Queue>, planet: Arc<Planet>, tx: Sender<(ChunkKey, CpuChunk)>) -> JoinHandle<()> {
+fn spawn_worker(
+    id: usize,
+    queue: Arc<Queue>,
+    planet: Arc<Planet>,
+    cfg: Arc<crate::mesh::MeshConfig>,
+    tx: Sender<(u32, ChunkKey, CpuChunk)>,
+) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("chunk-worker-{id}"))
         .spawn(move || loop {
-            let key = {
+            let (generation, key) = {
                 let mut inner = queue.inner.lock().unwrap();
                 loop {
                     if inner.shutdown {
                         return;
                     }
-                    if let Some(k) = inner.jobs.pop_front() {
+                    if let Some((g, k)) = inner.jobs.pop_front() {
                         inner.queued.remove(&k);
-                        break k;
+                        break (g, k);
                     }
                     inner = queue.cv.wait(inner).unwrap();
                 }
             };
-            let chunk = CpuChunk::build(&planet, key);
-            if tx.send((key, chunk)).is_err() {
+            let chunk = CpuChunk::build(&planet, key, &cfg);
+            if tx.send((generation, key, chunk)).is_err() {
                 return; // main thread gone
             }
         })

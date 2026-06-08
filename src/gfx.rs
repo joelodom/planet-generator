@@ -147,6 +147,7 @@ pub struct Renderer {
     overlay_quad: wgpu::Buffer,
     overlay_instances: Option<(wgpu::Buffer, u32)>,
     overlay_lines: Vec<String>,
+    overlay_highlight: usize,
     pub overlay_visible: bool,
 
     // Planet image shown in the help overlay.
@@ -378,6 +379,7 @@ impl Renderer {
             overlay_quad,
             overlay_instances: None,
             overlay_lines: Vec::new(),
+            overlay_highlight: usize::MAX,
             overlay_visible: false,
             image_pipeline,
             planet_bind,
@@ -403,23 +405,25 @@ impl Renderer {
     }
 
     /// Set the help overlay's text (built once at startup).
-    pub fn set_overlay_lines(&mut self, lines: Vec<String>) {
+    /// Set the overlay's text and which row (if any) is the highlighted setting.
+    pub fn set_overlay(&mut self, lines: Vec<String>, highlight: usize) {
         self.overlay_lines = lines;
+        self.overlay_highlight = highlight;
         if self.overlay_visible {
             self.rebuild_overlay();
         }
     }
 
-    /// Show/hide the help overlay, rebuilding its geometry when shown.
-    pub fn toggle_overlay(&mut self) {
-        self.overlay_visible = !self.overlay_visible;
-        if self.overlay_visible {
+    /// Show/hide the settings overlay, rebuilding its geometry when shown.
+    pub fn set_overlay_visible(&mut self, visible: bool) {
+        self.overlay_visible = visible;
+        if visible {
             self.rebuild_overlay();
         }
     }
 
     fn rebuild_overlay(&mut self) {
-        let geo = overlay::layout(&self.overlay_lines, self.size.0, self.size.1);
+        let geo = overlay::layout(&self.overlay_lines, self.overlay_highlight, self.size.0, self.size.1);
         self.overlay_instances = if geo.quads.is_empty() {
             None
         } else {
@@ -461,6 +465,12 @@ impl Renderer {
 
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
+    }
+
+    /// Drop every resident chunk. Used when a detail setting baked into geometry
+    /// changes, so the world re-streams at the new resolution.
+    pub fn clear_chunks(&mut self) {
+        self.chunks.clear();
     }
 
     pub fn update_globals(&self, g: &Globals) {
@@ -867,7 +877,8 @@ mod smoke {
         });
         let image_p = make_pipeline(&device, &image_pl, &image_sh, &[overlay_corner_layout(), overlay_instance_layout()], format, PassKind::Overlay, wgpu::PolygonMode::Fill);
 
-        let overlay_geo = overlay::layout(&overlay::help_lines(), w, h);
+        let (menu_lines, menu_hl) = overlay::menu(&crate::settings::Graphics::default(), 2);
+        let overlay_geo = overlay::layout(&menu_lines, menu_hl, w, h);
         assert!(!overlay_geo.quads.is_empty());
         let image_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
@@ -884,7 +895,7 @@ mod smoke {
         // One real chunk + base meshes.
         let planet = Planet::new(7);
         let key = ChunkKey { face: 2, level: 8, i: 128, j: 128 };
-        let cpu = CpuChunk::build(&planet, key);
+        let cpu = CpuChunk::build(&planet, key, &mesh::MeshConfig::standard());
         let terrain = GpuMesh::upload(&device, &cpu.vertices, &cpu.indices);
         let trees = InstanceBuf::upload(&device, &cpu.trees);
         let tm = mesh::tree_mesh();

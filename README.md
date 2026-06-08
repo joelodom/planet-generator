@@ -46,8 +46,25 @@ real-world units in the HUD — metric by default, or `--units us` for imperial.
 | R | Teleport to a random spot on the surface |
 | P | Print current location & seed (real units) |
 | G | Toggle wireframe |
-| Esc | Toggle the help overlay (key bindings + build version) |
+| Esc | Open the **graphics settings** + help overlay |
 | Cmd-Q / Ctrl-Q | Quit (or close the window) |
+
+### Graphics settings (Esc)
+
+Press **Esc** for an on-screen menu (keyboard-driven: ↑/↓ to select a row,
+←/→ to adjust). Five sliders trade detail for performance, plus Low/Medium/High/
+Ultra presets — tune it down on a laptop, crank it up on a big GPU:
+
+| Setting | What it does |
+|---------|--------------|
+| Terrain detail | How eagerly LOD subdivides — finer ground, more chunks (applies live) |
+| Mesh resolution | Triangles per chunk — smoother terrain at every distance |
+| Tree distance | How far out vegetation appears |
+| Vegetation | Plant density |
+| Memory budget | How much geometry stays resident as you look around |
+
+Terrain detail and memory budget apply immediately; the rest re-mesh the world
+when you close the menu.
 
 ## How it works
 

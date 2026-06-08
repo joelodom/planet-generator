@@ -9,6 +9,47 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use rand::{RngExt, SeedableRng};
 use rand::rngs::StdRng;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
+/// Detail settings that are baked into chunk geometry, shared (lock-free) with
+/// the meshing workers so the graphics menu can retune them at runtime. Changing
+/// any of these requires rebuilding chunks (the renderer drops its cache).
+pub struct MeshConfig {
+    grid: AtomicU32,
+    veg_min_level: AtomicU32,
+    veg_density: AtomicU32,
+}
+
+impl MeshConfig {
+    pub fn new(grid: u32, veg_min_level: u32, veg_density: u32) -> Arc<Self> {
+        Arc::new(Self {
+            grid: AtomicU32::new(grid),
+            veg_min_level: AtomicU32::new(veg_min_level),
+            veg_density: AtomicU32::new(veg_density),
+        })
+    }
+
+    /// Reasonable fixed config for tests and the offscreen smoke render.
+    #[cfg(test)]
+    pub fn standard() -> Arc<Self> {
+        Self::new(20, 13, 70)
+    }
+
+    pub fn set(&self, grid: u32, veg_min_level: u32, veg_density: u32) {
+        self.grid.store(grid, Ordering::Relaxed);
+        self.veg_min_level.store(veg_min_level, Ordering::Relaxed);
+        self.veg_density.store(veg_density, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (usize, u32, usize) {
+        (
+            self.grid.load(Ordering::Relaxed) as usize,
+            self.veg_min_level.load(Ordering::Relaxed),
+            self.veg_density.load(Ordering::Relaxed) as usize,
+        )
+    }
+}
 
 /// Per-vertex terrain/veg attributes. Plain data, uploaded straight to the GPU.
 #[repr(C)]
@@ -43,22 +84,12 @@ pub struct CpuChunk {
     pub shrubs: Vec<InstanceRaw>,
 }
 
-/// Terrain tessellation per chunk side (quads). Total grid is (GRID+1)^2 verts.
-pub const GRID: usize = 20;
-
-
-/// Below this quadtree level, chunks are too coarse / too far to bother placing
-/// individual plants on.
-// Vegetation only appears on the finest chunks (≈ sub-km) — at coarser levels an
-// Earth-sized chunk spans tens of km and individual plants would be invisible.
-pub const VEG_MIN_LEVEL: u32 = 13;
-
 // Crack-hiding skirts around each chunk edge.
 const SKIRT_DEPTH_FACTOR: f32 = 3.0; // skirt depth ≈ this × a terrain quad's width
 const SKIRT_MIN_DEPTH: f32 = 2.0; // render units
 
-// Vegetation scatter.
-const VEG_ATTEMPTS_PER_CHUNK: usize = 70;
+// Vegetation scatter. Density and the min LOD level are runtime settings (see
+// MeshConfig); the rest are fixed tuning.
 const VEG_MIN_GROUND_HEIGHT: f32 = 1.0; // skip water/waterline (render units)
 const VEG_MAX_STEEPNESS: f32 = 0.5; // skip cliffs
 const TREE_SCALE_MIN: f32 = 0.8; // ~8–26 m trees (render units)
@@ -70,12 +101,14 @@ const SHRUB_TINT_JITTER: f32 = 0.10;
 const SHRUB_TINT_BRIGHTEN: f32 = 1.1; // shrubs a touch lighter than the biome tint
 
 impl CpuChunk {
-    /// Build the terrain mesh and vegetation for one quadtree node.
-    pub fn build(planet: &Planet, key: ChunkKey) -> CpuChunk {
+    /// Build the terrain mesh and vegetation for one quadtree node, at the detail
+    /// level given by `cfg` (terrain grid resolution + vegetation rules).
+    pub fn build(planet: &Planet, key: ChunkKey, cfg: &MeshConfig) -> CpuChunk {
+        let (grid, veg_min_level, veg_density) = cfg.snapshot();
         let face = &FACES[key.face as usize];
         let (u0, v0, size) = key.face_rect();
 
-        let n = GRID + 1;
+        let n = grid + 1;
         let mut vertices: Vec<Vertex> = Vec::with_capacity(n * n);
         let mut dirs: Vec<Vec3> = Vec::with_capacity(n * n);
 
@@ -86,8 +119,8 @@ impl CpuChunk {
         // The deeper water is still colored darker (from the true height).
         for r in 0..n {
             for c in 0..n {
-                let u = u0 + size * (c as f32 / GRID as f32);
-                let v = v0 + size * (r as f32 / GRID as f32);
+                let u = u0 + size * (c as f32 / grid as f32);
+                let v = v0 + size * (r as f32 / grid as f32);
                 let cube = face.base + face.right * u + face.up * v;
                 let dir = planet::cube_to_sphere(cube);
                 let s = planet.sample(dir);
@@ -99,10 +132,10 @@ impl CpuChunk {
         }
 
         // Indices for the grid quads (two triangles each).
-        let mut indices: Vec<u32> = Vec::with_capacity(GRID * GRID * 6);
+        let mut indices: Vec<u32> = Vec::with_capacity(grid * grid * 6);
         let idx = |r: usize, c: usize| (r * n + c) as u32;
-        for r in 0..GRID {
-            for c in 0..GRID {
+        for r in 0..grid {
+            for c in 0..grid {
                 let a = idx(r, c);
                 let b = idx(r, c + 1);
                 let d = idx(r + 1, c);
@@ -138,7 +171,7 @@ impl CpuChunk {
 
         // Skirts: a downward apron around all four edges so neighbouring chunks
         // at a coarser LOD can't reveal cracks/gaps to the sky behind them.
-        let quad_arc = (size / GRID as f32) * PLANET_RADIUS;
+        let quad_arc = (size / grid as f32) * PLANET_RADIUS;
         let skirt = (quad_arc * SKIRT_DEPTH_FACTOR).max(SKIRT_MIN_DEPTH);
         let add_skirt = |edge: &[usize], vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>| {
             let start = vertices.len() as u32;
@@ -159,15 +192,15 @@ impl CpuChunk {
             }
         };
         let top: Vec<usize> = (0..n).map(|c| idx(0, c) as usize).collect();
-        let bottom: Vec<usize> = (0..n).map(|c| idx(GRID, c) as usize).collect();
+        let bottom: Vec<usize> = (0..n).map(|c| idx(grid, c) as usize).collect();
         let left: Vec<usize> = (0..n).map(|r| idx(r, 0) as usize).collect();
-        let right: Vec<usize> = (0..n).map(|r| idx(r, GRID) as usize).collect();
+        let right: Vec<usize> = (0..n).map(|r| idx(r, grid) as usize).collect();
         add_skirt(&top, &mut vertices, &mut indices);
         add_skirt(&bottom, &mut vertices, &mut indices);
         add_skirt(&left, &mut vertices, &mut indices);
         add_skirt(&right, &mut vertices, &mut indices);
 
-        let (trees, shrubs) = place_vegetation(planet, key, face, u0, v0, size);
+        let (trees, shrubs) = place_vegetation(planet, key, face, u0, v0, size, veg_min_level, veg_density);
 
         CpuChunk { vertices, indices, trees, shrubs }
     }
@@ -175,6 +208,8 @@ impl CpuChunk {
 
 /// Deterministically scatter vegetation across a chunk according to biome rules.
 /// Seeded by the chunk key so the same ground always grows the same plants.
+/// `min_level` gates how far out plants appear; `density` is attempts per chunk.
+#[allow(clippy::too_many_arguments)]
 fn place_vegetation(
     planet: &Planet,
     key: ChunkKey,
@@ -182,19 +217,17 @@ fn place_vegetation(
     u0: f32,
     v0: f32,
     size: f32,
+    min_level: u32,
+    density: usize,
 ) -> (Vec<InstanceRaw>, Vec<InstanceRaw>) {
     let mut trees = Vec::new();
     let mut shrubs = Vec::new();
-    if key.level < VEG_MIN_LEVEL {
+    if key.level < min_level {
         return (trees, shrubs);
     }
 
     let mut rng = StdRng::seed_from_u64(key.hash(planet.seed));
-    // More candidate slots at deeper levels (smaller chunks) keeps on-screen
-    // density roughly constant as you descend.
-    let attempts = VEG_ATTEMPTS_PER_CHUNK;
-
-    for _ in 0..attempts {
+    for _ in 0..density {
         let u = u0 + size * rng.random::<f32>();
         let v = v0 + size * rng.random::<f32>();
         let cube = face.base + face.right * u + face.up * v;
