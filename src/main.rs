@@ -550,11 +550,10 @@ impl App {
             }
         }
         info!(
-            split = round1(g.split_factor),
             grid = g.mesh_res,
             veg_min_level = g.veg_min_level,
             veg_density = g.veg_density,
-            "rebuilding world at new detail settings"
+            "rebuilding world at new mesh/vegetation settings"
         );
     }
 

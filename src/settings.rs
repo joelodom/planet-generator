@@ -49,9 +49,10 @@ const DENSITY_MIN: u32 = 100;
 const DENSITY_MAX: u32 = 1000;
 const DENSITY_STEP: u32 = 25;
 
-// --- Resident-geometry memory budget, in MB. The low end suits a 2–4 GB laptop GPU;
-// the high end gives a 5090 room to keep a lot of fine geometry resident. ---
-const MEM_MIN_MB: u32 = 256;
+// --- Resident-geometry memory budget, in MB. Like the other knobs the slider spans
+// [Low, Ultra]: 1 GB suits a basic laptop GPU, 24 GB gives a 5090 room to keep a lot
+// of fine geometry resident. ---
+const MEM_MIN_MB: u32 = 1_024; // == the Low preset, so every slider reads empty at Low
 const MEM_MAX_MB: u32 = 24_576; // 24 GB — Ultra on a 32 GB 5090
 const MEM_STEP_MB: u32 = 256;
 
@@ -130,13 +131,16 @@ impl Graphics {
         (self.mesh_res, self.veg_min_level, self.veg_density)
     }
 
-    /// Approximate camera distance (render units) out to which plants are drawn: a
-    /// chunk at `veg_min_level` has this edge length, and chunks that coarse are
-    /// rendered out to ~`split_factor` × their edge. Couples both LOD knobs, on
-    /// purpose — it's the real reach, not a single hidden number.
+    /// Approximate camera distance (render units) out to which plants are drawn.
+    /// Vegetation lands on chunks at level >= `veg_min_level`; the coarsest of those
+    /// (level `veg_min_level`) is the rendered LOD out to ~`split_factor` × its
+    /// *parent's* edge — beyond that only coarser, plant-less chunks remain. So that
+    /// product is the true reach. Couples both LOD knobs on purpose: it's the real
+    /// distance, not a single hidden number.
     fn plant_view_units(&self) -> f32 {
-        let edge = FACE_EDGE_SPAN / (1u32 << self.veg_min_level) as f32 * PLANET_RADIUS;
-        self.split_factor * edge
+        let parent_level = self.veg_min_level.saturating_sub(1);
+        let parent_edge = FACE_EDGE_SPAN / (1u32 << parent_level) as f32 * PLANET_RADIUS;
+        self.split_factor * parent_edge
     }
 
     /// Areal vegetation density as plants per km² (the mesher stores raw attempts per
@@ -278,6 +282,7 @@ mod tests {
         assert_eq!(g.mesh_res, GRID_MIN);
         assert_eq!(g.veg_min_level, VEG_LEVEL_NEAR);
         assert_eq!(g.veg_density, DENSITY_MIN);
+        assert_eq!(g.mem_budget_mb, MEM_MIN_MB); // Low == every slider's floor
     }
 
     #[test]
@@ -324,10 +329,8 @@ mod tests {
 
     #[test]
     fn mem_budget_bytes_tracks_the_setting() {
-        let mut g = Graphics::default();
-        g.adjust(5, 0); // no-op step, but proves the field drives bytes
-        g.mem_budget_mb = 2048;
-        assert_eq!(g.mem_budget_bytes(), 2048usize << 20);
+        // High's 8192 MB budget converts to bytes (MB << 20).
+        assert_eq!(preset("High").mem_budget_bytes(), 8192usize << 20);
     }
 
     #[test]
