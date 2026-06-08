@@ -150,6 +150,9 @@ Rules:
   the surrounding module.
 - **Keep `cargo clippy` clean** and introduce no new `TODO`/`FIXME` without a
   tracked follow-up. The tree currently has zero debt markers.
+- **Markdown docs are `ALL_CAPS.md`** (`README.md`, `BACKLOG.md`,
+  `ARCHITECTURE_REVIEW.md`, …) — SCREAMING_SNAKE_CASE filenames; the only exceptions
+  are tool-generated files we don't own (`.claude/scan-report*.md`).
 
 ## 7. Portability
 

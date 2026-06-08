@@ -56,6 +56,12 @@ halving/doubling (`0.5`, `2.0`), small structural integers (loop bounds, array
 indices, `+ 1`), and standard math (`PI`, `255` for a byte). When in doubt, name
 it. New code must follow this; don't reintroduce bare tuning literals.
 
+**Docs are `ALL_CAPS.md`.** Hand-authored Markdown files use SCREAMING_SNAKE_CASE
+names (`CLAUDE.md`, `README.md`, `BACKLOG.md`, `ARCHITECTURE_REVIEW.md`,
+`ARCHITECTURE_GUIDELINES.md`, `CODE_STYLE.md`). The only exceptions are
+tool-generated files we don't own (e.g. `.claude/scan-report*.md`). New docs follow
+this; rename any that don't.
+
 ## Target platforms — IMPORTANT
 
 Developed on **macOS / Apple Silicon (Metal)**, but **will soon also run on
