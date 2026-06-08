@@ -77,6 +77,23 @@ const BLOB_RINGS: usize = 3;
 const BLOB_SECTORS: usize = 5;
 const BLOB_LUMP: f32 = 0.22; // organic radius wobble on canopy/shrub blobs
 
+// --- Recursive branch & leaf structure (trees, shrubs, vines, snags) -----------
+// Plants are grown as a recursive skeleton of tapering branches; leaves are small
+// flat cards sprayed at the twig tips. This is all baked once per species, so the
+// per-plant cost is paid at world build, not per frame.
+const BRANCH_CURVE_STEPS: usize = 3; // sub-segments per branch (gives it a gentle curve)
+const BRANCH_TIP_TAPER: f32 = 0.5; // a branch tapers to base-radius × this at its tip
+const BRANCH_WOBBLE: f32 = 0.5; // ± random azimuth jitter on child branches (rad)
+const BRANCH_LEN_JITTER: f32 = 0.35; // ± fraction on each child branch's length
+const LEAF_WIDTH_RATIO: f32 = 0.42; // broadleaf leaf width / length (needles override it)
+const LEAF_TIP_BRIGHTEN: f32 = 1.12; // leaf tip a touch brighter (new growth / backscatter)
+const LEAF_SIZE_JITTER_LO: f32 = 0.7;
+const LEAF_SIZE_JITTER_HI: f32 = 1.3;
+const LEAF_SPREAD_LO: f32 = 0.15; // how far a sprayed leaf splays off its twig (0..1)
+const LEAF_SPREAD_HI: f32 = 0.95;
+const BLOOM_PER_SPRAY: f32 = 0.25; // chance a flowering twig tip also carries a blossom
+const BLOOM_SIZE: f32 = 0.6; // blossom radius as a fraction of leaf size
+
 /// One procedurally-generated plant: a finished local-space mesh plus the
 /// per-plant scale-jitter range applied when it's planted.
 pub struct Species {
@@ -162,6 +179,7 @@ enum Form {
     Flower,    // thin stalk + bright bloom head
     Grass,     // tuft of splayed blades
     Snag,      // bare, twiggy, dead-looking wood
+    Vine,      // winding, leafy trailing/climbing stems
 }
 
 /// Per-biome recipe: which forms appear (weighted), how big they run, and the
@@ -188,6 +206,7 @@ fn form_height(form: Form) -> (f32, f32) {
         Form::Flower => (0.06, 0.18),
         Form::Grass => (0.12, 0.34),
         Form::Snag => (1.3, 3.2),
+        Form::Vine => (0.6, 1.6),
     }
 }
 
@@ -205,6 +224,7 @@ fn form_cluster_km(form: Form) -> (f32, f32) {
         Form::Shrub => (0.2, 20.0),
         Form::Grass => (0.05, 6.0),
         Form::Flower => (0.02, 3.0),
+        Form::Vine => (1.0, 40.0),
     }
 }
 
@@ -212,7 +232,7 @@ fn biome_profile(biome: Biome) -> Option<Profile> {
     use Form::*;
     let p = match biome {
         Biome::TropicalForest => Profile {
-            forms: &[(Broadleaf, 0.45), (Palm, 0.25), (Bush, 0.18), (Flower, 0.12)],
+            forms: &[(Broadleaf, 0.42), (Palm, 0.22), (Bush, 0.16), (Vine, 0.10), (Flower, 0.10)],
             size_scale: 1.6,
             flower_chance: 0.30,
             fall_chance: 0.0,
@@ -220,7 +240,7 @@ fn biome_profile(biome: Biome) -> Option<Profile> {
             count: SPECIES_PER_BIOME,
         },
         Biome::TemperateForest => Profile {
-            forms: &[(Broadleaf, 0.45), (Conifer, 0.25), (Bush, 0.15), (Flower, 0.10), (Snag, 0.05)],
+            forms: &[(Broadleaf, 0.42), (Conifer, 0.24), (Bush, 0.14), (Vine, 0.06), (Flower, 0.09), (Snag, 0.05)],
             size_scale: 1.1,
             flower_chance: 0.18,
             fall_chance: 0.35, // maples & oaks in autumn
@@ -313,6 +333,7 @@ fn build_species(rng: &mut StdRng, profile: &Profile, hue_shift: f32, exotic: f3
         Form::Flower => build_flower(&mut m, rng, height, bloom),
         Form::Grass => build_grass(&mut m, rng, height, foliage),
         Form::Snag => build_snag(&mut m, rng, height, bark),
+        Form::Vine => build_vine(&mut m, rng, height, bark, foliage, flowering, bloom),
     }
 
     // Clustering scale for this species: log-uniform within its form's km range, so
@@ -335,24 +356,186 @@ fn pick_weighted(rng: &mut StdRng, items: &[(Form, f32)]) -> Form {
     items[items.len() - 1].0
 }
 
+// --- Recursive growth helpers --------------------------------------------------
+
+/// Recipe for a recursively-grown woody plant. One [`grow_branch`] call from the
+/// base produces the whole skeleton; leaves are sprayed at the twig tips.
+struct Branching {
+    depth: u32,           // recursion levels below the first (trunk) branch
+    children: (u32, u32), // sub-branches spawned at a node (min..max, max exclusive)
+    len_ratio: f32,       // child length / parent length
+    radius_ratio: f32,    // child radius / parent radius
+    spread: f32,          // child divergence from its parent (rad)
+    up_bias: f32,         // phototropism: pull growth toward +Y (0..1)
+    droop: f32,           // gravity: pull growth toward -Y (0..1)
+    curve: f32,           // along-branch bend toward (up_bias − droop), per step
+    leaves: (u32, u32),   // leaves per twig tip (min..max); (0, 0) = bare
+    leaf_size: f32,       // render units
+    leaf_width: f32,      // leaf width / length (small = needle)
+    bloom: Option<Vec3>,  // if Some, twig tips may carry a blossom of this colour
+}
+
+/// Normalize `v`, falling back to `fallback` when it's degenerate — keeps the
+/// growth maths total (never a `NaN` direction).
+fn safe_dir(v: Vec3, fallback: Vec3) -> Vec3 {
+    let n = v.normalize_or_zero();
+    if n == Vec3::ZERO {
+        fallback
+    } else {
+        n
+    }
+}
+
+/// Sides on a branch tube by recursion depth — twigs are cheaper than boughs.
+fn branch_sides(depth: u32) -> usize {
+    match depth {
+        0 => 3,
+        1 => 4,
+        _ => 5,
+    }
+}
+
+/// Grow one branch from `base` heading `dir` as a few tapering, gently-curving
+/// sub-segments, then either spray leaves (at a twig tip, `depth == 0`) or spawn
+/// diverging children and recurse. The whole plant is a single call from its base.
+#[allow(clippy::too_many_arguments)]
+fn grow_branch(m: &mut MeshData, rng: &mut StdRng, base: Vec3, dir: Vec3, length: f32, radius: f32, depth: u32, b: &Branching, bark: Vec3, foliage: Vec3) {
+    let bend = Vec3::Y * (b.up_bias - b.droop);
+    let sides = branch_sides(depth);
+    let seg = length / BRANCH_CURVE_STEPS as f32;
+    let mut a = base;
+    let mut d = safe_dir(dir, Vec3::Y);
+    for i in 0..BRANCH_CURVE_STEPS {
+        d = safe_dir(d + bend * b.curve, d);
+        let next = a + d * seg;
+        let t0 = i as f32 / BRANCH_CURVE_STEPS as f32;
+        let t1 = (i + 1) as f32 / BRANCH_CURVE_STEPS as f32;
+        let r0 = radius * (1.0 - t0 * (1.0 - BRANCH_TIP_TAPER));
+        let r1 = radius * (1.0 - t1 * (1.0 - BRANCH_TIP_TAPER));
+        segment(m, a, next, r0, r1, sides, bark, bark);
+        a = next;
+    }
+    if depth == 0 {
+        leaf_spray(m, rng, a, d, b, foliage);
+        return;
+    }
+    let n = rng.random_range(b.children.0..b.children.1);
+    let (u, v) = ortho_basis(d);
+    for k in 0..n {
+        let az = TAU * k as f32 / n.max(1) as f32 + sym(rng) * BRANCH_WOBBLE;
+        let spread = b.spread * (0.6 + 0.8 * rng.random::<f32>());
+        let side = u * az.cos() + v * az.sin();
+        let cd = safe_dir(d * spread.cos() + side * spread.sin(), d);
+        let cd = safe_dir(cd + Vec3::Y * (b.up_bias - b.droop), cd);
+        let cl = length * b.len_ratio * (1.0 - BRANCH_LEN_JITTER + 2.0 * BRANCH_LEN_JITTER * rng.random::<f32>());
+        let cr = radius * b.radius_ratio;
+        grow_branch(m, rng, a, cd, cl, cr, depth - 1, b, bark, foliage);
+    }
+}
+
+/// A cluster of leaves at a twig tip, splaying off `dir`. Honours the recipe's
+/// leaf count/size/width, and may add a blossom on a flowering plant.
+fn leaf_spray(m: &mut MeshData, rng: &mut StdRng, tip: Vec3, dir: Vec3, b: &Branching, color: Vec3) {
+    if b.leaves.1 > b.leaves.0 {
+        let n = rng.random_range(b.leaves.0..b.leaves.1);
+        let (u, v) = ortho_basis(dir);
+        for k in 0..n {
+            let az = TAU * k as f32 / n.max(1) as f32 + sym(rng) * 0.6;
+            let spread = rng.random_range(LEAF_SPREAD_LO..LEAF_SPREAD_HI);
+            let ld = safe_dir(dir * (1.0 - spread) + (u * az.cos() + v * az.sin()) * spread, dir);
+            let base = tip + ld * (b.leaf_size * 0.15);
+            let sz = b.leaf_size * rng.random_range(LEAF_SIZE_JITTER_LO..LEAF_SIZE_JITTER_HI);
+            let c = (color + Vec3::splat(sym(rng) * FOLIAGE_VERT_JITTER)).clamp(Vec3::ZERO, Vec3::ONE);
+            leaf(m, rng, base, ld, sz, b.leaf_width, c);
+        }
+    }
+    if let Some(bl) = b.bloom.filter(|_| rng.random::<f32>() < BLOOM_PER_SPRAY) {
+        ellipsoid(m, tip + dir * (b.leaf_size * 0.3), Vec3::splat(b.leaf_size * BLOOM_SIZE), bl, rng);
+    }
+}
+
+/// A single low-poly leaf: a flat kite (4 verts, 2 tris) from `base` along `dir`,
+/// at a random roll. One-sided, but the pipeline disables culling so it shows both.
+fn leaf(m: &mut MeshData, rng: &mut StdRng, base: Vec3, dir: Vec3, size: f32, width_ratio: f32, color: Vec3) {
+    let along = safe_dir(dir, Vec3::Y);
+    let (u0, _) = ortho_basis(along);
+    let roll = rng.random::<f32>() * TAU;
+    let side = safe_dir(u0 * roll.cos() + along.cross(u0) * roll.sin(), u0);
+    let normal = safe_dir(along.cross(side), Vec3::Y);
+    let w = size * width_ratio;
+    let mid = base + along * (size * 0.45);
+    let tip = base + along * size;
+    let tip_c = (color * LEAF_TIP_BRIGHTEN).clamp(Vec3::ZERO, Vec3::ONE);
+    let s = m.vertices.len() as u32;
+    m.vertices.push(vert(base, normal, color));
+    m.vertices.push(vert(mid + side * w, normal, color));
+    m.vertices.push(vert(mid - side * w, normal, color));
+    m.vertices.push(vert(tip, normal, tip_c));
+    m.indices.extend_from_slice(&[s, s + 1, s + 3, s, s + 3, s + 2]);
+}
+
+/// A drooping pinnate frond: a curved rachis from `base` along `out`, with paired
+/// leaflets along it. Palm crowns.
+#[allow(clippy::too_many_arguments)]
+fn pinnate_frond(m: &mut MeshData, rng: &mut StdRng, base: Vec3, out: Vec3, length: f32, droop: f32, leaflet: f32, color: Vec3) {
+    const SEGS: usize = 6;
+    let out = safe_dir(out, Vec3::X);
+    let side = safe_dir(out.cross(Vec3::Y), Vec3::X);
+    let mut prev = base;
+    for i in 1..=SEGS {
+        let t = i as f32 / SEGS as f32;
+        let p = base + out * (length * t) + Vec3::Y * (-droop * t * t);
+        let r = (leaflet * 0.06 * (1.0 - 0.7 * t)).max(0.001);
+        segment(m, prev, p, r, (r * 0.7).max(0.001), 3, color * 0.65, color * 0.65);
+        let rach = safe_dir(p - prev, out);
+        let llen = leaflet * (1.0 - 0.55 * t);
+        for s in [-1.0f32, 1.0] {
+            let ld = safe_dir(rach * 0.6 + side * s + Vec3::Y * 0.25, side * s);
+            leaf(m, rng, p, ld, llen, 0.16, color);
+        }
+        prev = p;
+    }
+}
+
 // --- Form builders -------------------------------------------------------------
 
 fn build_conifer(m: &mut MeshData, rng: &mut StdRng, height: f32, bark: Vec3, foliage: Vec3) {
-    const TRUNK_R: f32 = 0.035; // trunk radius as a fraction of height
-    // A bit of bare trunk shows beneath the skirt of branches.
-    segment(m, Vec3::ZERO, Vec3::Y * height * 0.45, height * TRUNK_R, height * TRUNK_R * 0.6, TRUNK_SIDES, bark, bark);
+    const TRUNK_R: f32 = 0.03; // trunk radius as a fraction of height
+    const BARE_BASE: f32 = 0.1; // lowest branch whorl starts this far up the trunk
+    const DROOP: f32 = 0.45; // how far the lateral branches sag
+    segment(m, Vec3::ZERO, Vec3::Y * height, height * TRUNK_R, height * TRUNK_R * 0.25, TRUNK_SIDES, bark, bark);
 
-    let tiers = rng.random_range(4..8);
-    let base_r = height * rng.random_range(0.22..0.30);
-    for i in 0..tiers {
-        let f = i as f32 / (tiers - 1) as f32;
-        let y = height * (0.12 + 0.80 * f);
-        let r = base_r * (1.0 - 0.85 * f);
-        let ch = height * (0.20 + 0.12 * (1.0 - f));
-        // Lower tiers a touch darker (self-shadowing), upper a touch brighter.
-        let col = (foliage * (0.82 + 0.22 * f)).clamp(Vec3::ZERO, Vec3::ONE);
-        cone(m, Vec3::Y * y, ch, r.max(height * 0.02), CONE_SIDES, col);
+    // Short, drooping, densely-needled lateral branchlets (grown recursively).
+    let needle = Branching {
+        depth: 1,
+        children: (2, 4),
+        len_ratio: 0.55,
+        radius_ratio: 0.5,
+        spread: 0.5,
+        up_bias: 0.0,
+        droop: 0.2,
+        curve: 0.4,
+        leaves: (6, 12),
+        leaf_size: height * 0.07,
+        leaf_width: 0.16, // thin needles
+        bloom: None,
+    };
+    // Whorls up the trunk — long at the bottom, short at the top → a conical crown.
+    let whorls = rng.random_range(9..15);
+    for i in 0..whorls {
+        let f = i as f32 / (whorls - 1).max(1) as f32;
+        let y = height * (BARE_BASE + (0.95 - BARE_BASE) * f);
+        let blen = height * 0.5 * (1.0 - f).powf(0.8).max(0.12);
+        let count = 3 + ((1.0 - f) * 5.0) as u32;
+        for k in 0..count {
+            let az = TAU * k as f32 / count as f32 + f * 2.4; // spiral up the trunk
+            let out = Vec3::new(az.cos(), 0.0, az.sin());
+            let dir = safe_dir(out - Vec3::Y * DROOP, out);
+            grow_branch(m, rng, Vec3::Y * y, dir, blen, height * 0.012, needle.depth, &needle, bark, foliage);
+        }
     }
+    // A leader tuft at the very top.
+    grow_branch(m, rng, Vec3::Y * (height * 0.95), Vec3::Y, height * 0.12, height * 0.01, needle.depth, &needle, bark, foliage);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -366,43 +549,24 @@ fn build_broadleaf(
     bloom: Vec3,
     bare: bool,
 ) {
-    let trunk_h = height * rng.random_range(0.40..0.60);
-    let r0 = height * rng.random_range(0.04..0.07);
-    segment(m, Vec3::ZERO, Vec3::Y * trunk_h, r0, r0 * 0.6, TRUNK_SIDES, bark, bark * 1.06);
-
-    // A few main limbs reaching up and out from the upper trunk.
-    let branches = rng.random_range(3..6);
-    for _ in 0..branches {
-        let az = rng.random_range(0.0..TAU);
-        let el: f32 = rng.random_range(0.5..1.1);
-        let dir = Vec3::new(az.cos() * el.cos(), el.sin(), az.sin() * el.cos()).normalize();
-        let p0 = Vec3::Y * (trunk_h * rng.random_range(0.6..1.0));
-        let len = height * rng.random_range(0.25..0.45);
-        segment(m, p0, p0 + dir * len, r0 * 0.5, r0 * 0.2, 4, bark, bark);
-    }
-
-    if bare {
-        return; // bare winter/dead frame — branches only
-    }
-
-    // Rounded crown: a clump of overlapping leafy blobs above the trunk.
-    let blobs = rng.random_range(3..7);
-    let crown_r = height * rng.random_range(0.32..0.50);
-    let crown_c = Vec3::Y * (height * rng.random_range(0.75..0.95));
-    for _ in 0..blobs {
-        let off = Vec3::new(sym(rng), sym(rng) * 0.6, sym(rng)) * crown_r;
-        let rr = crown_r * rng.random_range(0.6..1.0);
-        let radii = Vec3::new(rr, rr * rng.random_range(0.7..1.0), rr);
-        ellipsoid(m, crown_c + off, radii, foliage, rng);
-    }
-    if flowering {
-        let dots = rng.random_range(8..16);
-        for _ in 0..dots {
-            let off = Vec3::new(sym(rng), sym(rng) * 0.5, sym(rng)) * crown_r;
-            let rr = crown_r * 0.13;
-            ellipsoid(m, crown_c + off + Vec3::Y * crown_r * 0.2, Vec3::splat(rr), bloom, rng);
-        }
-    }
+    let trunk_len = height * rng.random_range(0.35..0.5);
+    let trunk_r = height * rng.random_range(0.045..0.075);
+    // Trunk → boughs → branches → leafy twigs, all from one recursive call.
+    let b = Branching {
+        depth: 3,
+        children: (2, 4),
+        len_ratio: 0.74,
+        radius_ratio: 0.58,
+        spread: 0.8,
+        up_bias: 0.32,
+        droop: 0.05,
+        curve: 0.5,
+        leaves: if bare { (0, 0) } else { (10, 18) }, // bare = winter/dead frame
+        leaf_size: height * 0.12,
+        leaf_width: LEAF_WIDTH_RATIO,
+        bloom: if flowering { Some(bloom) } else { None },
+    };
+    grow_branch(m, rng, Vec3::ZERO, Vec3::Y, trunk_len, trunk_r, b.depth, &b, bark, foliage);
 }
 
 fn build_palm(m: &mut MeshData, rng: &mut StdRng, height: f32, bark: Vec3, foliage: Vec3) {
@@ -420,13 +584,14 @@ fn build_palm(m: &mut MeshData, rng: &mut StdRng, height: f32, bark: Vec3, folia
         r *= 0.82;
     }
     let crown = prev;
-    let fronds = rng.random_range(7..12);
-    let droop = height * 0.5;
+    // A crown of drooping pinnate fronds (a rachis lined with leaflets).
+    let fronds = rng.random_range(8..14);
     for i in 0..fronds {
         let az = TAU * i as f32 / fronds as f32 + sym(rng) * 0.2;
-        let out = Vec3::new(az.cos(), 0.0, az.sin());
-        let len = height * rng.random_range(0.5..0.8);
-        frond(m, crown, out, len, height * 0.18, droop, height * 0.045, foliage, foliage * 0.8);
+        let lift = rng.random_range(0.0..0.5); // some fronds arch up, some splay flat
+        let out = safe_dir(Vec3::new(az.cos(), lift, az.sin()), Vec3::X);
+        let len = height * rng.random_range(0.6..0.9);
+        pinnate_frond(m, rng, crown, out, len, height * 0.5, height * 0.18, foliage);
     }
 }
 
@@ -442,31 +607,27 @@ fn build_shrub(
     bark: Vec3,
     big: bool,
 ) {
-    let base_r = height * if big { 0.6 } else { 0.5 };
-    if bare {
-        // Twiggy and brown: a fan of bare branches, no leaves.
-        let twigs = rng.random_range(3..7);
-        for _ in 0..twigs {
-            let az = rng.random_range(0.0..TAU);
-            let el: f32 = rng.random_range(0.7..1.3);
-            let dir = Vec3::new(az.cos() * el.cos(), el.sin(), az.sin() * el.cos()).normalize();
-            segment(m, Vec3::ZERO, dir * height * rng.random_range(0.6..1.0), height * 0.05, height * 0.012, 4, bark, bark);
-        }
-        return;
-    }
-    let lobes = if big { rng.random_range(3..6) } else { rng.random_range(1..4) };
-    for _ in 0..lobes {
-        let off = Vec3::new(sym(rng), 0.0, sym(rng)) * base_r;
-        let rr = base_r * rng.random_range(0.5..0.9);
-        let c = Vec3::new(off.x, off.y.abs() + rr * 0.5, off.z);
-        ellipsoid(m, c, Vec3::new(rr, rr * 0.8, rr), foliage, rng);
-    }
-    if flowering {
-        let dots = rng.random_range(6..14);
-        for _ in 0..dots {
-            let off = Vec3::new(sym(rng), rng.random::<f32>(), sym(rng)) * base_r;
-            ellipsoid(m, off + Vec3::Y * base_r * 0.4, Vec3::splat(base_r * 0.13), bloom, rng);
-        }
+    let b = Branching {
+        depth: if big { 3 } else { 2 },
+        children: (2, 4),
+        len_ratio: 0.72,
+        radius_ratio: 0.6,
+        spread: 0.95,
+        up_bias: 0.4,
+        droop: 0.05,
+        curve: 0.4,
+        leaves: if bare { (0, 0) } else { (8, 16) }, // bare = twiggy desert/tundra scrub
+        leaf_size: height * if big { 0.22 } else { 0.3 },
+        leaf_width: LEAF_WIDTH_RATIO,
+        bloom: if flowering { Some(bloom) } else { None },
+    };
+    // Several splayed stems from the base → a dense, rounded bush.
+    let stems = if big { rng.random_range(3..6) } else { rng.random_range(2..4) };
+    for _ in 0..stems {
+        let az = rng.random_range(0.0..TAU);
+        let out = safe_dir(Vec3::new(az.cos(), rng.random_range(1.5..3.0), az.sin()), Vec3::Y);
+        let len = height * rng.random_range(0.5..0.9);
+        grow_branch(m, rng, Vec3::ZERO, out, len, height * 0.05, b.depth, &b, bark, foliage);
     }
 }
 
@@ -492,16 +653,27 @@ fn build_cactus(m: &mut MeshData, rng: &mut StdRng, height: f32, col: Vec3, flow
 }
 
 fn build_flower(m: &mut MeshData, rng: &mut StdRng, height: f32, bloom: Vec3) {
-    segment(m, Vec3::ZERO, Vec3::Y * height, height * 0.05, height * 0.035, 4, STEM_COLOR, STEM_COLOR);
+    segment(m, Vec3::ZERO, Vec3::Y * height, height * 0.05, height * 0.03, 4, STEM_COLOR, STEM_COLOR);
+    // A couple of leaves low on the stalk.
+    let leaf_c = (STEM_COLOR * 1.4).clamp(Vec3::ZERO, Vec3::ONE);
+    for _ in 0..rng.random_range(2..4) {
+        let az = rng.random_range(0.0..TAU);
+        let h = height * rng.random_range(0.2..0.5);
+        let out = safe_dir(Vec3::new(az.cos(), 0.4, az.sin()), Vec3::Y);
+        leaf(m, rng, Vec3::Y * h, out, height * 0.4, 0.5, leaf_c);
+    }
+    // Bloom: a bright centre ringed by one or two rings of petals (leaf-cards).
     let head = Vec3::Y * height;
-    // A bright centre ringed by petals.
-    ellipsoid(m, head, Vec3::splat(height * 0.20), bloom * 0.8, rng);
-    let petals = rng.random_range(5..9);
-    for i in 0..petals {
-        let az = TAU * i as f32 / petals as f32;
-        let out = Vec3::new(az.cos(), 0.0, az.sin());
-        let pc = head + out * (height * 0.28);
-        ellipsoid(m, pc, Vec3::new(height * 0.22, height * 0.09, height * 0.22), bloom, rng);
+    ellipsoid(m, head, Vec3::splat(height * 0.12), (bloom * 0.7).clamp(Vec3::ZERO, Vec3::ONE), rng);
+    let petals = rng.random_range(6..11);
+    let rings = rng.random_range(1..3);
+    for ring in 0..rings {
+        let tilt = 0.7 - 0.25 * ring as f32; // outer ring opens flatter
+        for i in 0..petals {
+            let az = TAU * i as f32 / petals as f32 + ring as f32 * 0.4;
+            let out = safe_dir(Vec3::new(az.cos() * tilt, 1.0 - tilt, az.sin() * tilt), Vec3::Y);
+            leaf(m, rng, head, out, height * (0.34 - 0.06 * ring as f32), 0.55, bloom);
+        }
     }
 }
 
@@ -517,18 +689,49 @@ fn build_grass(m: &mut MeshData, rng: &mut StdRng, height: f32, foliage: Vec3) {
 }
 
 fn build_snag(m: &mut MeshData, rng: &mut StdRng, height: f32, bark: Vec3) {
-    // Greyed, weathered wood.
+    // Greyed, weathered, leafless wood — recursive bare branches.
     let wood = (bark * 0.7 + Vec3::splat(0.12)).clamp(Vec3::ZERO, Vec3::ONE);
-    let trunk_h = height * rng.random_range(0.7..1.0);
-    segment(m, Vec3::ZERO, Vec3::Y * trunk_h, height * 0.05, height * 0.02, TRUNK_SIDES, wood, wood * 1.1);
-    let branches = rng.random_range(2..6);
-    for _ in 0..branches {
+    let b = Branching {
+        depth: 3,
+        children: (2, 4),
+        len_ratio: 0.68,
+        radius_ratio: 0.55,
+        spread: 0.7,
+        up_bias: 0.18,
+        droop: 0.14,
+        curve: 0.5,
+        leaves: (0, 0),
+        leaf_size: 0.0,
+        leaf_width: 0.0,
+        bloom: None,
+    };
+    let trunk_len = height * rng.random_range(0.5..0.8);
+    grow_branch(m, rng, Vec3::ZERO, Vec3::Y, trunk_len, height * 0.05, b.depth, &b, wood, wood);
+}
+
+/// A winding, leafy vine: several trailing/climbing stems that wind (high `curve`)
+/// and droop under their own weight, leafed along their length.
+fn build_vine(m: &mut MeshData, rng: &mut StdRng, height: f32, bark: Vec3, foliage: Vec3, flowering: bool, bloom: Vec3) {
+    let b = Branching {
+        depth: 2,
+        children: (1, 3),
+        len_ratio: 0.82,
+        radius_ratio: 0.7,
+        spread: 1.1,
+        up_bias: 0.12,
+        droop: 0.22,
+        curve: 1.1, // winds noticeably
+        leaves: (4, 9),
+        leaf_size: height * 0.16,
+        leaf_width: 0.8, // broad, heart-shaped vine leaves
+        bloom: if flowering { Some(bloom) } else { None },
+    };
+    let stems = rng.random_range(2..5);
+    for _ in 0..stems {
         let az = rng.random_range(0.0..TAU);
-        let el: f32 = rng.random_range(0.6..1.2);
-        let dir = Vec3::new(az.cos() * el.cos(), el.sin(), az.sin() * el.cos()).normalize();
-        let p0 = Vec3::Y * (trunk_h * rng.random_range(0.4..0.9));
-        let len = height * rng.random_range(0.2..0.4);
-        segment(m, p0, p0 + dir * len, height * 0.025, height * 0.008, 4, wood, wood);
+        let out = safe_dir(Vec3::new(az.cos(), rng.random_range(0.4..1.4), az.sin()), Vec3::Y);
+        let len = height * rng.random_range(0.7..1.2);
+        grow_branch(m, rng, Vec3::ZERO, out, len, height * 0.03, b.depth, &b, bark, foliage);
     }
 }
 
@@ -615,23 +818,6 @@ fn segment(m: &mut MeshData, a: Vec3, b: Vec3, ra: f32, rb: f32, sides: usize, c
     }
 }
 
-/// An upright cone (apex on +Y) — conifer tiers. Side normals are slope-aware.
-fn cone(m: &mut MeshData, base: Vec3, height: f32, radius: f32, sides: usize, color: Vec3) {
-    let start = m.vertices.len() as u32;
-    let slope = (radius / height).max(0.0);
-    m.vertices.push(vert(base + Vec3::Y * height, Vec3::Y, color));
-    for s in 0..=sides {
-        let ang = TAU * s as f32 / sides as f32;
-        let radial = Vec3::new(ang.cos(), 0.0, ang.sin());
-        let n = (radial + Vec3::Y * slope).normalize();
-        m.vertices.push(vert(base + radial * radius, n, color));
-    }
-    for s in 0..sides as u32 {
-        let rim = start + 1 + s;
-        m.indices.extend_from_slice(&[start, rim + 1, rim]);
-    }
-}
-
 /// A lumpy ellipsoid blob — leafy canopy clumps, shrub lobes, flower heads.
 /// Position and colour are jittered per vertex for an organic, non-CG look.
 fn ellipsoid(m: &mut MeshData, center: Vec3, radii: Vec3, color: Vec3, rng: &mut StdRng) {
@@ -695,4 +881,56 @@ fn mix(a: u64, b: u64, c: u64) -> u64 {
         h = h.wrapping_mul(0x0100_0000_01B3);
     }
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The recursively-grown species meshes stay well-formed and bounded: the
+    /// detail is baked once per species, but a single mesh must stay affordable to
+    /// instance (no vegetation LOD yet — see FLORA_PHOTOREALISM_PLAN.md).
+    #[test]
+    fn species_meshes_are_bounded_and_well_formed() {
+        // Cap on any one species' geometry — recursion/leaf counts must not blow up.
+        const MAX_VERTS: usize = 30_000;
+        let flora = Flora::generate(0x1234_5678);
+        assert!(flora.species_count() > 0, "no species generated");
+
+        let (mut max_v, mut total_v) = (0usize, 0usize);
+        for id in 0..flora.species_count() as u32 {
+            let mesh = &flora.species(id).mesh;
+            let nv = mesh.vertices.len();
+            assert!(nv > 0, "species {id} produced an empty mesh");
+            assert_eq!(mesh.indices.len() % 3, 0, "species {id}: index count not whole triangles");
+            for &i in &mesh.indices {
+                assert!((i as usize) < nv, "species {id}: index {i} out of range ({nv} verts)");
+            }
+            for v in &mesh.vertices {
+                assert!(v.pos.iter().all(|c| c.is_finite()), "species {id}: non-finite vertex position");
+            }
+            assert!(nv < MAX_VERTS, "species {id} ballooned to {nv} verts (> {MAX_VERTS})");
+            max_v = max_v.max(nv);
+            total_v += nv;
+        }
+        eprintln!(
+            "flora: {} species, {} verts total, {} max, {} avg",
+            flora.species_count(),
+            total_v,
+            max_v,
+            total_v / flora.species_count()
+        );
+    }
+
+    /// Same seed → byte-identical library (determinism the meshing workers rely on).
+    #[test]
+    fn flora_generation_is_deterministic() {
+        let a = Flora::generate(99);
+        let b = Flora::generate(99);
+        assert_eq!(a.species_count(), b.species_count());
+        for id in 0..a.species_count() as u32 {
+            assert_eq!(a.species(id).mesh.vertices.len(), b.species(id).mesh.vertices.len(), "species {id} differs");
+            assert_eq!(a.species(id).mesh.indices, b.species(id).mesh.indices, "species {id} indices differ");
+        }
+    }
 }
