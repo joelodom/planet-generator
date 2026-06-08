@@ -1,5 +1,45 @@
 # planet-generator
 
+## Architecture — north star — IMPORTANT
+
+[`ARCHITECTURE_GUIDELINES.md`](ARCHITECTURE_GUIDELINES.md) is the standing
+architectural standard — **read it before any non-trivial change** and hold new
+code to it. It encodes the **priority hierarchy** that breaks every design tie:
+
+> correctness → security → performance → maintainability → portability → polish
+
+(higher wins on conflict; never trade a higher property away for a lower one
+without a written reason). Headline rules: in runtime/library paths **degrade,
+don't panic**; never repeat expensive work on a hot path (per-frame
+`frame`/`select`/`render`, per-chunk `build`/`sample`); keep heavy generation off
+the main thread and `gfx` a thin slab below the simulation; everything derives
+deterministically from the seed. A point-in-time assessment against these
+properties lives in [`ARCHITECTURE_REVIEW.md`](ARCHITECTURE_REVIEW.md).
+
+## Running & deploying — IMPORTANT
+
+**This repo is worked on over a headless SSH session to the `claude` macOS
+account — there is no display here, so `cargo run` cannot open the app's window.**
+The user runs the app from a **separate GUI account** on the same Mac. So
+"produce a build the user can run/test" means **package it and drop it in the
+shared folder** — never `cargo run`.
+
+- **Build + deploy:** `./package_macos.sh`. It release-builds, assembles
+  `dist/Planet Explorer.app`, **ad-hoc codesigns** it (so Gatekeeper doesn't flag
+  it as "damaged" when launched from another account), makes it
+  world-readable/executable, and copies it to **`/Users/Shared/Planet Explorer.app`**
+  — the shared drop point the GUI account launches from. (There is no
+  `/Users/Shared/Applications`; the `.app` lives directly in `/Users/Shared/`.)
+- **Whenever the user will "run/test" a change, re-run `./package_macos.sh`** so
+  the shared app reflects it. The bundle's version carries the git short hash with
+  a `-dirty` suffix for uncommitted trees, so the user can confirm the build
+  they're running (`".../planet-explorer" --version`, or the startup line in the
+  log).
+- **What you CAN verify headlessly here:** `cargo test` (the GPU smoke test runs
+  if an adapter is present, else skips), `cargo clippy`, and `--version` (it exits
+  before any window/GPU). Actual visuals are the user's to check from the GUI
+  account; the shared log (see Logging) is how you observe that run from here.
+
 ## Coding conventions — IMPORTANT
 
 **No magic numbers.** Tuning values and any non-obvious literal must be a
