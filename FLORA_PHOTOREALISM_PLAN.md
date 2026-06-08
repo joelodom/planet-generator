@@ -1,242 +1,337 @@
 # Flora Photorealism — Plan
 
-A staged plan to make Planet Explorer's vegetation read as *more photorealistic*.
-The goal is "better, not perfect": land the high-leverage cues first, defer the
-expensive pipeline work. Every item names the files/functions it touches, its
-cost, and how it stays inside [`ARCHITECTURE_GUIDELINES.md`](ARCHITECTURE_GUIDELINES.md)
-(determinism, the per-frame/per-chunk hot paths, `gfx` stays a thin slab,
-cross-platform, **no magic numbers**).
+A staged plan to make Planet Explorer's vegetation read as *more photorealistic*,
+**with memory and compute cost quantified for every idea**. The goal is "better,
+not perfect": land the high-leverage cues cheaply, defer the expensive pipeline
+work, and never let polish blow the resource budget.
+
+Every item names the files it touches, its **resource factor** (against the pool it
+actually grows), and how it stays inside [`ARCHITECTURE_GUIDELINES.md`](ARCHITECTURE_GUIDELINES.md).
 
 > Priority hierarchy (the tie-breaker): **correctness → security → performance →
-> maintainability → portability → polish.** Photorealism is *polish* — it must
-> never buy looks by breaking determinism, the hot path, or portability.
+> maintainability → portability → polish.** Photorealism is *polish* — it never
+> justifies breaking determinism, a hot path, or portability, and it must respect
+> the memory budget the user sets in the GRAPHICS menu.
 
 ---
 
-## TL;DR — what to do first
+## TL;DR
 
-**Slice 1 (recommended first cut — no new assets, low risk, deterministic, and it
-visibly transforms the look):**
+1. **Fix density first — it's the keystone.** Today density is *attempts per chunk*,
+   identical at every LOD level, so the near field is up to ~256× denser per unit
+   area than the far field and the user-visible "too dense." Switching to
+   **area-proportional density with a per-chunk cap**, tuned to **ecological
+   plants/hectare per biome**, plus a **layered-strata + reverse-J size
+   distribution**, makes it look right *and* **shrinks** the one veg cost that
+   scales with the world. This is free realism — it costs negative memory.
+2. **Most shading/geometry ideas are nearly memory-free.** They touch the
+   *base meshes* (uploaded **once**, ~1.6 MB total) or the *existing* per-instance
+   matrix+tint (80 B/plant, unchanged). Per-instance memory factor ≈ **1.0×** for
+   Tier 0, 1a, 2.
+3. **The only genuinely new memory is fixed VRAM** — leaf/bark **textures**
+   (~5–50 MB, one-time) and **MSAA** render targets (~120 MB at 1440p, resolution-
+   scaled). Both are independent of plant count and **gated behind the graphics
+   preset**.
 
-1. **Veg shading overhaul** in `shaders/vegetation.wgsl`: leaf **translucency /
-   back-light transmission**, a **half-Lambert wrap** to soften the terminator,
-   and a weak **leaf sheen**. Driven by a new per-vertex **material/AO** attribute
-   so leaves are lit differently from wood.
-2. **Baked ambient occlusion** into the foliage at generation time (`flora.rs`
-   builders) — canopy interiors/undersides and trunk bases darken, tops/outers
-   brighten. Gives forms volume without real-time AO.
-3. **Per-instance variation** in `mesh.rs::place_vegetation`: small lean, gentle
-   non-uniform scale, and richer per-instance tint — kills the "clone army" look.
-4. **Extend the gallery harness** to render through `vegetation.wgsl` (it currently
-   uses the terrain shader), plus a back-lit view, so we can *see* 1–3 in a headless
-   PNG and iterate.
-
-That slice is the one to build, package, and study. Everything below it (silhouette
-geometry, wind, leaf cards, MSAA) is sequenced after.
+So the resource story is reassuring: **vegetation is already a *minority* of
+geometry memory (terrain dominates ~5:1), and the photoreal work barely moves the
+veg pool — while the density fix actively reduces it.**
 
 ---
 
-## Where flora lives today (the pipeline)
+## Resource model — the three pools (know which one each idea grows)
 
-| Stage | File | What it does |
+Confirmed from the code (`gfx.rs` `mesh_bytes`/byte accounting, `mesh.rs` sizes,
+`settings.rs` presets):
+
+| Pool | What | Current size (High preset) | Scales with |
+|---|---|---|---|
+| **A — base meshes** | One mesh per species, uploaded once (`Renderer.species_meshes`) | ~180 species × ~250 verts × 36 B ≈ **1.6 MB** | species count × poly/species (one-time) |
+| **B — per-instance working set** | `VegInstance` (64 B model + 16 B tint = **80 B**) per planted plant, per resident chunk | tens of MB to ~**200 MB** worst case | **plant count = density × resident area** ← the lever |
+| **C — fixed VRAM** | Textures, MSAA targets | **0** for veg today | resolution / atlas size (one-time) |
+
+Anchor numbers (High, `grid=63`, budget 8 GB):
+
+- **Terrain per chunk** ≈ 4096 verts·36 B + 23.8 k idx·4 B ≈ **~240 KB**.
+- **Veg per dense chunk** ≈ 675 plants · 80 B ≈ **~54 KB** (≈ 18 % of that chunk;
+  most land chunks are far sparser, ocean/ice = 0).
+- **Working set** ≈ 3,800 chunks → terrain ≈ **~0.9 GB**, veg ≈ **tens of MB–200 MB**.
+
+**The single most important fact:** only **Pool B** grows with the world, and it is
+`80 B × plants`. Reduce plants (density) and you reduce the only scaling veg cost —
+linearly — while improving realism. Everything else is one-time and small.
+
+---
+
+## Where flora lives today (pipeline)
+
+| Stage | File | What |
 |---|---|---|
-| Species library | `src/flora.rs` | Per-planet, per-biome procedural plants. `Flora::generate(seed)` grows up to `SPECIES_PER_BIOME` meshes per vegetated biome from low-poly primitives: `segment` (tapered tube — trunks/limbs), `cone` (conifer tiers), `ellipsoid` (lumpy blob — canopy/shrub/flower heads), `frond` (flat drooping strip — grass/palm). Colour baked per vertex. |
-| Placement | `src/mesh.rs` → `place_vegetation` | Per-chunk, chunk-key-seeded scatter. Linear-decay clustering per species; emits `VegInstance { model: Mat4, tint }` (~80 B) grouped by species. |
-| Render | `src/shaders/vegetation.wgsl` | Instanced draw, one per species per chunk. Lambert diffuse + flat ambient + tiny sky fill + distance fog. **No** specular/translucency/AO/shadows/wind. |
-| Evaluate | `src/gfx.rs` → `mod gallery` | Offscreen PNGs: `flora_gallery_renders` → `planet_flora_gallery.png`, `terrain_closeup_renders` → `planet_flora_closeup.png`. ⚠️ Renders flora via the **terrain** shader (baked to world space), not `vegetation.wgsl`. |
-
-Lighting context (`gfx.rs` Globals): a single directional sun (`sun_dir.xyz`), a
-flat ambient (`sun_dir.w`, ~0.42), atmosphere tint for fog/sky. Opaque pass is
-`sample_count: 1` (no MSAA), blend `REPLACE`, `cull_mode: None`.
+| Species library | `flora.rs` | `Flora::generate(seed)` grows ≤`SPECIES_PER_BIOME` low-poly meshes per vegetated biome from `segment`/`cone`/`ellipsoid`/`frond`. Per-vertex colour. |
+| Placement | `mesh.rs::place_vegetation` | Per-chunk, chunk-key-seeded scatter; `density` **attempts/chunk** (not area-scaled), gated by `biome_coverage` × per-species clustering presence. Emits `VegInstance`s grouped by species. |
+| Render | `shaders/vegetation.wgsl` | Instanced; Lambert + flat ambient + tiny sky-fill + fog. No specular/translucency/AO/shadow/wind. |
+| Evaluate | `gfx.rs::mod gallery` | Offscreen PNGs. ⚠️ Renders flora via the **terrain** shader (baked to world space), not `vegetation.wgsl`. |
 
 ---
 
-## Diagnosis — why the current flora reads as "CG"
+## Diagnosis — why current flora reads as "CG"
 
-1. **Blobby/geometric silhouette.** Canopies are smooth lumpy spheres
-   (`ellipsoid`, `BLOB_RINGS=3`, `BLOB_SECTORS=5`); conifers are clean stacked
-   cones. Real foliage has a broken, near-fractal, semi-transparent edge.
-2. **No translucency.** Pure Lambert makes leaves look like opaque painted
-   plastic. Real leaves transmit and scatter light; back-lit canopies glow.
-3. **Harsh terminator + dead shade side.** `max(dot(n,l),0)` on a sphere gives a
-   hard light/dark split; the shadow side is lifted only by flat ambient. Real
-   canopies have strong inter-leaf bounce, so the falloff is soft.
-4. **Flat, low-variance colour.** Base colour ± small jitter (`FOLIAGE_VERT_JITTER
-   = 0.05`); little top/bottom or sun/shade variation, no per-leaf hue spread.
-5. **"Clone army."** Every instance of a species is the *same* mesh; only uniform
-   scale (`0.82–1.20`) and a near-white tint vary. Identical trees in identical
-   upright poses read as instanced CG.
-6. **Pasted-on, no ground integration.** Plants are lone objects on the terrain
-   (sunk by `VEG_SINK`). No contact shadow/AO, no leaf litter, no basal grass — so
-   they look like decals floating on the ground.
-7. **Dead still.** No wind. Static vegetation is an instant tell.
-8. **Aliasing.** `sample_count: 1`: thin trunks, fronds, and leaf edges shimmer and
-   crawl, especially in motion (the tour).
+1. **Density is wrong and view-dependent** (see next section) — the biggest single tell.
+2. **Blobby/geometric silhouette** (`ellipsoid` 3×5 rings, clean `cone` tiers).
+3. **No translucency** — Lambert makes leaves look like opaque plastic.
+4. **Harsh terminator + dead shade side** (`max(dot(n,l),0)` on smooth blobs).
+5. **Flat, *random* colour** — `FOLIAGE_VERT_JITTER=0.05`; hue picked by RNG, not
+   tied to climate, so stands aren't cohesive.
+6. **"Clone army"** — every instance is the same mesh; only uniform scale + near-
+   white tint vary; all perfectly upright.
+7. **Uniform sizes** — no age/size distribution; a stand is all one size.
+8. **Pasted-on** — no contact shadow/AO, no leaf litter, no basal grass.
+9. **Dead still** — no wind.
+10. **Aliasing** — `sample_count: 1`; thin trunks/fronds/leaf edges crawl in motion.
 
 ---
 
-## The plan, in tiers
+## Density & ecological realism (the keystone — do this first)
 
-Each tier is roughly *payoff ÷ effort* descending. Tier 0–1 are the "better, not
-perfect" core; Tier 3 is the genuine photoreal leap when we want it.
+### The current model and why it's "too dense"
 
-### Tier 0 — Shading & light (biggest ratio; no new assets)
+`place_vegetation` makes a **fixed `density` attempts per chunk regardless of the
+chunk's LOD level or ground area** (`veg_density` ≈ 498 at High, max 750). Because
+the LOD system draws *fine* chunks near the camera and *coarse* chunks far away:
 
-A single cohesive change: give vegetation its **own vertex attribute** carrying a
-`material` flag (wood vs leaf) and a baked `ao` term, then upgrade
-`vegetation.wgsl`. Today terrain and veg share `vertex_layout()`; this introduces a
-veg-specific layout so the shader can treat foliage ≠ bark without touching terrain.
+- A level-16 (near) chunk ≈ **3.8 ha**; ~675 plants ⇒ ~**180 plants/ha**.
+- A level-12 (far) chunk ≈ **970 ha**; ~675 plants ⇒ ~**0.7 plants/ha**.
 
-- **0a. Leaf translucency / back-light transmission.** Add a transmission lobe:
-  light arriving from *behind* a leaf surface (`dot(-n, l)` style, modulated by
-  view) adds a warm, brightened tint of the leaf colour. Foliage only (gate on
-  `material`). *Why:* the single biggest "plastic → leaves" cue.
-- **0b. Half-Lambert wrap.** Replace `max(dot(n,l),0)` for foliage with a wrapped
-  diffuse (`dot*0.5+0.5`), softening the terminator and lifting the shade side
-  naturally instead of with flat ambient. *Why:* fixes tell #3.
-- **0c. Weak leaf sheen.** A broad, low-strength specular (half-vector, like the
-  water glint but much softer) so canopies catch a waxy highlight under sun.
-- **0d. Baked AO + foliage normal break-up.** In `flora.rs` builders, compute a
-  per-vertex AO (canopy interior/underside and trunk base darker; tops/outers
-  brighter — generalising the conifer's existing tier ramp) and store it in the new
-  attribute. Optionally jitter foliage normals (we already jitter position+colour,
-  not normals) so lighting breaks up across a blob instead of reading as a balloon.
-- **Where:** `shaders/vegetation.wgsl` (`vs`/`fs`); `mesh.rs` `Vertex`/veg vertex
-  layout (or a new `VegVertex`); `flora.rs` `vert`/`ellipsoid`/`cone`/`segment`/`frond`
-  tag material + AO.
-- **Cost:** per-fragment math (cheap); one extra vertex attribute; gen-time AO.
-- **Arch:** deterministic (baked from the seed at build time), off the main thread
-  (in flora build), `gfx` unchanged in spirit (just richer shader). All new tuning
-  values become named `const`s in WGSL/Rust.
-- **Test:** keep `offscreen_pipeline_validates` green; extend gallery (below) to
-  show it.
+So **the same ground is ~256× denser per unit area when you stand on it than when
+you see it from altitude** (4× per level, levels 12→16). Walking toward a forest, it
+*thickens* unnaturally; the near field becomes a wall — especially with tropical
+trees at `size_scale=1.6` (heights ~50–75 m) spaced ~7 m apart, so canopies fully
+overlap. That's the "too dense in general."
 
-### Tier 1 — Cheap geometry & per-instance variation (generation side)
+It also makes **total veg memory LOD-dependent and unpredictable**: zoom in and Pool
+B balloons because each fine chunk independently plants ~`density`.
 
-- **1a. Per-instance variation.** In `place_vegetation`, enrich the per-plant
-  transform/tint that's *already emitted*: a small random **lean** (compose a tilt
-  quaternion — trees aren't all plumb), gentle **non-uniform scale** (squash/stretch
-  in Vec3), and a wider **tint** spread (hue/brightness, not just near-white). *Why:*
-  kills the clone-army look (#5) at ~zero cost — no extra geometry or memory.
-  *Caveat:* `vegetation.wgsl` assumes the instance upper-3×3 is rotation×uniform
-  scale for normals; keep the anisotropy modest, or pass a per-instance normal
-  matrix. Flag in the shader comment.
-- **1b. A few mesh variants per species.** Build N≈3 variants per species and pick
-  per instance. *Why:* silhouette variety within a species. *Cost:* tiny extra
-  base-mesh memory (uploaded once) but **more draw calls** — see `BACKLOG.md`
-  "Tame `split_factor`"; weigh against that.
-- **1c. Richer canopy silhouette.** More, smaller overlapping foliage blobs with
-  stronger displacement (raise/za second octave on `BLOB_LUMP`), jittered cone rims
-  so conifer tiers aren't perfect cones, optional drooping needle fronds at tier
-  edges. *Why:* attacks tell #1 directly. *Cost:* more polys per species (still
-  tiny memory; watch CPU/visual only, per `BACKLOG.md`).
-- **1d. Branch structure.** A second branching level for `build_broadleaf` /
-  `build_snag` so crowns sit on visible boughs and bare/winter frames read as real
-  wood.
-- **1e. Basal integration (grass collar).** Bias a few small grass/forb instances
-  around the base of larger plants in `place_vegetation`. *Why:* stops the pasted-on
-  look (#6). (Contact shadows on the terrain itself are harder — defer to Tier 3.)
-- **Arch:** all seeded from existing per-chunk/per-species sub-seeds → deterministic;
-  all in worker-side generation → off the main thread. Keep per-plant work O(1).
+### The fix: area-proportional density, capped, ecological targets
+
+1. **Make density physical — plants per unit area, not per chunk.** Expected plants
+   for a chunk = `D_biome × chunk_ground_area` (Bernoulli/Poisson so fractional
+   expectations work at fine levels). Now ground density is **constant across LOD** —
+   the forest looks the same near and far, and **total Pool B ≈ `D̄ × resident_area ×
+   80 B`, decoupled from LOD** (predictable, budgetable).
+2. **Cap per chunk** (`VEG_MAX_INSTANCES_PER_CHUNK`). Pure area-proportional would
+   make a far level-12 chunk want `D × 970 ha` = tens of thousands of plants (a
+   single 7 MB instance buffer!). Cap it: far/coarse chunks come out *sparse but
+   present and bounded*; the deficit is invisible at distance (and is exactly where
+   **impostors**, Tier 3c, take over later). The cap is the Pool-B safety rail.
+3. **Tune `D_biome` to ecology** (1 unit = 10 m ⇒ 1 ha = 100 unit² ⇒ *100 plants/ha =
+   1 plant/unit²*). Earth anchors for the **canopy layer**:
+   - Tropical / temperate forest: ~**60–150 trees/ha** (was effectively ~180 near-field, *and* now constant) → spacing ~8–13 m, canopies touch but don't merge into a wall.
+   - Boreal: ~**100–200/ha** (denser stems, smaller crowns).
+   - Savanna / grassland trees: ~**5–40/ha** (open, scattered).
+   - Desert woody: ~**5–60/ha**; tundra dwarf shrubs sparse.
+4. **Layer the strata** instead of one scatter. Real ecosystems stack
+   canopy → understory → shrub → ground/herb. Plant a *sparse* big-tree canopy
+   (numbers above) **plus** a denser low layer (grass/forb/shrub at high count but
+   *tiny* meshes). Scenes read lush at the ground while the canopy stays open — the
+   opposite failure mode from today. *(Tiny ground plants are cheap geometry and the
+   per-instance cost is still 80 B each, so keep the ground-layer cap sane.)*
+5. **Reverse-J size distribution.** Draw per-instance scale from a power law (many
+   small/young, few large/mature) rather than uniform `0.82–1.20`. Kills the "all one
+   size" tell, ZERO memory cost (it only reshapes the existing scale RNG).
+6. **Competition spacing + environmental gradients.** A minimum-spacing/Poisson-disk
+   reject so plants don't interpenetrate; density gradients with moisture/altitude
+   (lush near water, thinning up mountains / into arid edges). Mostly placement-logic,
+   ~0 memory.
+
+**Where:** `mesh.rs::place_vegetation` (area-scaled attempt count + cap + strata +
+size law + spacing), `flora.rs` `biome_profile`/new per-biome `D_biome`, `settings.rs`
+(density knob becomes an areal target; add the cap). Keep determinism (chunk-key
+seeded) and keep it O(attempts) per chunk.
+
+**Resource impact:** **Pool B near-field ×~0.3–0.5** (fewer near plants), total Pool B
+**bounded and LOD-independent**; **CPU placement ×~0.3–0.6** (fewer attempts where it
+was densest); GPU veg vertex/draw load **down**. Pools A and C unchanged. *Net: a
+realism win that also reclaims memory and CPU.*
+
+---
+
+## The tiers (each with its resource factor)
+
+### Tier 0 — Shading & light (biggest ratio; ~memory-free)
+
+Give vegetation its **own vertex attribute** packing a `material` flag (wood vs leaf)
++ a baked `ao` term, then upgrade `vegetation.wgsl`:
+
+- **0a. Leaf translucency / back-light transmission** — back-lit canopies glow
+  (the single biggest "plastic → leaves" cue). Foliage-gated.
+- **0b. Half-Lambert wrap** — softens the terminator, lifts the shade side naturally.
+- **0c. Weak leaf sheen** — broad, low specular for waxy gloss under sun.
+- **0d. Baked AO + foliage-normal break-up** — darken canopy interiors/undersides &
+  trunk bases at *generation* time; jitter foliage normals so a blob stops shading
+  like a balloon.
+
+**Where:** `vegetation.wgsl`; a veg-specific vertex layout (`VegVertex` or +1 attr on
+the base mesh); `flora.rs` builders tag material/AO.
+**Resource:** Pool A only — `Vertex` 36 B → 40 B *on base meshes* (+~0.2 MB total).
+**Pool B ×1.0**, Pool C +0. GPU: a few fragment ALU ops (negligible). CPU: gen-time
+AO, off the main thread. **Memory factor ≈ 1.00×.**
+
+### Tier 1 — Cheap geometry & per-instance variation
+
+- **1a. Per-instance variation** — small lean (tilt quat), gentle non-uniform scale,
+  wider tint, all in the *already-emitted* model matrix + tint. Kills the clone army.
+  **Pool B ×1.0** (no new bytes), CPU ~×1.0. *(Caveat: keep non-uniform scale modest
+  or pass a normal matrix — the shader assumes rotation×uniform scale for normals.)*
+- **1b. N mesh variants per species** — pick per instance for silhouette variety.
+  **Pool A ×N** (e.g. ×3 → ~5 MB, still trivial); **Pool B ×1.0**; cost is **draw
+  calls** (up to ×N species-runs/chunk — weigh against `BACKLOG.md` "Tame `split_factor`").
+- **1c. Richer canopy silhouette** — more, smaller, more-displaced blobs; jittered
+  cone rims; needle fronds. **Pool A ×~2–3** (→ ~3–5 MB); **Pool B ×1.0**; real cost
+  is **GPU vertex/triangle throughput ×~2–3** on drawn veg (fine on a 5090; measure on
+  Mac; gate poly density behind the preset).
+- **1d. Branch structure** for broadleaf/snag (a second branching level). Same profile
+  as 1c (Pool A modest, Pool B ×1.0, GPU vtx ↑).
+- **1e. Basal grass collar** — a few tiny ground plants around big plants. This is part
+  of the strata work above; **Pool B** grows only by the (capped) ground-layer count.
 
 ### Tier 2 — Wind / motion
 
-- **2a. Wind sway.** Animate foliage vertices in `vegetation.wgsl` `vs`: sway
-  amplitude scales up the plant (trunk base fixed → canopy/frond/grass tips move
-  most) and with the `material`/local-Y weight, driven by a wind vector + time
-  (`camera_pos.w`) + a per-instance phase. *Why:* the biggest "alive" boost; static
-  plants are an instant tell. Precedent: the water already animates in `terrain.wgsl`.
-- **⚠️ Precision landmine (ARCH §8 / review M6).** Do **not** phase the sway off
-  absolute world position — at ~637 k-unit magnitude `sin(world_pos·k)` loses phase
-  precision. Drive it from a **per-instance phase scalar** (add to the instance
-  buffer) or local/fractional coordinates. Call this out at the call site.
-- **Arch:** render-time only (like water ripples) — the *world* mesh/instances stay
-  deterministic; nothing in generation depends on wall-clock. Named consts for
-  amplitude/frequency/stiffness.
+- **2a. Wind sway** in `vegetation.wgsl` `vs` — amplitude scales up the plant (base
+  fixed, tips move), via the `material`/local-Y weight, a wind vector, time
+  (`camera_pos.w`), and a per-instance phase.
+- **⚠️ Precision (ARCH §8 / M6):** do **not** phase off absolute world position
+  (~637 k units loses `sin` phase). Use a **per-instance phase scalar** or local/
+  fractional coords.
+**Resource:** **Pool B ×1.0** (derive phase from existing data) **or ×1.05** (add a
+4 B phase float). GPU: a few vertex ops (negligible). Render-time only — world stays
+deterministic (like the existing water animation).
 
-### Tier 3 — The photoreal leap (highest effort, highest payoff; later)
+### Tier 3 — The photoreal leap (highest effort; the only real new memory)
 
-- **3a. Alpha-tested leaf cards.** Replace/augment solid foliage blobs with clusters
-  of textured, **alpha-tested** quads (crossed quads or camera-facing billboards)
-  carrying a leaf-cluster texture — how most real-time engines get photoreal
-  canopies. Needs: UVs on veg vertices; a texture+sampler bind group (veg is
-  vertex-colour only today); **alpha-test/clip** in the fragment (order-independent —
-  works with the current opaque+depth-write pass, no sorting). Texture source:
-  procedurally generated at startup (stays self-contained & seed-deterministic, in
-  keeping with the project) or a small embedded PNG (`assets/` + `include_bytes!`,
-  like `planet.png`).
-- **3b. Bark / ground textures.** Same pipeline, lower priority than leaves.
-- **3c. Vegetation LOD impostors.** Far plants → a single billboard impostor; full
-  mesh only up close. Hooks into the existing chunk LOD (`veg_min_level`). Lets near
-  plants get much richer (Tier 1c/3a) without paying for it at distance, and cuts
-  distant thin-geometry aliasing.
-- **3d. MSAA (or FXAA).** Enable multisampling on the opaque pass (resolve target),
-  or a cheap post AA. *Why:* fixes tell #8 for *all* geometry, not just veg — the
-  tour especially. Cross-cutting (touches every pipeline + the render targets); gate
-  the sample count behind the graphics preset (`settings.rs`) — the RTX 5090 eats
-  4–8×, the Mac is fine at 4×.
-
-### Cross-cutting — ecology & distribution
-
-Cheap realism via `place_vegetation`: denser ground cover *under* canopy
-(undergrowth layering), a more natural size histogram (mix saplings + mature — falls
-out of 1a's scale variation), and continued species mixing at biome edges (already
-dithered via `sample_blended`). Lower priority; fold into Tier 1.
+- **3a. Alpha-tested leaf cards + textures.** Clusters of textured, **alpha-clipped**
+  quads instead of solid blobs — how real-time engines get photoreal canopies.
+  Order-independent (clip in the fragment; works with the current opaque+depth pass).
+  **Resource:** **Pool C +5–50 MB** (one shared leaf/bark atlas, e.g. 1–2 k² RGBA +
+  mips; *fixed, independent of plant count*); **Pool A ×~1.5–4** (UVs: `Vertex` +8 B;
+  more card geometry — still single-digit MB); **Pool B ×1.0**. GPU: **fragment
+  overdraw + `discard`** is the real cost (alpha-tested foliage is fill-heavy) — pairs
+  naturally with impostors (3c) and a density that isn't a wall. Texture source:
+  procedural at startup (seed-deterministic, self-contained) or a small embedded PNG.
+- **3b. Bark / ground detail textures** — same pipeline, lower priority. Pool C +few MB.
+- **3c. Vegetation LOD impostors** — far plants → one billboard; full mesh only near.
+  **Resource: REDUCES** Pool B and GPU in the far field; small impostor atlas in Pool
+  C. This is what lets a low `veg_min_level` (far-field veg) coexist with a sane
+  near-field density and the per-chunk cap. **A memory/compute *saver*.**
+- **3d. MSAA (or FXAA)** — fixes aliasing (#10) for *all* geometry, not just veg.
+  **Resource:** **Pool C + render-target VRAM × sample_count** — ~**120 MB at 1440p /
+  ~330 MB at 4K for 4×** (color+depth+resolve), *resolution-scaled, fixed*; GPU fill
+  ×~2–4. Gate sample count behind `settings.rs` (5090 eats 4–8×; Mac fine at 4×).
+  FXAA is a cheaper alternative (~one extra full-screen pass, no MSAA VRAM).
 
 ---
 
-## Evaluation workflow (how to study output headlessly)
+## Per-idea resource impact — at a glance
 
-The `gallery` module is the tight loop — no GUI needed:
+Factors are against the pool the idea actually grows (✱ = the dominant/limiting cost).
 
-- `flora_gallery_renders` → `<tempdir>/planet_flora_gallery.png` (species catalogue).
-- `terrain_closeup_renders` → `<tempdir>/planet_flora_closeup.png` (in-situ forest;
-  `--ignored`, slow).
+| Idea | Pool A (base, 1.6 MB) | Pool B (80 B/plant) ✱ | Pool C (fixed VRAM) | CPU place | GPU |
+|---|---|---|---|---|---|
+| **Density redesign** | ×1.0 | **×0.3–0.5, capped** | 0 | **×0.3–0.6** | ↓ |
+| 0 Shading + material/AO | +0.2 MB | ×1.0 | 0 | ×1.0 | frag +ε |
+| 1a Per-instance variation | ×1.0 | ×1.0 | 0 | ×1.0 | ×1.0 |
+| 1b N variants (×3) | ×3 (~5 MB) | ×1.0 | 0 | ×1.0 | +draw calls |
+| 1c/1d Richer geometry | ×2–3 (~5 MB) | ×1.0 | 0 | ×1.0 | **vtx ×2–3** |
+| 2 Wind | ×1.0 | ×1.0–1.05 | 0 | ×1.0 | vtx +ε |
+| 3a Leaf cards + textures | ×1.5–4 (~6 MB) | ×1.0 | **+5–50 MB** | ×1.0 | **frag overdraw** |
+| 3c Impostors | ×1.0 | **↓** | +small | ↓ | ↓ |
+| 3d MSAA 4× | ×1.0 | ×1.0 | **+120 MB @1440p** | ×1.0 | **fill ×2–4** |
 
-**Fix first:** the gallery renders flora through the **terrain** shader (baked to
-world space), so Tier-0 veg-shader work won't show there. Extend it to render via the
-**vegetation pipeline** (instanced), and add a **back-lit** camera/sun setup so
-translucency is visible. Then the before/after of every slice is a PNG diff.
+**Reading it:** nothing here multiplies the world-scaling pool (B) except the density
+redesign, which *divides* it. New memory is one-time fixed VRAM (textures, MSAA),
+budget-gated. Compute risk concentrates in richer geometry (vertex throughput) and
+alpha-tested foliage (fragment overdraw) — both mitigated by impostors + sane density.
 
-Run: `cargo test --release flora_gallery -- --nocapture` (add `--ignored` for the
-closeup), then copy the PNG into `/Users/Shared/` to view from the GUI account. The
-existing `package_macos.sh` flow remains how the *interactive* build is shipped.
+---
+
+## More photorealism from Earth-flora thinking
+
+Beyond shading/geometry, what actually separates real vegetation from CG — most of it
+**near-zero memory**:
+
+- **Climate-driven colour (not RNG).** Tie foliage hue/value/saturation to the
+  sample's **temperature & moisture** (the planet already computes both) instead of
+  `green_foliage`'s pure random pick: deep saturated greens in warm-wet, olive/straw
+  in arid, blue-green needles in cold, autumn where seasonal. Stands become *cohesive*
+  and place-appropriate. **Pool B/A ×1.0** — it only reseeds existing colour choices.
+- **Allometric size distribution (reverse-J)** — covered under density #5; free.
+- **Layered strata** — covered under density #4.
+- **Textured leaves/bark + translucent leaf masks** — Tier 3a/3b; the leap that needs
+  Pool C.
+- **Competition spacing, clearings, riparian/altitude gradients** — density #6; free.
+- **Dead matter & ground variation** — stumps, fallen logs, bare soil patches, rock;
+  breaks uniformity. Cheap geometry (reuse `Snag`), Pool B by the (small) count.
+- **Contact shadow / soil darkening under canopy** — a subtle darkening of terrain
+  vertices (or a decal) beneath big plants; grounds them. Modest terrain-side work;
+  Pool A/B ×1.0.
+- **Aerial-perspective desaturation** — slight extra desaturation with distance on top
+  of fog; a couple of shader ops, free.
+
+---
+
+## Evaluation workflow (study output headlessly)
+
+The `gallery` module is the tight loop: `flora_gallery_renders` →
+`<tempdir>/planet_flora_gallery.png`, `terrain_closeup_renders` →
+`planet_flora_closeup.png` (`--ignored`, slow). **Fix first:** it renders flora through
+the **terrain** shader (baked to world space), so Tier-0 veg-shader work won't show —
+extend it to render via the **vegetation pipeline**, add a **back-lit** view (to show
+translucency) and a **wide stand** view (to judge *density* before/after). Run
+`cargo test --release flora_gallery -- --nocapture`, copy the PNG to `/Users/Shared/`
+to view from the GUI account. Interactive builds still ship via `package_macos.sh`.
+
+Also lean on the existing **`mem_mb` HUD/log readout** (`BACKLOG.md`) to measure Pool B
+before/after each change — the density redesign should visibly *drop* it.
 
 ---
 
 ## Recommended sequencing
 
-1. **Slice 1 — Tier 0 shading overhaul + Tier 1a per-instance variation + 1e grass
-   collar + gallery-through-veg-shader.** No assets, low risk, deterministic, and it
-   visibly changes everything. ← build, package, study.
-2. **Slice 2 — Tier 1c/1d silhouette + branches, then Tier 2 wind.**
-3. **Slice 3 — Tier 3 leaf cards + MSAA + LOD impostors** (the real leap, when we
-   commit the pipeline work).
+1. **Density redesign** (area-proportional + cap + ecological targets + strata + size
+   law). Highest realism impact, *reduces* memory/CPU, no new assets. Measure Pool B
+   drop via `mem_mb`. ← do first.
+2. **Tier 0 shading overhaul + 1a per-instance variation + climate-driven colour.**
+   ~memory-free, transforms the look. Extend the gallery to the veg shader. ← package
+   & study.
+3. **Tier 1c/1d silhouette + branches, then Tier 2 wind.** Watch GPU vertex load.
+4. **Tier 3 leaf cards + impostors + MSAA** — the real leap; the only items that add
+   (fixed, gated) VRAM. Impostors offset the leaf-card fill cost.
 
 ---
 
 ## Guardrails (hold every slice to these)
 
-- **Determinism.** Generation changes seed from existing sub-seeds
-  (`flora::mix`, `ChunkKey::hash`). Animation (wind) is render-time only, like water —
-  the world mesh/instances stay a pure function of the seed.
-- **Hot paths.** `place_vegetation` is per-chunk (worker): keep added work O(1) per
-  plant, no new per-call heap churn. Shader additions are per-vertex/fragment: keep
-  them cheap; no new per-frame allocations on the main thread.
-- **`gfx` stays thin.** Policy lives in `flora`/`mesh`; `gfx` only grows a texture/
-  bind group if we take Tier 3. Don't leak `wgpu` types upward.
-- **Portability.** Plain WGSL, `wgpu` textures, pure-Rust cross-platform crates only;
-  `cfg`-gate nothing device-specific into portable code. Gate heavier defaults
-  (variant count, MSAA samples, density) behind `settings.rs` presets, not hardcoded
-  per-device assumptions.
-- **No magic numbers.** Every new tuning value is a named `SCREAMING_SNAKE_CASE`
-  `const` with a units/intent comment — Rust *and* WGSL.
-- **Tests.** New generation maths ships a determinism/bounds test; keep
-  `offscreen_pipeline_validates` green; use the gallery for the visual record.
+- **Respect the memory budget.** Pool B stays bounded by the density cap; Pool C
+  (textures, MSAA samples) is **gated behind `settings.rs` presets**, never a
+  hardcoded per-device assumption (the 5090 cranks; the laptop preset stays lean).
+  Re-check `mem_mb` after any change that touches placement or adds VRAM.
+- **Determinism.** Generation seeds from existing sub-seeds (`flora::mix`,
+  `ChunkKey::hash`); animation (wind) is render-time only, like water.
+- **Hot paths.** `place_vegetation` (per-chunk worker) stays O(attempts), no new
+  per-call heap churn; shader additions are cheap per-vertex/fragment; no new
+  per-frame main-thread allocation.
+- **`gfx` stays thin.** Policy in `flora`/`mesh`; `gfx` grows only a texture/bind
+  group if Tier 3 lands. No `wgpu` types leaked upward.
+- **Portability.** Plain WGSL, `wgpu` textures, pure-Rust cross-platform crates.
+- **No magic numbers.** Every new tuning value (densities, caps, atlas sizes, sway
+  constants, AO weights) is a named `SCREAMING_SNAKE_CASE` `const` with a units/intent
+  comment — Rust *and* WGSL.
+- **Tests.** New generation maths ships a determinism/bounds test (e.g. *areal density
+  is LOD-independent*, *per-chunk instances ≤ cap*); keep `offscreen_pipeline_validates`
+  green; use the gallery for the visual record.
 
-## Out of scope (deferred deliberately)
+## Out of scope (deferred)
 
-Real-time cast shadows / shadow maps; global illumination; volumetric/God-ray
-lighting; physically-based material authoring; seasonal simulation. These are large,
-cross-cutting renderer projects — revisit only after Tier 3 lands and only if the
-payoff justifies the weight.
+Real-time cast shadows / shadow maps; global illumination; volumetric lighting;
+full PBR material authoring; seasonal simulation. Large cross-cutting renderer
+projects — revisit only after Tier 3, and only if the payoff justifies the weight and
+the VRAM.
