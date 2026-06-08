@@ -41,7 +41,7 @@ const PRESETS: [(&str, f32, u32); 4] = [
     ("High", 0.65, 4_096),   // solid gaming GPU
     ("Ultra", 1.00, MEM_MAX_MB), // 5090 — maxes out everything
 ];
-const DEFAULT_PRESET: usize = 1; // Medium
+const DEFAULT_PRESET: usize = 2; // High
 const CUSTOM: &str = "Custom";
 
 /// ESC-overlay tabs.
@@ -191,9 +191,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_medium() {
+    fn default_is_high() {
         let g = Graphics::default();
-        assert_eq!(g.preset, "Medium");
+        assert_eq!(g.preset, "High");
         assert_eq!(g.rows().len(), ROW_COUNT);
     }
 
