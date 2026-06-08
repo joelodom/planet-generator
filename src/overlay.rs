@@ -3,11 +3,13 @@
 //! unit-testable; the renderer just uploads the instances and draws them.
 
 use crate::font8x8::FONT8X8;
-use crate::settings::Graphics;
+use crate::settings::{self, Graphics};
 use bytemuck::{Pod, Zeroable};
 
 /// Width (chars) of a settings slider bar, e.g. `[####------]`.
 const BAR_WIDTH: usize = 10;
+/// Width (chars) of the HELP tab's key column (left), before the description.
+const KEY_COL: usize = 13;
 
 /// One solid-color rectangle in normalized device coordinates. `rect` is
 /// `(x, y, w, h)` where `(x, y)` is the top-left and `h` is negative (NDC y is
@@ -39,18 +41,51 @@ fn header_lines() -> Vec<String> {
     ]
 }
 
-/// The key-bindings block.
-fn control_lines() -> Vec<String> {
+/// The HELP tab body: two aligned columns — key(s) on the left, what they do on
+/// the right.
+fn help_body() -> Vec<String> {
     let quit = if cfg!(target_os = "macos") { "Cmd-Q" } else { "Ctrl-Q" };
-    vec![
-        "CONTROLS  (Google Earth style, keyboard)".to_string(),
-        "Arrow keys    pan  /  move + adjust settings".to_string(),
-        "W / S  (+ -)  zoom in / out".to_string(),
-        "A / D         rotate     Q / E   tilt".to_string(),
-        "Shift         move faster (hold)".to_string(),
-        "T  tour    R  teleport    P  location    G  wireframe".to_string(),
-        format!("ESC  close menu              {quit}  quit"),
-    ]
+    let rows: [(&str, &str); 13] = [
+        ("Arrow keys", "Pan across the surface"),
+        ("W / S", "Zoom in"),
+        ("+ / -", "Zoom out"),
+        ("A / D", "Rotate (spin) the view"),
+        ("Q / E", "Tilt (top-down to horizon)"),
+        ("Shift", "Move faster (hold)"),
+        ("T", "Guided tour (autopilot)"),
+        ("R", "Teleport to a random spot"),
+        ("P", "Print location to the log"),
+        ("G", "Toggle wireframe"),
+        ("Tab", "Switch HELP / GRAPHICS tab"),
+        ("Esc", "Close this menu"),
+        (quit, "Quit (or close the window)"),
+    ];
+    rows.iter().map(|(k, d)| format!("{:<width$}{}", k, d, width = KEY_COL)).collect()
+}
+
+/// The GRAPHICS tab body: a hint line then the setting rows. Returns the body and
+/// the index *within the body* of the selected row.
+fn graphics_body(graphics: &Graphics, selected: usize) -> (Vec<String>, usize) {
+    let mut v = vec!["up/down: select     left/right: adjust".to_string()];
+    for (i, row) in graphics.rows().iter().enumerate() {
+        let marker = if i == selected { '>' } else { ' ' };
+        let body = match row.frac {
+            Some(f) => format!("{}  {:>6}", bar(f), row.value),
+            None => format!("  < {} >", row.value),
+        };
+        v.push(format!("{} {:<15} {}", marker, row.label, body));
+    }
+    (v, 1 + selected) // +1: the hint line precedes the rows
+}
+
+fn tab_bar(tab: usize) -> String {
+    // The active tab is bracketed.
+    let (h, g) = if tab == settings::TAB_GRAPHICS {
+        ("  HELP  ", "[ GRAPHICS ]")
+    } else {
+        ("[ HELP ]", "  GRAPHICS  ")
+    };
+    format!("{h}    {g}        Tab: switch")
 }
 
 /// Plain help text (no live settings) — used by the offscreen smoke test.
@@ -58,7 +93,7 @@ fn control_lines() -> Vec<String> {
 pub fn help_lines() -> Vec<String> {
     let mut v = header_lines();
     v.push(String::new());
-    v.extend(control_lines());
+    v.extend(help_body());
     v
 }
 
@@ -73,24 +108,53 @@ fn bar(frac: f32) -> String {
     s
 }
 
-/// Build the full ESC menu — graphics settings (with sliders) above the controls
-/// — and the row index that should be highlighted (the selected setting).
-pub fn menu(graphics: &Graphics, selected: usize) -> (Vec<String>, usize) {
+/// Build the ESC menu for the active `tab` (HELP or GRAPHICS) and the row index
+/// to highlight (the selected setting on the GRAPHICS tab; none on HELP).
+///
+/// Both tabs are padded to a common width and height so the panel size and font
+/// scale never change when you switch tabs.
+pub fn menu(graphics: &Graphics, tab: usize, selected: usize) -> (Vec<String>, usize) {
+    let help = help_body();
+    let (gfx, gfx_hl) = graphics_body(graphics, selected);
+    let body_rows = help.len().max(gfx.len());
+
     let mut lines = header_lines();
     lines.push(String::new());
-    lines.push("GRAPHICS   up/down: select    left/right: adjust".to_string());
-    let settings_start = lines.len();
-    for (i, row) in graphics.rows().iter().enumerate() {
-        let marker = if i == selected { '>' } else { ' ' };
-        let body = match row.frac {
-            Some(f) => format!("{}  {:>6}", bar(f), row.value),
-            None => format!("  < {} >", row.value),
-        };
-        lines.push(format!("{} {:<15} {}", marker, row.label, body));
-    }
-    let highlight = settings_start + selected;
+    lines.push(tab_bar(tab));
     lines.push(String::new());
-    lines.extend(control_lines());
+    let body_start = lines.len();
+
+    let highlight = if tab == settings::TAB_HELP {
+        lines.extend(help.iter().cloned());
+        usize::MAX
+    } else {
+        lines.extend(gfx.iter().cloned());
+        body_start + gfx_hl
+    };
+    // Pad the body so the footer and panel height match across tabs.
+    while lines.len() < body_start + body_rows {
+        lines.push(String::new());
+    }
+
+    lines.push(String::new());
+    lines.push("Tab: switch tab      Esc: close".to_string());
+
+    // Pad every line to a common width — the max over BOTH tabs' content — so the
+    // panel width and font scale are identical regardless of which tab shows.
+    let width = lines
+        .iter()
+        .chain(help.iter())
+        .chain(gfx.iter())
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0);
+    for l in &mut lines {
+        let n = l.chars().count();
+        if n < width {
+            l.push_str(&" ".repeat(width - n));
+        }
+    }
+
     (lines, highlight)
 }
 

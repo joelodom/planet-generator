@@ -181,6 +181,7 @@ struct App {
     graphics: settings::Graphics,
     mesh_cfg: Arc<mesh::MeshConfig>,
     menu_open: bool,
+    menu_tab: usize,
     menu_sel: usize,
     /// Rebuild-relevant settings captured when the menu opened, to detect change.
     menu_open_sig: (u32, u32, u32),
@@ -199,7 +200,7 @@ impl App {
         let anchor = Vec3::new(0.4, 0.5, 0.77).normalize();
         let camera = Camera::new(&planet, anchor);
         let graphics = settings::Graphics::default();
-        let mesh_cfg = mesh::MeshConfig::new(graphics.mesh_res, graphics.veg_min_level, graphics.veg_density);
+        let mesh_cfg = mesh::MeshConfig::new(graphics.mesh_res(), graphics.veg_min_level(), graphics.veg_density());
         Self {
             seed,
             planet,
@@ -217,6 +218,7 @@ impl App {
             graphics,
             mesh_cfg,
             menu_open: false,
+            menu_tab: settings::TAB_HELP,
             menu_sel: 0,
             menu_open_sig: (0, 0, 0),
             perf_accum: 0.0,
@@ -260,7 +262,7 @@ impl App {
         }
 
         let cam_pos = self.camera.position(&self.planet);
-        let sel = lod::select(&self.planet, cam_pos, self.graphics.terrain_detail, &|k| renderer.has_chunk(k));
+        let sel = lod::select(&self.planet, cam_pos, self.graphics.split_factor(), &|k| renderer.has_chunk(k));
         let draw_count = sel.draw.len();
 
         // Request the nearest wanted chunks first.
@@ -275,7 +277,7 @@ impl App {
         }
 
         let keep: std::collections::HashSet<_> = sel.draw.iter().copied().collect();
-        renderer.evict(&keep, self.graphics.chunk_budget);
+        renderer.evict(&keep, self.graphics.chunk_budget());
 
         // Assemble the per-frame uniforms.
         let (view_proj, _view, pos) = self.camera.view_proj(&self.planet);
@@ -393,7 +395,7 @@ impl ApplicationHandler for App {
 
         let mut renderer = pollster::block_on(Renderer::new(window.clone())).expect("renderer init");
         self.camera.set_aspect(renderer.size.0, renderer.size.1);
-        let (lines, hl) = overlay::menu(&self.graphics, self.menu_sel);
+        let (lines, hl) = overlay::menu(&self.graphics, self.menu_tab, self.menu_sel);
         renderer.set_overlay(lines, hl);
 
         // Generate the six root chunks up front so there's always a planet to see.
@@ -454,7 +456,7 @@ impl ApplicationHandler for App {
 impl App {
     /// Push the current settings/selection into the overlay geometry.
     fn refresh_overlay(&mut self) {
-        let (lines, hl) = overlay::menu(&self.graphics, self.menu_sel);
+        let (lines, hl) = overlay::menu(&self.graphics, self.menu_tab, self.menu_sel);
         if let Some(r) = &mut self.renderer {
             r.set_overlay(lines, hl);
         }
@@ -483,6 +485,11 @@ impl App {
         info!(action = "menu", preset = self.graphics.preset, "graphics menu closed");
     }
 
+    fn menu_switch_tab(&mut self) {
+        self.menu_tab = (self.menu_tab + 1) % settings::TAB_COUNT;
+        self.refresh_overlay();
+    }
+
     fn menu_move(&mut self, dir: i32) {
         let n = settings::ROW_COUNT as i32;
         self.menu_sel = (self.menu_sel as i32 + dir).rem_euclid(n) as usize;
@@ -499,7 +506,7 @@ impl App {
     /// Re-mesh the world at the current mesh/vegetation settings.
     fn apply_rebuild(&mut self) {
         let g = self.graphics;
-        self.mesh_cfg.set(g.mesh_res, g.veg_min_level, g.veg_density);
+        self.mesh_cfg.set(g.mesh_res(), g.veg_min_level(), g.veg_density());
         if let Some(s) = &mut self.streamer {
             s.clear();
         }
@@ -512,9 +519,10 @@ impl App {
             }
         }
         info!(
-            grid = g.mesh_res,
-            veg_min_level = g.veg_min_level,
-            veg_density = g.veg_density,
+            detail = round1(g.detail),
+            grid = g.mesh_res(),
+            veg_min_level = g.veg_min_level(),
+            veg_density = g.veg_density(),
             "rebuilding world at new detail settings"
         );
     }
@@ -527,12 +535,15 @@ impl App {
         // camera); Esc closes it. Auto-repeat is allowed for the sliders.
         if self.menu_open {
             if pressed {
+                let on_graphics = self.menu_tab == settings::TAB_GRAPHICS;
                 match code {
                     KeyCode::Escape if !ev.repeat => self.close_menu(),
-                    KeyCode::ArrowUp => self.menu_move(-1),
-                    KeyCode::ArrowDown => self.menu_move(1),
-                    KeyCode::ArrowLeft => self.menu_adjust(-1),
-                    KeyCode::ArrowRight => self.menu_adjust(1),
+                    KeyCode::Tab if !ev.repeat => self.menu_switch_tab(),
+                    // Settings navigation only applies on the GRAPHICS tab.
+                    KeyCode::ArrowUp if on_graphics => self.menu_move(-1),
+                    KeyCode::ArrowDown if on_graphics => self.menu_move(1),
+                    KeyCode::ArrowLeft if on_graphics => self.menu_adjust(-1),
+                    KeyCode::ArrowRight if on_graphics => self.menu_adjust(1),
                     KeyCode::KeyQ if self.mods.super_key() || self.mods.control_key() => {
                         info!("quit shortcut; exiting");
                         event_loop.exit();

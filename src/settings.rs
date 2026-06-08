@@ -1,44 +1,57 @@
-//! Runtime graphics settings, adjustable from the ESC overlay so the same build
-//! can run lean on a laptop and crank way up on a big GPU.
+//! Runtime graphics settings, adjustable from the ESC overlay's GRAPHICS tab, so
+//! the same build can run lean on a cheap laptop GPU and crank way up on a 5090.
 //!
-//! Five knobs cover the things that matter most for visible detail:
-//!   - **terrain detail** — how eagerly the LOD subdivides (applies live)
-//!   - **mesh resolution** — triangles per chunk (needs a rebuild)
-//!   - **tree distance**   — how far out vegetation appears (needs a rebuild)
-//!   - **vegetation**      — plant density (needs a rebuild)
-//!   - **memory budget**   — how much geometry stays resident (applies live)
+//! Two knobs:
+//!   - **Detail** — a single master that drives LOD subdivision, terrain mesh
+//!     resolution, and vegetation (distance + density) together. Future "detail
+//!     object" types should derive from it too, rather than adding sliders.
+//!   - **Memory budget** — a real memory target (MB/GB) for resident geometry;
+//!     the resident-chunk cap is derived from it and the current mesh resolution,
+//!     so the same budget holds fewer chunks at higher detail.
 //!
-//! "Applies live" settings take effect next frame; the rest are baked into chunk
-//! meshes, so changing them rebuilds the visible world (done when the menu closes).
+//! LOD and the memory budget apply live (read fresh each frame); mesh resolution
+//! and vegetation are baked into chunk geometry, so they take effect on a rebuild
+//! when the menu closes.
 
-// Slider ranges and step sizes.
-const DETAIL_MIN: f32 = 1.0;
-const DETAIL_MAX: f32 = 4.5;
-const DETAIL_STEP: f32 = 0.2;
-const GRID_MIN: u32 = 12;
-const GRID_MAX: u32 = 64;
-const GRID_STEP: u32 = 4;
-const TREE_LEVEL_NEAR: u32 = 16; // higher level = trees only on smaller/closer chunks
-const TREE_LEVEL_FAR: u32 = 10;
-const DENSITY_MAX: u32 = 400;
-const DENSITY_STEP: u32 = 20;
-const BUDGET_MIN: usize = 800;
-const BUDGET_MAX: usize = 14_000;
-const BUDGET_STEP: usize = 600;
+// Master-detail end points. `detail` is 0..1; these are its min/max effects.
+// Maxed out is intentionally punishing (a laptop should struggle on Ultra while a
+// high-end GPU looks great).
+const SPLIT_MIN: f32 = 1.3; // LOD split factor (higher = finer, more chunks)
+const SPLIT_MAX: f32 = 6.5;
+const GRID_MIN: u32 = 16; // terrain quads per chunk side
+const GRID_MAX: u32 = 88;
+const VEG_LEVEL_NEAR: u32 = 15; // veg only on small/near chunks (low detail) ...
+const VEG_LEVEL_FAR: u32 = 11; // ... out to bigger/farther chunks (high detail)
+const DENSITY_MIN: u32 = 30; // vegetation attempts per chunk
+const DENSITY_MAX: u32 = 750;
 
-/// (name, terrain_detail, mesh_res, veg_min_level, veg_density, chunk_budget)
-const PRESETS: [(&str, f32, u32, u32, u32, usize); 4] = [
-    ("Low", 1.4, 16, 14, 40, 1_200),
-    ("Medium", 2.2, 28, 12, 110, 3_000),
-    ("High", 3.0, 40, 11, 220, 6_000),
-    ("Ultra", 4.2, 56, 10, 380, 12_000),
+const DETAIL_STEP: f32 = 0.05;
+
+// Memory budget for resident geometry, in MB. The low end suits a 2–4 GB laptop
+// GPU; the high end gives a 5090 room to keep a lot of fine geometry resident.
+const MEM_MIN_MB: u32 = 256;
+const MEM_MAX_MB: u32 = 8_192; // 8 GB
+const MEM_STEP_MB: u32 = 256;
+const CHUNK_BUDGET_FLOOR: usize = 256; // never derive fewer than this many chunks
+
+/// (name, detail 0..1, memory budget MB) — tiers from a cheap laptop GPU to a 5090.
+const PRESETS: [(&str, f32, u32); 4] = [
+    ("Low", 0.10, 512),     // weak/integrated laptop GPU
+    ("Medium", 0.35, 1_536), // decent laptop / entry desktop
+    ("High", 0.65, 4_096),   // solid gaming GPU
+    ("Ultra", 1.00, MEM_MAX_MB), // 5090 — maxes out everything
 ];
-const DEFAULT_PRESET: usize = 1; // Medium — a clear step up from the old fixed values
+const DEFAULT_PRESET: usize = 1; // Medium
 const CUSTOM: &str = "Custom";
 
-/// Menu rows, in display order. Row 0 is the preset selector.
+/// ESC-overlay tabs.
+pub const TAB_HELP: usize = 0;
+pub const TAB_GRAPHICS: usize = 1;
+pub const TAB_COUNT: usize = 2;
+
+/// GRAPHICS-tab rows, in display order. Row 0 is the preset selector.
 pub const ROW_PRESET: usize = 0;
-pub const ROW_COUNT: usize = 6;
+pub const ROW_COUNT: usize = 3;
 
 /// One rendered menu row: a label, a value string, and (for sliders) a 0..1 fill.
 pub struct Row {
@@ -50,68 +63,71 @@ pub struct Row {
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct Graphics {
-    pub terrain_detail: f32, // LOD split factor (live)
-    pub mesh_res: u32,       // terrain grid per chunk side (rebuild)
-    pub veg_min_level: u32,  // lowest LOD level that grows plants (rebuild)
-    pub veg_density: u32,    // vegetation attempts per chunk (rebuild)
-    pub chunk_budget: usize, // resident chunk cap (live)
+    pub detail: f32,        // master detail, 0..1
+    pub mem_budget_mb: u32, // resident-geometry memory target
     pub preset: &'static str,
 }
 
 impl Default for Graphics {
     fn default() -> Self {
-        let mut g = Graphics {
-            terrain_detail: 1.0,
-            mesh_res: 16,
-            veg_min_level: 13,
-            veg_density: 70,
-            chunk_budget: 1_800,
-            preset: CUSTOM,
-        };
+        let mut g = Graphics { detail: 0.0, mem_budget_mb: MEM_MIN_MB, preset: CUSTOM };
         g.apply_preset(DEFAULT_PRESET);
         g
     }
 }
 
 impl Graphics {
-    /// The fields baked into chunk meshes; when this changes the world rebuilds.
+    // --- derived detail values (the single `detail` knob fans out to these) ---
+    pub fn split_factor(&self) -> f32 {
+        lerp(SPLIT_MIN, SPLIT_MAX, self.detail)
+    }
+    pub fn mesh_res(&self) -> u32 {
+        lerp_u32(GRID_MIN, GRID_MAX, self.detail)
+    }
+    pub fn veg_min_level(&self) -> u32 {
+        // Higher detail lowers the level (vegetation appears farther out).
+        lerp_u32(VEG_LEVEL_NEAR, VEG_LEVEL_FAR, self.detail)
+    }
+    pub fn veg_density(&self) -> u32 {
+        lerp_u32(DENSITY_MIN, DENSITY_MAX, self.detail)
+    }
+
+    /// Resident-chunk cap: how many chunks fit in the memory budget at the current
+    /// mesh resolution (finer meshes → fewer chunks per GB).
+    pub fn chunk_budget(&self) -> usize {
+        let bytes = (self.mem_budget_mb as usize) << 20;
+        (bytes / per_chunk_bytes(self.mesh_res())).max(CHUNK_BUDGET_FLOOR)
+    }
+
+    /// The values baked into chunk geometry; when this changes the world rebuilds.
     pub fn rebuild_signature(&self) -> (u32, u32, u32) {
-        (self.mesh_res, self.veg_min_level, self.veg_density)
+        (self.mesh_res(), self.veg_min_level(), self.veg_density())
     }
 
     fn apply_preset(&mut self, idx: usize) {
         let p = PRESETS[idx];
-        self.terrain_detail = p.1;
-        self.mesh_res = p.2;
-        self.veg_min_level = p.3;
-        self.veg_density = p.4;
-        self.chunk_budget = p.5;
+        self.detail = p.1;
+        self.mem_budget_mb = p.2;
         self.preset = p.0;
     }
 
-    /// Adjust the setting at `index` by one step in `dir` (-1 / +1).
+    /// Adjust the GRAPHICS row at `index` by one step in `dir` (-1 / +1).
     pub fn adjust(&mut self, index: usize, dir: i32) {
         if index == ROW_PRESET {
             self.cycle_preset(dir);
             return;
         }
         match index {
-            1 => self.terrain_detail = round1((self.terrain_detail + dir as f32 * DETAIL_STEP).clamp(DETAIL_MIN, DETAIL_MAX)),
-            2 => self.mesh_res = step_u32(self.mesh_res, dir, GRID_STEP, GRID_MIN, GRID_MAX),
-            // Higher "distance" = lower min level, so +1 lowers the level.
-            3 => self.veg_min_level = ((self.veg_min_level as i32 - dir).clamp(TREE_LEVEL_FAR as i32, TREE_LEVEL_NEAR as i32)) as u32,
-            4 => self.veg_density = step_u32(self.veg_density, dir, DENSITY_STEP, 0, DENSITY_MAX),
-            5 => self.chunk_budget = step_usize(self.chunk_budget, dir, BUDGET_STEP, BUDGET_MIN, BUDGET_MAX),
+            1 => self.detail = round2((self.detail + dir as f32 * DETAIL_STEP).clamp(0.0, 1.0)),
+            2 => self.mem_budget_mb = step_u32(self.mem_budget_mb, dir, MEM_STEP_MB, MEM_MIN_MB, MEM_MAX_MB),
             _ => {}
         }
         self.preset = CUSTOM;
     }
 
     fn cycle_preset(&mut self, dir: i32) {
-        // Current index among named presets, or -1 if Custom.
         let cur = PRESETS.iter().position(|p| p.0 == self.preset).map(|i| i as i32).unwrap_or(-1);
         let n = PRESETS.len() as i32;
-        // From Custom, +1 → first preset, -1 → last.
         let next = if cur < 0 {
             if dir >= 0 { 0 } else { n - 1 }
         } else {
@@ -124,55 +140,50 @@ impl Graphics {
         vec![
             Row { label: "Preset", value: self.preset.to_string(), frac: None },
             Row {
-                label: "Terrain detail",
-                value: format!("{:.1}", self.terrain_detail),
-                frac: Some((self.terrain_detail - DETAIL_MIN) / (DETAIL_MAX - DETAIL_MIN)),
-            },
-            Row {
-                label: "Mesh resolution",
-                value: format!("{}", self.mesh_res),
-                frac: Some((self.mesh_res - GRID_MIN) as f32 / (GRID_MAX - GRID_MIN) as f32),
-            },
-            Row {
-                label: "Tree distance",
-                value: tree_distance_word(self.veg_min_level).to_string(),
-                frac: Some((TREE_LEVEL_NEAR - self.veg_min_level) as f32 / (TREE_LEVEL_NEAR - TREE_LEVEL_FAR) as f32),
-            },
-            Row {
-                label: "Vegetation",
-                value: format!("{}", self.veg_density),
-                frac: Some(self.veg_density as f32 / DENSITY_MAX as f32),
+                label: "Detail",
+                value: format!("{}%", (self.detail * 100.0).round() as i32),
+                frac: Some(self.detail),
             },
             Row {
                 label: "Memory budget",
-                value: format!("{}", self.chunk_budget),
-                frac: Some((self.chunk_budget - BUDGET_MIN) as f32 / (BUDGET_MAX - BUDGET_MIN) as f32),
+                value: format_mem(self.mem_budget_mb),
+                frac: Some((self.mem_budget_mb - MEM_MIN_MB) as f32 / (MEM_MAX_MB - MEM_MIN_MB) as f32),
             },
         ]
     }
 }
 
-fn tree_distance_word(level: u32) -> &'static str {
-    match level {
-        l if l >= 15 => "close",
-        14 => "near",
-        13 => "medium",
-        12 => "far",
-        11 => "very far",
-        _ => "maximum",
+/// Rough resident bytes for one chunk at grid `g`: vertices + indices, plus a
+/// margin for skirts and vegetation instances.
+fn per_chunk_bytes(g: u32) -> usize {
+    let n = (g + 1) as usize;
+    let verts = n * n * std::mem::size_of::<[f32; 9]>(); // pos + normal + color
+    let indices = (g as usize) * (g as usize) * 6 * std::mem::size_of::<u32>();
+    (verts + indices) * 5 / 4 // +25% for skirts + vegetation
+}
+
+fn format_mem(mb: u32) -> String {
+    if mb >= 1024 {
+        format!("{:.1} GB", mb as f32 / 1024.0)
+    } else {
+        format!("{} MB", mb)
     }
 }
 
-fn round1(v: f32) -> f32 {
-    (v * 10.0).round() / 10.0
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t.clamp(0.0, 1.0)
+}
+
+fn lerp_u32(a: u32, b: u32, t: f32) -> u32 {
+    (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)).round() as u32
+}
+
+fn round2(v: f32) -> f32 {
+    (v * 100.0).round() / 100.0
 }
 
 fn step_u32(v: u32, dir: i32, step: u32, lo: u32, hi: u32) -> u32 {
-    (v as i32 + dir * step as i32).clamp(lo as i32, hi as i32) as u32
-}
-
-fn step_usize(v: usize, dir: i32, step: usize, lo: usize, hi: usize) -> usize {
-    (v as i64 + dir as i64 * step as i64).clamp(lo as i64, hi as i64) as usize
+    (v as i64 + dir as i64 * step as i64).clamp(lo as i64, hi as i64) as u32
 }
 
 #[cfg(test)]
@@ -187,34 +198,39 @@ mod tests {
     }
 
     #[test]
-    fn adjusting_a_slider_makes_it_custom_and_clamps() {
+    fn ultra_maxes_everything() {
         let mut g = Graphics::default();
-        g.adjust(1, 1); // bump terrain detail
-        assert_eq!(g.preset, "Custom");
-        for _ in 0..100 {
-            g.adjust(1, 1);
+        while g.preset != "Ultra" {
+            g.adjust(ROW_PRESET, 1);
         }
-        assert!(g.terrain_detail <= DETAIL_MAX);
-        for _ in 0..100 {
-            g.adjust(1, -1);
-        }
-        assert!(g.terrain_detail >= DETAIL_MIN);
+        assert_eq!(g.detail, 1.0);
+        assert_eq!(g.mem_budget_mb, MEM_MAX_MB);
+        assert_eq!(g.mesh_res(), GRID_MAX);
+        assert_eq!(g.veg_density(), DENSITY_MAX);
+        assert_eq!(g.veg_min_level(), VEG_LEVEL_FAR);
     }
 
     #[test]
-    fn tree_distance_increases_as_level_drops() {
-        let mut g = Graphics::default();
-        let before = g.veg_min_level;
-        g.adjust(3, 1); // "more distance"
-        assert!(g.veg_min_level < before);
+    fn budget_holds_fewer_chunks_at_higher_detail() {
+        let lo = Graphics { detail: 0.0, mem_budget_mb: 4096, preset: "Custom" };
+        let hi = Graphics { detail: 1.0, mem_budget_mb: 4096, preset: "Custom" };
+        assert!(hi.chunk_budget() < lo.chunk_budget());
+        assert!(hi.chunk_budget() >= CHUNK_BUDGET_FLOOR);
     }
 
     #[test]
-    fn preset_cycles_and_changes_rebuild_signature() {
-        let mut g = Graphics::default();
-        let sig = g.rebuild_signature();
-        g.adjust(ROW_PRESET, 1); // Medium → High
-        assert_eq!(g.preset, "High");
-        assert_ne!(g.rebuild_signature(), sig);
+    fn detail_fans_out_monotonically() {
+        let lo = Graphics { detail: 0.0, mem_budget_mb: 2048, preset: "Custom" };
+        let hi = Graphics { detail: 1.0, mem_budget_mb: 2048, preset: "Custom" };
+        assert!(hi.split_factor() > lo.split_factor());
+        assert!(hi.mesh_res() > lo.mesh_res());
+        assert!(hi.veg_density() > lo.veg_density());
+        assert!(hi.veg_min_level() < lo.veg_min_level());
+    }
+
+    #[test]
+    fn memory_formats_with_units() {
+        assert_eq!(format_mem(512), "512 MB");
+        assert_eq!(format_mem(8192), "8.0 GB");
     }
 }
