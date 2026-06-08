@@ -23,7 +23,12 @@ const GRID_MAX: u32 = 88;
 const VEG_LEVEL_NEAR: u32 = 15; // veg only on small/near chunks (low detail) ...
 const VEG_LEVEL_FAR: u32 = 11; // ... out to bigger/farther chunks (high detail)
 const DENSITY_MIN: u32 = 30; // vegetation attempts per chunk
-const DENSITY_MAX: u32 = 750;
+// Capped so a fully-subdivided dense forest's *drawn* chunks fit the memory budget:
+// plants baked into each chunk mesh are the dominant cost, and a covering that
+// overshoots the budget forces eviction of chunks we need this frame, thrashing the
+// LOD (the treetop flashing). Vegetation instancing (BACKLOG.md, High) is what lets
+// this go back up without the memory blow-up.
+const DENSITY_MAX: u32 = 250;
 
 const DETAIL_STEP: f32 = 0.05;
 
@@ -32,7 +37,6 @@ const DETAIL_STEP: f32 = 0.05;
 const MEM_MIN_MB: u32 = 256;
 const MEM_MAX_MB: u32 = 8_192; // 8 GB
 const MEM_STEP_MB: u32 = 256;
-const CHUNK_BUDGET_FLOOR: usize = 256; // never derive fewer than this many chunks
 
 /// (name, detail 0..1, memory budget MB) — tiers from a cheap laptop GPU to a 5090.
 const PRESETS: [(&str, f32, u32); 4] = [
@@ -92,11 +96,12 @@ impl Graphics {
         lerp_u32(DENSITY_MIN, DENSITY_MAX, self.detail)
     }
 
-    /// Resident-chunk cap: how many chunks fit in the memory budget at the current
-    /// mesh resolution (finer meshes → fewer chunks per GB).
-    pub fn chunk_budget(&self) -> usize {
-        let bytes = (self.mem_budget_mb as usize) << 20;
-        (bytes / per_chunk_bytes(self.mesh_res())).max(CHUNK_BUDGET_FLOOR)
+    /// Resident-geometry budget in bytes — the renderer evicts cached chunks to keep
+    /// real GPU memory (terrain + vegetation) under this. Finer detail makes each
+    /// chunk bigger, so fewer fit — but that now falls out of the *actual* sizes the
+    /// renderer tracks, not an estimate.
+    pub fn mem_budget_bytes(&self) -> usize {
+        (self.mem_budget_mb as usize) << 20
     }
 
     /// The values baked into chunk geometry; when this changes the world rebuilds.
@@ -153,15 +158,6 @@ impl Graphics {
     }
 }
 
-/// Rough resident bytes for one chunk at grid `g`: vertices + indices, plus a
-/// margin for skirts and vegetation instances.
-fn per_chunk_bytes(g: u32) -> usize {
-    let n = (g + 1) as usize;
-    let verts = n * n * std::mem::size_of::<[f32; 9]>(); // pos + normal + color
-    let indices = (g as usize) * (g as usize) * 6 * std::mem::size_of::<u32>();
-    (verts + indices) * 5 / 4 // +25% for skirts + vegetation
-}
-
 fn format_mem(mb: u32) -> String {
     if mb >= 1024 {
         format!("{:.1} GB", mb as f32 / 1024.0)
@@ -211,11 +207,9 @@ mod tests {
     }
 
     #[test]
-    fn budget_holds_fewer_chunks_at_higher_detail() {
-        let lo = Graphics { detail: 0.0, mem_budget_mb: 4096, preset: "Custom" };
-        let hi = Graphics { detail: 1.0, mem_budget_mb: 4096, preset: "Custom" };
-        assert!(hi.chunk_budget() < lo.chunk_budget());
-        assert!(hi.chunk_budget() >= CHUNK_BUDGET_FLOOR);
+    fn mem_budget_bytes_tracks_the_setting() {
+        let g = Graphics { detail: 0.5, mem_budget_mb: 2048, preset: "Custom" };
+        assert_eq!(g.mem_budget_bytes(), 2048usize << 20);
     }
 
     #[test]

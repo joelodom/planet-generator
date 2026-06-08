@@ -44,7 +44,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId};
 
 const SUN_AMBIENT: f32 = 0.32;
 /// Cap chunk requests per frame so a fast camera can't flood the work queue.
@@ -56,6 +56,9 @@ const AUDIO_VOLUME: f32 = 0.5;
 /// Initial window size, logical pixels.
 const WINDOW_WIDTH: f64 = 1280.0;
 const WINDOW_HEIGHT: f64 = 800.0;
+/// Idle time after launch before the guided tour auto-starts (attract mode) — only
+/// if the user hasn't pressed anything yet.
+const AUTO_TOUR_IDLE_SECONDS: f32 = 5.0;
 /// Aggregate a performance sample to the log this often.
 const PERF_SAMPLE_SECONDS: f32 = 2.0;
 /// Refresh the window-title HUD this often.
@@ -64,6 +67,8 @@ const TITLE_UPDATE_SECONDS: f32 = 0.4;
 const FRAME_HITCH_MS: f32 = 120.0;
 /// ... but at most once per this interval, to avoid log spam.
 const HITCH_LOG_COOLDOWN: f32 = 1.0;
+/// Bytes per MiB, for the resident-memory readout (HUD + perf log).
+const BYTES_PER_MIB: f32 = 1024.0 * 1024.0;
 
 fn main() -> anyhow::Result<()> {
     if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
@@ -177,6 +182,8 @@ struct App {
     audio: Option<audio::Audio>,
     units: units::Units,
     tour: Option<tour::Tour>,
+    /// Set once the user presses any key; gates the launch auto-tour (attract mode).
+    had_input: bool,
 
     // Graphics settings + the ESC settings menu.
     graphics: settings::Graphics,
@@ -216,6 +223,7 @@ impl App {
             audio: None,
             units,
             tour: None,
+            had_input: false,
             graphics,
             mesh_cfg,
             menu_open: false,
@@ -238,6 +246,13 @@ impl App {
         let dt = (now - self.last).as_secs_f32().min(0.1);
         self.last = now;
         let time = (now - self.start).as_secs_f32();
+
+        // Attract mode: if the user hasn't touched anything for a few seconds after
+        // launch, start the guided tour automatically.
+        if !self.had_input && self.tour.is_none() && time >= AUTO_TOUR_IDLE_SECONDS {
+            self.tour = Some(tour::Tour::new(&self.camera, &self.planet));
+            info!(action = "tour", "auto-started guided tour (idle at launch)");
+        }
 
         // Advance the playlist (reshuffles when a round finishes) and the camera.
         if let Some(audio) = &mut self.audio {
@@ -266,19 +281,26 @@ impl App {
         let sel = lod::select(&self.planet, cam_pos, self.graphics.split_factor(), &|k| renderer.has_chunk(k));
         let draw_count = sel.draw.len();
 
-        // Request the nearest wanted chunks first.
-        let mut want = sel.want;
-        want.sort_by(|a, b| {
-            let da = (a.center_dir() * self.planet.surface_radius(a.center_dir()) - cam_pos).length_squared();
-            let db = (b.center_dir() * self.planet.surface_radius(b.center_dir()) - cam_pos).length_squared();
-            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for key in want.into_iter().take(MAX_REQUESTS_PER_FRAME) {
-            streamer.request(key);
+        // Request the nearest wanted chunks first — but only while under the memory
+        // budget. Over-committing past what fits makes eviction drop the chunks we
+        // need next frame, collapsing the LOD so the scene flashes between full detail
+        // and bare root chunks (worst in dense forest at high detail). Throttling
+        // keeps it stable: draw what fits, nearest first, streaming more only as
+        // eviction frees room.
+        if renderer.resident_bytes() < self.graphics.mem_budget_bytes() {
+            let mut want = sel.want;
+            want.sort_by(|a, b| {
+                let da = (a.center_dir() * self.planet.surface_radius(a.center_dir()) - cam_pos).length_squared();
+                let db = (b.center_dir() * self.planet.surface_radius(b.center_dir()) - cam_pos).length_squared();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for key in want.into_iter().take(MAX_REQUESTS_PER_FRAME) {
+                streamer.request(key);
+            }
         }
 
         let keep: std::collections::HashSet<_> = sel.draw.iter().copied().collect();
-        renderer.evict(&keep, self.graphics.chunk_budget());
+        renderer.evict(&keep, self.graphics.mem_budget_bytes());
 
         // Assemble the per-frame uniforms.
         let (view_proj, _view, pos) = self.camera.view_proj(&self.planet);
@@ -333,6 +355,7 @@ impl App {
                 lon = round1(lon),
                 biome,
                 chunks = renderer.chunk_count(),
+                mem_mb = round1(renderer.resident_bytes() as f32 / BYTES_PER_MIB),
                 draw = draw_count,
                 pending = streamer.pending_count(),
                 uploads = self.uploads_period,
@@ -353,11 +376,12 @@ impl App {
             let fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
             if let Some(w) = &self.window {
                 w.set_title(&format!(
-                    "planet-explorer — seed {} | {:.0} fps | alt {} | {:.1}°,{:.1}° | {} | chunks {}",
+                    "planet-explorer — seed {} | {:.0} fps | alt {} | {:.1}°,{:.1}° | {} | chunks {} | {:.0} MB",
                     self.seed,
                     fps,
                     units::distance(self.camera.altitude(), self.units),
-                    lat, lon, biome, renderer.chunk_count()
+                    lat, lon, biome, renderer.chunk_count(),
+                    renderer.resident_bytes() as f32 / BYTES_PER_MIB
                 ));
             }
         }
@@ -391,7 +415,11 @@ impl ApplicationHandler for App {
         }
         let attrs = Window::default_attributes()
             .with_title(format!("planet-explorer — seed {}", self.seed))
-            .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+            .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT))
+            // Start filling the screen (borderless fullscreen) — the user always
+            // expands the window first thing. `with_inner_size` is the fallback if
+            // they drop out of fullscreen.
+            .with_fullscreen(Some(Fullscreen::Borderless(None)));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
 
         let mut renderer = pollster::block_on(Renderer::new(window.clone())).expect("renderer init");
@@ -424,6 +452,9 @@ impl ApplicationHandler for App {
         self.renderer = Some(renderer);
         self.streamer = Some(streamer);
         self.last = Instant::now();
+        // Count the attract-mode idle window from when the app is actually up
+        // (renderer/window init can take a moment).
+        self.start = Instant::now();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -530,6 +561,9 @@ impl App {
 
     fn handle_key(&mut self, event_loop: &ActiveEventLoop, ev: winit::event::KeyEvent) {
         let pressed = ev.state == ElementState::Pressed;
+        if pressed {
+            self.had_input = true; // any keypress cancels the launch auto-tour
+        }
         let PhysicalKey::Code(code) = ev.physical_key else { return };
 
         // While the settings menu is open the arrow keys drive it (not the

@@ -52,6 +52,12 @@ impl GpuMesh {
     }
 }
 
+/// Approximate GPU bytes an indexed mesh occupies (vertex + index data). Used to
+/// budget resident memory; ignores small driver-side allocation padding.
+fn mesh_bytes(verts: usize, indices: usize) -> usize {
+    verts * std::mem::size_of::<Vertex>() + indices * std::mem::size_of::<u32>()
+}
+
 /// A terrain chunk plus its baked vegetation mesh, all GPU-resident. Vegetation
 /// is a single world-space mesh (grown by the worker from this planet's procedural
 /// species), so it draws in one call with the terrain pipeline — no instancing, no
@@ -59,6 +65,12 @@ impl GpuMesh {
 struct GpuChunk {
     terrain: GpuMesh,
     veg: Option<GpuMesh>,
+    /// Approximate GPU bytes this chunk holds (terrain + veg vertex/index data),
+    /// summed into `Renderer.resident_bytes` so eviction can honour a real budget.
+    bytes: usize,
+    /// Renderer tick when this chunk was last drawn or uploaded — eviction keeps the
+    /// most-recently-used and drops the oldest first.
+    last_used: u64,
 }
 
 const VERT_ATTRS: [wgpu::VertexAttribute; 3] =
@@ -124,6 +136,11 @@ pub struct Renderer {
     image_instance: Option<wgpu::Buffer>,
 
     chunks: HashMap<ChunkKey, GpuChunk>,
+    /// Running total of approximate GPU bytes across `chunks`, so eviction bounds
+    /// *real* memory instead of a chunk count.
+    resident_bytes: usize,
+    /// Monotonic frame tick stamped onto chunks as they're drawn/uploaded, for LRU.
+    tick: u64,
     pub wireframe: bool,
     pub supports_wireframe: bool,
 }
@@ -345,6 +362,8 @@ impl Renderer {
             planet_bind,
             image_instance: None,
             chunks: HashMap::new(),
+            resident_bytes: 0,
+            tick: 0,
             wireframe: false,
             supports_wireframe,
         })
@@ -406,21 +425,50 @@ impl Renderer {
     }
 
     pub fn upload_chunk(&mut self, key: ChunkKey, cpu: CpuChunk) {
+        let bytes = mesh_bytes(cpu.vertices.len(), cpu.indices.len())
+            + mesh_bytes(cpu.veg.vertices.len(), cpu.veg.indices.len());
         let terrain = GpuMesh::upload(&self.device, &cpu.vertices, &cpu.indices);
         let veg = (!cpu.veg.indices.is_empty())
             .then(|| GpuMesh::upload(&self.device, &cpu.veg.vertices, &cpu.veg.indices));
-        self.chunks.insert(key, GpuChunk { terrain, veg });
+        // Replacing a key frees the old chunk's buffers — discount its bytes first.
+        if let Some(old) = self.chunks.insert(key, GpuChunk { terrain, veg, bytes, last_used: self.tick }) {
+            self.resident_bytes -= old.bytes;
+        }
+        self.resident_bytes += bytes;
     }
 
-    /// Drop chunks no longer needed, keeping memory bounded. Roots and anything
-    /// in `keep` are retained.
-    pub fn evict(&mut self, keep: &std::collections::HashSet<ChunkKey>, limit: usize) {
-        if self.chunks.len() <= limit {
+    /// Drop cached chunks until resident GPU memory is back under `budget_bytes`,
+    /// **least-recently-used first**. Drawn chunks (`keep`) and the six roots are
+    /// never dropped, so memory floors at the working set; everything else is a cache
+    /// the seed regenerates identically on return. Keeping the most-recently-used is
+    /// what lets a zoom finish — the fine children still streaming in for a refinement
+    /// survive instead of being evicted before all four are ready — and keeps
+    /// just-left areas cached for instant revisits; older/farther chunks go first.
+    pub fn evict(&mut self, keep: &std::collections::HashSet<ChunkKey>, budget_bytes: usize) {
+        if self.resident_bytes <= budget_bytes {
             return;
         }
         let roots = ChunkKey::roots();
-        self.chunks
-            .retain(|k, _| keep.contains(k) || roots.contains(k));
+        let mut candidates: Vec<(u64, ChunkKey)> = self
+            .chunks
+            .iter()
+            .filter(|(k, _)| !keep.contains(k) && !roots.contains(k))
+            .map(|(k, c)| (c.last_used, *k))
+            .collect();
+        candidates.sort_unstable_by_key(|(used, _)| *used); // oldest first
+        for (_, k) in candidates {
+            if self.resident_bytes <= budget_bytes {
+                break;
+            }
+            if let Some(c) = self.chunks.remove(&k) {
+                self.resident_bytes -= c.bytes;
+            }
+        }
+    }
+
+    /// Approximate resident GPU geometry, in bytes (terrain + vegetation buffers).
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
     }
 
     pub fn chunk_count(&self) -> usize {
@@ -431,6 +479,7 @@ impl Renderer {
     /// changes, so the world re-streams at the new resolution.
     pub fn clear_chunks(&mut self) {
         self.chunks.clear();
+        self.resident_bytes = 0;
     }
 
     pub fn update_globals(&self, g: &Globals) {
@@ -438,6 +487,16 @@ impl Renderer {
     }
 
     pub fn render(&mut self, draw: &[ChunkKey]) {
+        // LRU bookkeeping: stamp the chunks we're about to draw as used this tick, so
+        // eviction keeps the working set (and recently-left areas) and drops the rest.
+        self.tick += 1;
+        let tick = self.tick;
+        for key in draw {
+            if let Some(c) = self.chunks.get_mut(key) {
+                c.last_used = tick;
+            }
+        }
+
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match self.surface.get_current_texture() {
             Cst::Success(f) | Cst::Suboptimal(f) => f,
