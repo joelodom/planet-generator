@@ -123,13 +123,11 @@ fn parse_units() -> units::Units {
         if a == "--imperial" {
             return units::Units::Us;
         }
-        if a == "--units" {
-            if let Some(v) = args.next() {
-                if let Some(u) = units::Units::parse(&v) {
-                    return u;
-                }
-                eprintln!("warning: unknown --units '{v}', using metric");
+        if a == "--units" && let Some(v) = args.next() {
+            if let Some(u) = units::Units::parse(&v) {
+                return u;
             }
+            eprintln!("warning: unknown --units '{v}', using metric");
         }
     }
     units::Units::Metric
@@ -138,13 +136,11 @@ fn parse_units() -> units::Units {
 fn parse_seed() -> u64 {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        if a == "--seed" || a == "-s" {
-            if let Some(v) = args.next() {
-                if let Ok(n) = v.parse::<u64>() {
-                    return n;
-                }
-                eprintln!("warning: could not parse seed '{v}', using random");
+        if (a == "--seed" || a == "-s") && let Some(v) = args.next() {
+            if let Ok(n) = v.parse::<u64>() {
+                return n;
             }
+            eprintln!("warning: could not parse seed '{v}', using random");
         }
     }
     rand::random::<u64>()
@@ -283,10 +279,14 @@ impl App {
 
         // Request the nearest wanted chunks first.
         let mut want = sel.want;
-        want.sort_by(|a, b| {
-            let da = (a.center_dir() * self.planet.surface_radius(a.center_dir()) - cam_pos).length_squared();
-            let db = (b.center_dir() * self.planet.surface_radius(b.center_dir()) - cam_pos).length_squared();
-            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        // Decorate-sort: `surface_radius` samples the (expensive) height noise, so
+        // compute each chunk's squared camera distance exactly once per key instead
+        // of twice per comparison — O(n) noise samples per frame, not O(n log n).
+        // Distance-squared is non-negative, so its IEEE-754 bits order identically
+        // to the value, giving an integer sort key without needing `f32: Ord`.
+        want.sort_by_cached_key(|k| {
+            let d = k.center_dir();
+            (d * self.planet.surface_radius(d) - cam_pos).length_squared().to_bits()
         });
         for key in want.into_iter().take(MAX_REQUESTS_PER_FRAME) {
             streamer.request(key);
@@ -472,7 +472,7 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => self.frame(),
             // Keyboard-only: mouse buttons, motion, and wheel are intentionally ignored.
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
-            WindowEvent::KeyboardInput { event, .. } => self.handle_key(event_loop, event),
+            WindowEvent::KeyboardInput { event, is_synthetic, .. } => self.handle_key(event_loop, event, is_synthetic),
             _ => {}
         }
     }
@@ -557,10 +557,15 @@ impl App {
         );
     }
 
-    fn handle_key(&mut self, event_loop: &ActiveEventLoop, ev: winit::event::KeyEvent) {
+    fn handle_key(&mut self, event_loop: &ActiveEventLoop, ev: winit::event::KeyEvent, is_synthetic: bool) {
         let pressed = ev.state == ElementState::Pressed;
-        if pressed {
-            self.had_input = true; // any keypress cancels the launch auto-tour
+        // A real keypress cancels attract mode. Ignore *synthetic* key events: when
+        // a window gains focus, winit replays currently-held keys as synthetic
+        // presses — notably on Windows as the borderless-fullscreen window grabs
+        // focus at launch. Counting those cancelled the launch auto-tour before it
+        // could start (the bug was Windows-only; macOS doesn't emit these).
+        if pressed && !is_synthetic {
+            self.had_input = true;
         }
         let PhysicalKey::Code(code) = ev.physical_key else { return };
 

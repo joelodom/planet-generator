@@ -73,12 +73,8 @@ impl Audio {
         let mut order: Vec<usize> = (0..n).collect();
         order.shuffle(&mut rng);
         // Don't replay the just-finished track immediately.
-        if n > 1 {
-            if let Some(last) = self.last_played {
-                if order[0] == last {
-                    order.swap(0, rng.random_range(1..n));
-                }
-            }
+        if n > 1 && let Some(last) = self.last_played && order[0] == last {
+            order.swap(0, rng.random_range(1..n));
         }
 
         let mut queued_last = self.last_played;

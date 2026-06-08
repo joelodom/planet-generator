@@ -42,20 +42,28 @@ pub fn init() -> PathBuf {
         // World rwx so a different account can create the file inside it.
         set_mode(dir, 0o777);
     }
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .unwrap_or_else(|e| panic!("cannot open log file {}: {e}", path.display()));
-    // World rw so either account can append and read the shared log.
-    set_mode(&path, 0o666);
-
-    let file_layer = fmt::layer()
-        .with_ansi(false)
-        .with_target(true)
-        .with_thread_names(true)
-        .with_writer(Mutex::new(file))
-        .with_filter(env_filter(DEFAULT_FILTER));
+    // The log file is a diagnostic aid, not a launch dependency: if the path is
+    // unwritable (a locked-down or read-only FS — likelier on the Windows target
+    // than the dev Mac), degrade to stderr-only with a warning rather than
+    // refusing to start. `Option<Layer>` is itself a `Layer` (None = no-op).
+    let file_layer = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => {
+            // World rw so either account can append and read the shared log.
+            set_mode(&path, 0o666);
+            Some(
+                fmt::layer()
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_thread_names(true)
+                    .with_writer(Mutex::new(file))
+                    .with_filter(env_filter(DEFAULT_FILTER)),
+            )
+        }
+        Err(e) => {
+            eprintln!("warning: cannot open log file {}: {e}; logging to stderr only", path.display());
+            None
+        }
+    };
 
     let stderr_layer = fmt::layer()
         .with_ansi(true)

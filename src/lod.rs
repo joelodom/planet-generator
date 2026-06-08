@@ -100,42 +100,57 @@ pub fn select(planet: &Planet, cam: Vec3, split_factor: f32, ready: &dyn Fn(Chun
     // Angular radius of the horizon cone as seen from the camera. Anything more
     // than this far around the sphere is occluded by the planet itself.
     let horizon = if cam_len > PLANET_RADIUS { (PLANET_RADIUS / cam_len).acos() } else { std::f32::consts::PI };
+    // The walk's invariants, gathered once — notably `cam_dir`, computed here rather
+    // than re-normalized per node inside the recursion.
+    let walk = Walk { planet, cam, cam_dir: cam.normalize_or_zero(), horizon, split_factor, ready };
     for root in ChunkKey::roots() {
-        select_node(root, planet, cam, horizon, split_factor, ready, &mut sel);
+        select_node(root, &walk, &mut sel);
     }
     sel
 }
 
-fn select_node(node: ChunkKey, planet: &Planet, cam: Vec3, horizon: f32, split_factor: f32, ready: &dyn Fn(ChunkKey) -> bool, sel: &mut Selection) {
+/// Everything the six-face quadtree walk reads but never mutates as it recurses —
+/// grouped so `select_node` takes one context instead of a long, churn-prone
+/// argument list (and so loop-invariants like `cam_dir` are computed exactly once).
+struct Walk<'a> {
+    planet: &'a Planet,
+    cam: Vec3,
+    cam_dir: Vec3,
+    horizon: f32,
+    split_factor: f32,
+    ready: &'a dyn Fn(ChunkKey) -> bool,
+}
+
+fn select_node(node: ChunkKey, w: &Walk, sel: &mut Selection) {
     // Horizon cull: skip nodes fully behind the planet's bulge.
     let center_dir = node.center_dir();
-    let ang = center_dir.angle_between(cam.normalize_or_zero());
+    let ang = center_dir.angle_between(w.cam_dir);
     let node_ang = node.world_size() / PLANET_RADIUS; // ~angular radius
-    if ang > horizon + node_ang + HORIZON_CULL_MARGIN {
+    if ang > w.horizon + node_ang + HORIZON_CULL_MARGIN {
         return;
     }
 
-    let center = center_dir * planet.surface_radius(center_dir);
-    let dist = (center - cam).length();
-    let split = dist < split_factor * node.world_size() && node.level < MAX_LEVEL;
+    let center = center_dir * w.planet.surface_radius(center_dir);
+    let dist = (center - w.cam).length();
+    let split = dist < w.split_factor * node.world_size() && node.level < MAX_LEVEL;
 
     if split {
         let kids = node.children();
-        if kids.iter().all(|k| ready(*k)) {
+        if kids.iter().all(|k| (w.ready)(*k)) {
             for k in kids {
-                select_node(k, planet, cam, horizon, split_factor, ready, sel);
+                select_node(k, w, sel);
             }
             return;
         }
         // Children not all ready: request the missing ones, draw the parent.
         for k in kids {
-            if !ready(k) {
+            if !(w.ready)(k) {
                 sel.want.push(k);
             }
         }
     }
 
-    if ready(node) {
+    if (w.ready)(node) {
         sel.draw.push(node);
     } else {
         sel.want.push(node);
@@ -262,7 +277,19 @@ fn spawn_worker(
                     inner = queue.cv.wait(inner).unwrap();
                 }
             };
-            let chunk = CpuChunk::build(&planet, key, &cfg);
+            // Supervise the build: a panic here (a latent bug as `build` grows) must
+            // not silently kill the worker and stall streaming forever. Catch it,
+            // log it (the panic hook also records the location), and keep serving.
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                CpuChunk::build(&planet, key, &cfg)
+            }));
+            let chunk = match built {
+                Ok(c) => c,
+                Err(_) => {
+                    tracing::error!(worker = id, level = key.level, "chunk build panicked; skipped, worker stays up");
+                    continue;
+                }
+            };
             if tx.send((generation, key, chunk)).is_err() {
                 return; // main thread gone
             }
