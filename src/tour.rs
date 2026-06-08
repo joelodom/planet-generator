@@ -32,8 +32,8 @@ const DESCEND_DUR: f32 = 12.0; // a calmer settle, since the cruise altitude is 
 // visible; the focus distance is derived from the tilt each leg, since the eye's
 // height above terrain ≈ distance · cos(tilt). The camera's ground guard lifts it
 // over the occasional tall rise.
-const CRUISE_ALT_MIN: f32 = 2.0; // 20 m — close enough to fly among the treetops
-const CRUISE_ALT_MAX: f32 = 14.0; // 140 m — varied, higher scenic passes
+const CRUISE_ALT_MIN: f32 = 10.0; // 100 m — low pass, trees clearly visible
+const CRUISE_ALT_MAX: f32 = 22.0; // 220 m — varied, higher scenic passes
 
 // Terrain-following: the cruise keeps the eye ~cruise_alt above a *smoothed* local
 // ground so it never flies through hills, but only very loosely (it doesn't rigidly
@@ -139,10 +139,21 @@ impl Tour {
         match self.phase {
             Phase::Travel | Phase::Descend => {
                 let s = planet::smoothstep(0.0, 1.0, (self.t / self.dur).min(1.0));
-                let focus = slerp_dir(self.s_focus, self.e_focus, s);
                 // Exponential (multiplicative) zoom feels natural across scales.
                 let dist = self.s_dist * (self.e_dist / self.s_dist).powf(s);
-                let head = self.s_head + shortest(self.e_head - self.s_head) * s;
+                // Lateral/heading progress tracks ALTITUDE, not time: the camera
+                // barely moves sideways while low and crosses quickly once it has
+                // zoomed out. So leaving a treetop flyby it climbs out and speeds up
+                // smoothly instead of suddenly, and arriving it decelerates as it
+                // drops in. (On the descend leg the focus is stationary, so this
+                // only shapes the heading settle.)
+                let lat = if (self.e_dist - self.s_dist).abs() < 1e-3 {
+                    s
+                } else {
+                    ((dist - self.s_dist) / (self.e_dist - self.s_dist)).clamp(0.0, 1.0)
+                };
+                let focus = slerp_dir(self.s_focus, self.e_focus, lat);
+                let head = self.s_head + shortest(self.e_head - self.s_head) * lat;
                 let tilt = self.s_tilt + (self.e_tilt - self.s_tilt) * s;
                 cam.set_view(focus, dist, head, tilt);
 
