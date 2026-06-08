@@ -890,8 +890,8 @@ mod smoke {
         let tm = mesh::tree_mesh();
         let tree_mesh = GpuMesh::upload(&device, &tm.vertices, &tm.indices);
 
-        // Camera looking at the chunk from above. Sit well clear of any peak
-        // (terrain reaches ~+860 units) so the eye is never underground.
+        // Camera looking at the chunk from above. Sit well clear of any peak so
+        // the eye is never underground.
         let center = key.center_dir() * planet.surface_radius(key.center_dir());
         let eye = center.normalize() * (crate::planet::PLANET_RADIUS + 4000.0);
         let up = crate::planet::tangent_basis(center.normalize()).0;

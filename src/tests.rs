@@ -27,7 +27,7 @@ fn height_is_finite_and_bounded() {
         let h = p.height(d);
         assert!(h.is_finite(), "height not finite");
         // Comfortably within the design envelope around sea level.
-        assert!(h > -HEIGHT_SCALE && h < HEIGHT_SCALE * 1.5, "height {h} out of range");
+        assert!(h > -HEIGHT_SCALE && h < HEIGHT_SCALE * 1.8, "height {h} out of range");
     }
 }
 

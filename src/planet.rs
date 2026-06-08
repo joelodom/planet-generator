@@ -25,11 +25,12 @@ pub const METERS_PER_UNIT: f32 = 10.0;
 /// avoid the f32 precision wall (no camera-relative rendering needed).
 pub const PLANET_RADIUS: f32 = 637_100.0;
 
-/// Vertical scale applied to the normalised height field, in render units. Tuned
-/// so peaks reach ~+8.6 km and ocean floors ~-4.4 km — an Earth-like elevation
-/// envelope. Crucially the height:radius ratio (~0.0014) matches Earth, so
-/// mountains look proportionate rather than absurdly tall.
-pub const HEIGHT_SCALE: f32 = 640.0;
+/// Vertical scale applied to the normalised height field, in render units. This
+/// carries a deliberate ~2x vertical exaggeration (as Google Earth and most
+/// terrain renderers do): at true Earth proportions an 8 km peak is only 0.13%
+/// of the radius and reads as flat, so peaks here reach ~+17 km. Mountains are
+/// then clearly visible and snow-capped while the planet still feels huge.
+pub const HEIGHT_SCALE: f32 = 1300.0;
 
 /// Sea level sits exactly at `PLANET_RADIUS`; anything below is underwater.
 pub const SEA_LEVEL: f32 = PLANET_RADIUS;
@@ -37,9 +38,9 @@ pub const SEA_LEVEL: f32 = PLANET_RADIUS;
 /// Terrain height (render units) below which a vertex is ocean floor.
 pub const SHORE: f32 = 0.0;
 
-/// Base permanent-snow elevation (render units ≈ 4 km), raised toward the equator
-/// by temperature in `classify`.
-pub const SNOW_BASE: f32 = 400.0;
+/// Base permanent-snow elevation (render units), raised toward the equator by
+/// temperature in `classify`, so high peaks wear snow caps.
+pub const SNOW_BASE: f32 = 650.0;
 
 /// The six faces of the cube that we inflate into a sphere. Each face is a unit
 /// square parameterised by (u, v) in [-1, 1], embedded in 3D by an origin axis
@@ -144,13 +145,16 @@ impl Planet {
             .set_frequency(0.9)
             .set_persistence(0.5)
             .set_lacunarity(2.1);
+        // Higher-frequency ridged noise makes steep, local mountain ranges (rather
+        // than continent-wide gentle swells), so peaks read as real rocky/snowy
+        // mountains with dramatic relief.
         let mountains = RidgedMulti::<Perlin>::new(sub(&mut s))
-            .set_octaves(5)
-            .set_frequency(1.7)
-            .set_lacunarity(2.3);
+            .set_octaves(6)
+            .set_frequency(4.2)
+            .set_lacunarity(2.4);
         let detail = Fbm::<Perlin>::new(sub(&mut s))
-            .set_octaves(4)
-            .set_frequency(8.0)
+            .set_octaves(5)
+            .set_frequency(13.0)
             .set_persistence(0.5);
         let warp = Fbm::<Perlin>::new(sub(&mut s))
             .set_octaves(3)
@@ -192,14 +196,15 @@ impl Planet {
         // Land mask ramps in past the coastline so mountains only rise inland.
         let land = smoothstep(-0.02, 0.30, continent);
 
-        // Ridged mountains, only meaningful on land.
-        let m = self.mountains.get([p[0] * 1.0, p[1] * 1.0, p[2] * 1.0]) as f32;
-        let mountains = (m * 0.5 + 0.5).powf(1.4) * land;
+        // Ridged mountains, only meaningful on land. Sharper power + higher weight
+        // gives prominent ranges with steep flanks.
+        let m = self.mountains.get(p) as f32;
+        let mountains = (m * 0.5 + 0.5).powf(1.7) * land;
 
-        // Fine detail everywhere.
-        let detail = self.detail.get(p) as f32 * 0.06;
+        // Fine detail everywhere (surface roughness as you zoom in).
+        let detail = self.detail.get(p) as f32 * 0.08;
 
-        let h_unit = continent * 0.55 + mountains * 0.8 + detail;
+        let h_unit = continent * 0.5 + mountains * 1.05 + detail;
         h_unit * HEIGHT_SCALE
     }
 
@@ -216,8 +221,8 @@ impl Planet {
         // a little noise so biome bands aren't perfect latitude rings.
         let lat = d.y.clamp(-1.0, 1.0).asin().abs() / (PI * 0.5); // 0 equator .. 1 pole
         let tvar = self.temp_var.get(p) as f32 * 0.10;
-        // Altitude cooling: ~0.5 cooler at the highest peaks (in render units).
-        let temp = (1.0 - lat - (height.max(0.0) / 1800.0) + tvar).clamp(0.0, 1.0);
+        // Altitude cooling: high peaks run much colder (so they hold snow).
+        let temp = (1.0 - lat - (height.max(0.0) / 3000.0) + tvar).clamp(0.0, 1.0);
 
         let biome = classify(height, temp, moisture, steepness);
         let color = biome_color(biome, height, temp, moisture, self.detail.get([p[0] * 40.0, p[1] * 40.0, p[2] * 40.0]) as f32);
@@ -264,17 +269,17 @@ fn classify(height: f32, temp: f32, moisture: f32, steep: f32) -> Biome {
     if height < SHORE {
         return Biome::Ocean;
     }
-    if height < 4.0 && temp > 0.25 {
+    if height < 8.0 && temp > 0.25 {
         return Biome::Beach;
     }
     // Snow: cold poles at any altitude, or cold-enough high ground. Snow line
-    // rises toward the warm equator (render units: ~4 km at poles, ~8.5 km warm).
-    let snow_line = SNOW_BASE + temp * 450.0;
+    // rises toward the warm equator, so peaks wear caps and ranges go white.
+    let snow_line = SNOW_BASE + temp * 1000.0;
     if temp < 0.08 || height > snow_line {
         return Biome::Snow;
     }
-    // Steep high rock reads as mountain regardless of biome band.
-    if steep > 0.55 && height > 250.0 {
+    // Steep high rock reads as bare mountain regardless of biome band.
+    if steep > 0.5 && height > 520.0 {
         return Biome::Mountain;
     }
     if temp < 0.18 {

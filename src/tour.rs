@@ -138,7 +138,9 @@ impl Tour {
     }
 
     fn begin_descend(&mut self, _planet: &Planet) {
-        let cruise_dist = rand_range(900.0, 2800.0);
+        // High enough to clear most peaks (now ~17 km) but still a flying view;
+        // the camera's ground guard gently lifts it over the rare tall summit.
+        let cruise_dist = rand_range(1800.0, 4500.0);
         let cruise_tilt = rand_range(0.85, 1.18);
         let arrive_head = self.e_head + rand_range(-0.6, 0.6);
         self.phase = Phase::Descend;

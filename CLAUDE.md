@@ -28,9 +28,11 @@ The planet is **Earth-sized**: `PLANET_RADIUS = 637_100` render units at
 `METERS_PER_UNIT = 10` → 6,371 km. We render in "units" (10 m each), not real
 metres, on purpose: it keeps absolute coordinates inside `f32`'s comfortable
 range (~0.75 m precision at the surface) so the renderer needs **no
-camera-relative / f64 path**. Heights are tuned to an Earth-like envelope
-(~+8.6 km peaks) and, importantly, an Earth-like height:radius ratio (~0.0014)
-so mountains look proportionate.
+camera-relative / f64 path**. Heights carry a deliberate ~2x vertical
+exaggeration (peaks ~+20 km) — at true Earth proportions an 8 km peak is only
+0.13% of the radius and reads as flat, so the terrain is exaggerated (as Google
+Earth / most renderers do) and the mountain noise is high-frequency enough to be
+genuinely steep and snow-capped, while the planet still reads as huge.
 
 Consequences to respect when changing things:
 - Display real-world values via `src/units.rs` (`--units us` flag), never raw
