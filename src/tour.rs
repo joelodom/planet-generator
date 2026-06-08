@@ -10,7 +10,7 @@
 //! composes with all the normal rendering and streaming.
 
 use crate::camera::Camera;
-use crate::planet::{self, Planet, PLANET_RADIUS, SHORE};
+use crate::planet::{self, Biome, Planet, PLANET_RADIUS};
 use glam::{Quat, Vec3};
 use std::f32::consts::{PI, TAU};
 
@@ -64,6 +64,28 @@ const ARRIVE_HEADING_JITTER: f32 = 0.6; // ± rad turn as we settle onto a biome
 const DEST_ARC_MIN: f32 = 0.6; // rad between consecutive biomes (not too near/far)
 const DEST_ARC_MAX: f32 = 2.1;
 const DEST_MIN_HEIGHT: f32 = 5.0; // prefer solid land, above the coast (render units)
+// Random points probed per destination search. Bounded so even a leg that has to
+// skip several absent biomes stays a one-frame cost at a phase transition (never
+// the per-frame hot path). One probe ≈ one `Planet::sample`.
+const DEST_SAMPLES: usize = 500;
+
+/// Biomes the guided tour seeks out, one per leg, in cycle order — a deliberately
+/// varied progression (lush → arid → cold → high → frozen). Ocean is omitted: the
+/// tour is a low *land* flyover, and open water is merely the backdrop it crosses
+/// between stops. A biome absent from (or, this leg, out of reach on) a given world
+/// is skipped without stalling the cycle (see [`Tour::pick_biome_destination`]).
+const BIOME_TOUR: [Biome; 10] = [
+    Biome::TropicalForest,
+    Biome::Grassland,
+    Biome::TemperateForest,
+    Biome::Desert,
+    Biome::BorealForest,
+    Biome::Tundra,
+    Biome::Beach,
+    Biome::Mountain,
+    Biome::Snow,
+    Biome::PolarIce,
+];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
@@ -76,6 +98,9 @@ pub struct Tour {
     phase: Phase,
     t: f32,
     dur: f32,
+    /// Cursor into [`BIOME_TOUR`]: the next biome the tour will seek out. Advances
+    /// every biome it tries (found or skipped), so the cycle never stalls.
+    biome_cursor: usize,
 
     // Eased segment endpoints (Travel / Descend).
     s_focus: Vec3,
@@ -110,6 +135,7 @@ impl Tour {
             phase: Phase::Travel,
             t: 0.0,
             dur: 1.0,
+            biome_cursor: 0,
             s_focus: cam.focus,
             s_dist: cam.distance(),
             s_head: cam.heading(),
@@ -190,7 +216,7 @@ impl Tour {
     }
 
     fn begin_travel(&mut self, from_focus: Vec3, from_dist: f32, from_head: f32, from_tilt: f32, planet: &Planet) {
-        let dest = pick_destination(from_focus, planet);
+        let dest = self.pick_biome_destination(from_focus, planet);
         let arc = from_focus.angle_between(dest);
 
         // Heading that roughly faces the direction of travel.
@@ -261,6 +287,24 @@ impl Tour {
         self.e_head = eh;
         self.e_tilt = et;
     }
+
+    /// Advance the biome cycle and return a scenic land point in the next biome
+    /// that occurs on this planet. Every biome it tries advances the cursor, so
+    /// biomes absent from — or, this leg, out of reach on — a world are skipped
+    /// rather than stalling the tour; because the camera roams a little each leg,
+    /// every biome the planet does have is eventually reached. Falls back to any
+    /// land, then anywhere, on a near-waterworld with nothing in range.
+    fn pick_biome_destination(&mut self, from: Vec3, planet: &Planet) -> Vec3 {
+        for _ in 0..BIOME_TOUR.len() {
+            let biome = BIOME_TOUR[self.biome_cursor];
+            self.biome_cursor = (self.biome_cursor + 1) % BIOME_TOUR.len();
+            if let Some(dest) = pick_destination(from, planet, Some(biome)) {
+                tracing::info!(biome = biome.name(), "tour: cruising to next biome");
+                return dest;
+            }
+        }
+        pick_destination(from, planet, None).unwrap_or_else(random_unit)
+    }
 }
 
 /// Max terrain radius over the focus and four neighbours `reach` units away — the
@@ -287,26 +331,27 @@ fn frame(up: Vec3) -> (Vec3, Vec3) {
     (north, east)
 }
 
-/// Pick a varied land destination a comfortable distance from `current`.
-fn pick_destination(current: Vec3, planet: &Planet) -> Vec3 {
-    for _ in 0..400 {
+/// Probe up to [`DEST_SAMPLES`] random surface points for a scenic destination a
+/// comfortable arc from `current` and above the coast. With `Some(biome)`, only
+/// that biome qualifies; with `None`, any solid land does. `None` (the return)
+/// means nothing matched within the budget.
+fn pick_destination(current: Vec3, planet: &Planet, target: Option<Biome>) -> Option<Vec3> {
+    for _ in 0..DEST_SAMPLES {
         let d = random_unit();
         let arc = current.angle_between(d);
         if !(DEST_ARC_MIN..DEST_ARC_MAX).contains(&arc) {
             continue;
         }
-        if planet.height(d) > DEST_MIN_HEIGHT {
-            return d; // solid land, above the coast
+        let s = planet.sample(d);
+        if s.height <= DEST_MIN_HEIGHT {
+            continue; // skip ocean and the shoreline — keep the cruise on solid land
         }
-    }
-    // Fallback: any land at all.
-    for _ in 0..400 {
-        let d = random_unit();
-        if planet.height(d) > SHORE {
-            return d;
+        if target.is_some_and(|biome| s.biome != biome) {
+            continue; // wrong biome for this leg
         }
+        return Some(d);
     }
-    random_unit()
+    None
 }
 
 /// Spherical interpolation between two unit directions.
@@ -364,6 +409,9 @@ mod tests {
         let mut prev_focus = cam.focus;
         let mut max_focus_jump = 0.0f32;
         let mut moved = false;
+        // Distinct biomes visited at cruise altitude — the tour should seek out
+        // variety, not loiter in one. (`Biome` isn't `Hash`; key by discriminant.)
+        let mut cruise_biomes = std::collections::HashSet::new();
 
         // ~6 minutes of touring.
         for _ in 0..10_800 {
@@ -393,6 +441,12 @@ mod tests {
                 moved = true;
             }
             prev_focus = cam.focus;
+
+            // Only the low cruise reflects the targeted biome (travel sweeps over
+            // many); travel/orbit altitude is ~0.16·radius, cruise is tens of units.
+            if cam.distance() < 1_000.0 {
+                cruise_biomes.insert(planet.sample(cam.focus).biome as usize);
+            }
         }
 
         // It descends near the surface (cruise) and climbs to travel altitude.
@@ -404,5 +458,8 @@ mod tests {
         // It moves, but never teleports — frame-to-frame motion stays small/smooth.
         assert!(moved, "tour camera never moved");
         assert!(max_focus_jump < 0.02, "tour made a jarring jump: {max_focus_jump} rad/frame");
+        // The biome cycle takes it through several distinct biomes over 6 minutes,
+        // not round and round one stretch of land.
+        assert!(cruise_biomes.len() >= 3, "tour lacked biome variety: {} distinct cruise biomes", cruise_biomes.len());
     }
 }

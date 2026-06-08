@@ -168,6 +168,25 @@ pub enum Biome {
     Snow,
 }
 
+impl Biome {
+    /// Lowercase human-readable label (HUD title, `P` printout, tour log).
+    pub fn name(self) -> &'static str {
+        match self {
+            Biome::Ocean => "ocean",
+            Biome::Beach => "beach",
+            Biome::PolarIce => "polar ice",
+            Biome::Tundra => "tundra",
+            Biome::BorealForest => "boreal forest",
+            Biome::Grassland => "grassland",
+            Biome::TemperateForest => "temperate forest",
+            Biome::Desert => "desert",
+            Biome::TropicalForest => "tropical forest",
+            Biome::Mountain => "mountain",
+            Biome::Snow => "snow",
+        }
+    }
+}
+
 /// Number of [`Biome`] variants. `biome as usize` indexes a per-biome table
 /// (e.g. the flora library's species lists).
 pub const BIOME_COUNT: usize = 11;

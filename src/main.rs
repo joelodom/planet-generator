@@ -337,7 +337,7 @@ impl App {
             let fps = self.perf_frames as f32 / self.perf_accum;
             let avg_ms = self.perf_accum * 1000.0 / self.perf_frames as f32;
             let (lat, lon) = self.camera.lat_lon();
-            let biome = biome_name(self.planet.sample(self.camera.focus).biome);
+            let biome = self.planet.sample(self.camera.focus).biome.name();
             debug!(
                 target: "perf",
                 fps = round1(fps),
@@ -365,7 +365,7 @@ impl App {
         if self.title_timer > TITLE_UPDATE_SECONDS {
             self.title_timer = 0.0;
             let (lat, lon) = self.camera.lat_lon();
-            let biome = biome_name(self.planet.sample(self.camera.focus).biome);
+            let biome = self.planet.sample(self.camera.focus).biome.name();
             let fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
             if let Some(w) = &self.window {
                 w.set_title(&format!(
@@ -387,7 +387,7 @@ impl App {
         let terrain = units::elevation(s.height, self.units);
         println!(
             "location: seed {} | lat {:.3}° lon {:.3}° | altitude {} | terrain {} | biome {}",
-            self.seed, lat, lon, alt, terrain, biome_name(s.biome)
+            self.seed, lat, lon, alt, terrain, s.biome.name()
         );
         info!(
             seed = self.seed,
@@ -395,7 +395,7 @@ impl App {
             lon = round1(lon),
             altitude = alt,
             terrain = terrain,
-            biome = biome_name(s.biome),
+            biome = s.biome.name(),
             "location"
         );
     }
@@ -672,19 +672,3 @@ fn random_unit() -> Vec3 {
     Vec3::new(r * a.cos(), z, r * a.sin())
 }
 
-fn biome_name(b: planet::Biome) -> &'static str {
-    use planet::Biome::*;
-    match b {
-        Ocean => "ocean",
-        Beach => "beach",
-        PolarIce => "polar ice",
-        Tundra => "tundra",
-        BorealForest => "boreal forest",
-        Grassland => "grassland",
-        TemperateForest => "temperate forest",
-        Desert => "desert",
-        TropicalForest => "tropical forest",
-        Mountain => "mountain",
-        Snow => "snow",
-    }
-}
