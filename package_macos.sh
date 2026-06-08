@@ -29,8 +29,9 @@ mkdir -p "${MACOS_DIR}" "${RES_DIR}"
 cp "target/release/${BIN_NAME}" "${MACOS_DIR}/${BIN_NAME}"
 chmod 755 "${MACOS_DIR}/${BIN_NAME}"
 
-# App icon (prebuilt from planet.png; regenerate with ./make_icon.py + iconutil).
-# NOTE: this .icns is macOS-only; a Windows build will need a .ico instead.
+# App icon (regenerate from planet.png with ./make_icon.py, which emits both this
+# .icns and the Windows assets/AppIcon.ico). The Windows .exe embeds the .ico itself
+# via build.rs; here we just copy the .icns into the bundle.
 ICON_LINE=""
 if [ -f assets/AppIcon.icns ]; then
     cp assets/AppIcon.icns "${RES_DIR}/AppIcon.icns"

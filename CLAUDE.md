@@ -123,10 +123,12 @@ Consequences to respect when changing things:
   Audio failures are non-fatal (runs silent).
 - **planet.png** is also decoded (via `png`, pure Rust) into a texture and shown
   as a circular disc in the ESC help overlay (`shaders/image.wgsl`).
-- **App icon:** `make_icon.py` (Pillow) builds a macOS squircle from planet.png;
-  `package_macos.sh` copies `assets/AppIcon.icns` into the bundle. macOS-only —
-  **a Windows build will need a `.ico`** (build script + `winresource`); track
-  that when Windows lands.
+- **App icon:** `make_icon.py` (Pillow) renders one squircle from planet.png and
+  emits **both** `assets/AppIcon.icns` (macOS, via `iconutil`) and
+  `assets/AppIcon.ico` (Windows, multi-resolution) so the two platforms match.
+  `package_macos.sh` copies the `.icns` into the `.app`; `build.rs` embeds the
+  `.ico` into the Windows `.exe` via the `winresource` build-dep (cfg(windows)-gated).
+  Regenerate both with `./make_icon.py` after changing the source art.
 - New crates must be cross-platform (rodio, png are). Verify before adding — the
   RTX 5090 / Windows target is coming.
 

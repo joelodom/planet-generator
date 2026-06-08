@@ -19,3 +19,8 @@ winit = "0.30.13"
 
 [dev-dependencies]
 png = "0.18.1"
+
+# Windows only: embed the app icon (assets/AppIcon.ico) into the .exe at build
+# time. Target-gated so it isn't pulled in on macOS.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

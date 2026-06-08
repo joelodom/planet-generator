@@ -33,6 +33,19 @@ fn main() {
         .unwrap_or_default();
     println!("cargo:rustc-env=BUILD_DATE={date}");
 
+    // On Windows, embed the app icon into the .exe so Explorer/taskbar show it,
+    // matching the macOS bundle (which gets AppIcon.icns via package_macos.sh).
+    // Best-effort: a failure here degrades to an icon-less exe, never a broken build.
+    #[cfg(windows)]
+    {
+        println!("cargo:rerun-if-changed=assets/AppIcon.ico");
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon("assets/AppIcon.ico");
+        if let Err(e) = res.compile() {
+            println!("cargo:warning=app icon embed failed: {e}");
+        }
+    }
+
     // Force this script to re-run on EVERY build so BUILD_DATE/GIT_HASH reflect
     // the actual build, not just the last commit. Referencing a path that never
     // exists makes Cargo treat the script as dirty each build.
