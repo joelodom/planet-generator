@@ -25,17 +25,32 @@ const TRAVEL_ANGULAR_SPEED: f32 = 0.08; // rad/s
 const TRAVEL_DUR_MIN: f32 = 10.0;
 const TRAVEL_DUR_MAX: f32 = 22.0;
 
-const DESCEND_DUR: f32 = 9.0;
+const DESCEND_DUR: f32 = 12.0; // a calmer settle, since the cruise altitude is low
 
 // Cruise (low flyover): randomized per leg so it never feels mechanical.
-const CRUISE_DIST_MIN: f32 = 1800.0; // render units; high enough to clear peaks
-const CRUISE_DIST_MAX: f32 = 4500.0;
+// Target a low *altitude* (render units; ×10 = metres) so trees are clearly
+// visible; the focus distance is derived from the tilt each leg, since the eye's
+// height above terrain ≈ distance · cos(tilt). The camera's ground guard lifts it
+// over the occasional tall rise.
+const CRUISE_ALT_MIN: f32 = 2.0; // 20 m — close enough to fly among the treetops
+const CRUISE_ALT_MAX: f32 = 14.0; // 140 m — varied, higher scenic passes
+
+// Terrain-following: the cruise keeps the eye ~cruise_alt above a *smoothed* local
+// ground so it never flies through hills, but only very loosely (it doesn't rigidly
+// hug the surface). It climbs over rising ground fairly quickly and settles back
+// slowly, which reads as a gentle, natural drift.
+const GROUND_SAMPLE_REACH: f32 = 6.0; // sample terrain this far around the focus (render units)
+const GROUND_RISE_TAU: f32 = 0.8; // smoothing time-constant when climbing (s)
+const GROUND_FALL_TAU: f32 = 3.5; // slower coming back down — keeps it loose
 const CRUISE_TILT_MIN: f32 = 0.85; // oblique, scenic horizon angles (rad)
 const CRUISE_TILT_MAX: f32 = 1.18;
 const CRUISE_DUR_MIN: f32 = 24.0; // seconds spent exploring a biome
 const CRUISE_DUR_MAX: f32 = 38.0;
-const CRUISE_PAN_MIN: f32 = 0.000_12; // rad/s great-circle focus drift
-const CRUISE_PAN_MAX: f32 = 0.000_32;
+// Great-circle focus drift. At the low cruise altitude this is the ground speed
+// you feel, so it's much gentler than the old high-altitude pan: rate × radius ×
+// 10 m ≈ 19–51 m/s ground speed (a low, scenic flyover, not a hypersonic blur).
+const CRUISE_PAN_MIN: f32 = 0.000_003; // rad/s
+const CRUISE_PAN_MAX: f32 = 0.000_008;
 const CRUISE_HEAD_MIN: f32 = 0.006; // rad/s gentle look-around
 const CRUISE_HEAD_MAX: f32 = 0.018;
 const CRUISE_TILT_AMP_MIN: f32 = 0.04; // gentle tilt bob (rad)
@@ -82,6 +97,10 @@ pub struct Tour {
     base_tilt: f32,
     tilt_amp: f32,
     tilt_freq: f32,
+
+    // Smoothed terrain-following for the low cruise.
+    cruise_alt: f32, // target eye height above ground (render units)
+    ground_r: f32,   // smoothed local ground radius the eye stays above
 }
 
 impl Tour {
@@ -108,6 +127,8 @@ impl Tour {
             base_tilt: cam.tilt(),
             tilt_amp: 0.0,
             tilt_freq: 0.0,
+            cruise_alt: CRUISE_ALT_MIN,
+            ground_r: planet.surface_radius(cam.focus),
         };
         tour.begin_travel(cam.focus, cam.distance(), cam.heading(), cam.tilt(), planet);
         tour
@@ -129,7 +150,7 @@ impl Tour {
                     if self.phase == Phase::Travel {
                         self.begin_descend(planet);
                     } else {
-                        self.begin_cruise();
+                        self.begin_cruise(planet);
                     }
                 }
             }
@@ -138,6 +159,16 @@ impl Tour {
                 self.c_focus = (Quat::from_axis_angle(self.drift_axis, self.pan_rate * dt) * self.c_focus).normalize();
                 self.c_head += self.head_rate * dt;
                 let tilt = (self.base_tilt + (self.t * self.tilt_freq).sin() * self.tilt_amp).clamp(0.0, CRUISE_TILT_CLAMP);
+
+                // Loosely follow the terrain: keep the eye ~cruise_alt above a
+                // smoothed local-max ground. Climb fairly quickly over rising land
+                // (so it never flies through hills) and settle back slowly.
+                let focus_r = planet.surface_radius(self.c_focus);
+                let target_r = local_ground_radius(planet, self.c_focus, GROUND_SAMPLE_REACH);
+                let tau = if target_r > self.ground_r { GROUND_RISE_TAU } else { GROUND_FALL_TAU };
+                self.ground_r += (target_r - self.ground_r) * (1.0 - (-dt / tau).exp());
+                let ref_r = self.ground_r.max(focus_r);
+                self.c_dist = (ref_r + self.cruise_alt - focus_r) / tilt.cos();
                 cam.set_view(self.c_focus, self.c_dist, self.c_head, tilt);
 
                 if self.t >= self.dur {
@@ -168,10 +199,12 @@ impl Tour {
     }
 
     fn begin_descend(&mut self, _planet: &Planet) {
-        // High enough to clear most peaks but still a flying view; the camera's
-        // ground guard gently lifts it over the rare tall summit.
-        let cruise_dist = rand_range(CRUISE_DIST_MIN, CRUISE_DIST_MAX);
+        // Settle into a low flyover: pick the tilt, then derive the focus distance
+        // that puts the eye at the target altitude (altitude ≈ dist · cos(tilt)).
         let cruise_tilt = rand_range(CRUISE_TILT_MIN, CRUISE_TILT_MAX);
+        let cruise_alt = rand_range(CRUISE_ALT_MIN, CRUISE_ALT_MAX);
+        self.cruise_alt = cruise_alt;
+        let cruise_dist = cruise_alt / cruise_tilt.cos();
         let arrive_head = self.e_head + rand_range(-ARRIVE_HEADING_JITTER, ARRIVE_HEADING_JITTER);
         self.phase = Phase::Descend;
         self.t = 0.0;
@@ -180,13 +213,16 @@ impl Tour {
         self.set_segment(self.e_focus, self.e_dist, self.e_head, self.e_tilt, self.e_focus, cruise_dist, arrive_head, cruise_tilt);
     }
 
-    fn begin_cruise(&mut self) {
+    fn begin_cruise(&mut self, planet: &Planet) {
         self.phase = Phase::Cruise;
         self.t = 0.0;
         self.dur = rand_range(CRUISE_DUR_MIN, CRUISE_DUR_MAX);
         self.c_focus = self.e_focus;
         self.c_dist = self.e_dist;
         self.c_head = self.e_head;
+        // Start the terrain-follow reference at the focus ground; it eases up to
+        // clear nearby rises over the first second of cruise (no jump on arrival).
+        self.ground_r = planet.surface_radius(self.c_focus);
 
         // Drift in a random direction along the surface.
         let (north, east) = frame(self.c_focus);
@@ -214,6 +250,19 @@ impl Tour {
         self.e_head = eh;
         self.e_tilt = et;
     }
+}
+
+/// Max terrain radius over the focus and four neighbours `reach` units away — the
+/// local ground the cruise camera should stay above so it doesn't clip a nearby rise.
+fn local_ground_radius(planet: &Planet, focus: Vec3, reach: f32) -> f32 {
+    let (north, east) = frame(focus);
+    let ang = reach / PLANET_RADIUS; // small-angle tangent offset
+    let mut r = planet.surface_radius(focus);
+    for t in [north, -north, east, -east] {
+        let dir = (focus + t * ang).normalize();
+        r = r.max(planet.surface_radius(dir));
+    }
+    r
 }
 
 /// North/east tangent basis at a surface point (north = toward +Y, projected).
@@ -300,6 +349,7 @@ mod tests {
         let dt = 1.0 / 30.0;
         let mut min_dist = f32::INFINITY;
         let mut max_dist = 0.0f32;
+        let mut min_clear = f32::INFINITY; // eye height above the terrain beneath it
         let mut prev_focus = cam.focus;
         let mut max_focus_jump = 0.0f32;
         let mut moved = false;
@@ -315,6 +365,11 @@ mod tests {
             for col in vp.to_cols_array() {
                 assert!(col.is_finite(), "view_proj has non-finite value");
             }
+
+            // The eye must never sink into the terrain beneath it.
+            let clear = eye.length() - planet.surface_radius(eye.normalize());
+            assert!(clear > 0.0, "eye went underground (clearance {clear})");
+            min_clear = min_clear.min(clear);
 
             let d = cam.distance();
             assert!(d.is_finite() && d > 0.0, "bad distance {d}");
@@ -332,6 +387,9 @@ mod tests {
         // It descends near the surface (cruise) and climbs to travel altitude.
         assert!(min_dist < 5_000.0, "tour never got near the surface (min {min_dist})");
         assert!(max_dist > 0.1 * PLANET_RADIUS, "tour never zoomed out to travel (max {max_dist})");
+        // The low cruise genuinely flies low (within ~150 m of the ground) without
+        // ever clipping through it.
+        assert!(min_clear < 16.0, "tour never flew low over the terrain (min clearance {min_clear})");
         // It moves, but never teleports — frame-to-frame motion stays small/smooth.
         assert!(moved, "tour camera never moved");
         assert!(max_focus_jump < 0.02, "tour made a jarring jump: {max_focus_jump} rad/frame");
