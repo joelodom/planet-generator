@@ -1203,7 +1203,11 @@ mod gallery {
         for (r, biome) in rows.iter().enumerate() {
             for c in 0..cols {
                 let hash = (c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (r as u64).wrapping_mul(0x0100_0000_01B3) ^ 0x5151_5151;
-                let Some(id) = flora.pick(*biome, hash) else { continue };
+                let ids = flora.biome_species(*biome);
+                if ids.is_empty() {
+                    continue;
+                }
+                let id = ids[(hash % ids.len() as u64) as usize];
                 let off = Vec3::new((c as f32 - (cols as f32 - 1.0) * 0.5) * sx, 0.0, r as f32 * sz);
                 add(&mut verts, &mut idx, &flora.species(id).mesh, off, 1.0);
             }

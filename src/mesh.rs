@@ -3,8 +3,9 @@
 //! vegetation instances, and the static base meshes (trees, shrubs, water,
 //! fullscreen triangle) the renderer instances and reuses.
 
+use crate::flora;
 use crate::lod::ChunkKey;
-use crate::planet::{self, Planet, Biome, FACES, METERS_PER_UNIT, PLANET_RADIUS};
+use crate::planet::{self, Planet, Biome, FACES, PLANET_RADIUS};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Vec3};
 use rand::{RngExt, SeedableRng};
@@ -82,18 +83,12 @@ const VEG_MAX_STEEPNESS: f32 = 0.5; // skip cliffs
 const VEG_SINK: f32 = 0.15; // bury each plant's base this deep to hide the seam
 const VEG_TINT_JITTER: f32 = 0.06; // ± per-plant brightness so a stand isn't uniform
 
-// Same-species "stands". A Worley cell grid laid over each cube face, independent
-// of the LOD chunk grid so stands cross chunk seams seamlessly. Every cell owns a
-// jittered seed point and (per biome) one species; nearby plants adopt it, so one
-// kind of plant clusters together the way real stands do.
-const CLUSTER_CELL_METERS: f32 = 320.0; // ~ stand diameter
-const CLUSTER_CELL_UV: f32 = CLUSTER_CELL_METERS / METERS_PER_UNIT / PLANET_RADIUS;
-// Density falls off from each stand's seed: a dense core thinning to gaps, plus a
-// sparse floor of stragglers between stands. Distances are normalised to the cell.
-const CLUSTER_CORE: f32 = 0.18; // within this radius of a seed: full density
-const CLUSTER_EDGE: f32 = 0.62; // past this: bare ground
-const CLUSTER_FLOOR: f32 = 0.06; // baseline density between stands (loose mixing)
-const CLUSTER_MIX: f32 = 0.5; // odds, near a border, of taking the neighbour's species
+// Per-species clustering. Each species (see `flora`) has its own linear-decay
+// radius: certain at a seed point, fading to zero that far out. A species' seed
+// points sit on a per-species Worley grid (per cube face) spaced SEED_SPACING ×
+// its radius, so plant types cluster at wildly different scales — trees blanketing
+// regions, ground cover in tight patches — and thin to nothing between seeds.
+const SEED_SPACING: f32 = 2.0; // seed spacing, in units of a species' cluster radius
 
 impl CpuChunk {
     /// Build the terrain mesh and vegetation for one quadtree node, at the detail
@@ -223,30 +218,53 @@ fn place_vegetation(
     }
 
     let mut rng = StdRng::seed_from_u64(key.hash(planet.seed));
+    let mut presence = [0.0f32; flora::SPECIES_PER_BIOME]; // scratch, refilled per attempt
     for _ in 0..density {
         let u = u0 + size * rng.random::<f32>();
         let v = v0 + size * rng.random::<f32>();
         let cube = face.base + face.right * u + face.up * v;
         let dir = planet::cube_to_sphere(cube);
-        let s = planet.sample(dir);
 
-        // Nothing grows in water, on bare cliffs, or in a biome with no flora.
+        // Biome dithered across boundaries so flora intermixes over the same band
+        // the colours blend across. Nothing grows in water or on bare cliffs.
+        let tj = rng.random::<f32>() * 2.0 - 1.0;
+        let mj = rng.random::<f32>() * 2.0 - 1.0;
+        let s = planet.sample_blended(dir, tj, mj);
         if s.height < VEG_MIN_GROUND_HEIGHT || s.steepness > VEG_MAX_STEEPNESS {
             continue;
         }
-        let coverage = biome_coverage(s.biome);
-        if coverage <= 0.0 || !planet.flora.has_vegetation(s.biome) {
+        let lushness = biome_coverage(s.biome);
+        if lushness <= 0.0 {
+            continue;
+        }
+        let species_ids = planet.flora.biome_species(s.biome);
+        if species_ids.is_empty() {
             continue;
         }
 
-        // Which stand are we in? Its local density decides whether a plant grows
-        // here (dense cores, thinning to gaps); its species hash decides which.
-        let stand = cluster_lookup(planet.seed, key.face, u, v, &mut rng);
-        if rng.random::<f32>() > coverage * stand.density {
+        // Each species' presence here is a linear decay from its nearest seed point
+        // at that species' own cluster scale. The sum drives how likely a plant
+        // grows; the per-species presences weight which one does.
+        let mut sum = 0.0f32;
+        for (k, &id) in species_ids.iter().enumerate() {
+            let w = species_presence(planet.seed, key.face, u, v, id, planet.flora.species(id).cluster_radius);
+            presence[k] = w;
+            sum += w;
+        }
+        if sum <= 0.0 || rng.random::<f32>() >= lushness * sum.min(1.0) {
             continue;
         }
-        let Some(species_id) = planet.flora.pick(s.biome, stand.species_hash) else { continue };
-        let species = planet.flora.species(species_id);
+        // Weighted pick: which species grows here, proportional to local presence.
+        let mut pick = rng.random::<f32>() * sum;
+        let mut chosen = species_ids[0];
+        for (k, &id) in species_ids.iter().enumerate() {
+            if pick < presence[k] {
+                chosen = id;
+                break;
+            }
+            pick -= presence[k];
+        }
+        let species = planet.flora.species(chosen);
 
         // Plant it: upright on the surface, with a yaw spin and a size jitter.
         let up = dir;
@@ -276,56 +294,40 @@ fn bake_plant(dst: &mut MeshData, src: &MeshData, model: Mat4, nmat: Mat3, tint:
     dst.indices.extend(src.indices.iter().map(|&i| base + i));
 }
 
-/// The stand covering a point: how dense vegetation is here, and a stable hash
-/// selecting its species.
-struct Stand {
-    density: f32,
-    species_hash: u64,
-}
-
-/// Worley-cell lookup over the stand grid. Finds the nearest seed point (and the
-/// runner-up, for soft borders), returning the local stand density and a species
-/// hash that's constant across a stand's core so one species clusters together.
-fn cluster_lookup(seed: u64, face: u8, u: f32, v: f32, rng: &mut StdRng) -> Stand {
-    let cu = (u / CLUSTER_CELL_UV).floor() as i64;
-    let cv = (v / CLUSTER_CELL_UV).floor() as i64;
-    let (mut d1, mut d2) = (f32::INFINITY, f32::INFINITY);
-    let (mut h1, mut h2) = (0u64, 0u64);
+/// Linear-decay presence of one species at a point: 1 at its nearest seed point,
+/// fading to 0 at the species' cluster radius. Seeds sit on a per-species Worley
+/// grid (per cube face) spaced SEED_SPACING × that radius, so each species clusters
+/// at its own scale — metres for some ground cover, hundreds of km for forest trees.
+fn species_presence(seed: u64, face: u8, u: f32, v: f32, species_id: u32, radius_units: f32) -> f32 {
+    let radius_uv = radius_units / PLANET_RADIUS;
+    if radius_uv <= 0.0 {
+        return 0.0;
+    }
+    let cell = (radius_uv * SEED_SPACING) as f64;
+    let cu = (u as f64 / cell).floor() as i64;
+    let cv = (v as f64 / cell).floor() as i64;
+    let mut best = 0.0f32;
     for di in -1..=1 {
         for dj in -1..=1 {
             let (gi, gj) = (cu + di, cv + dj);
-            let h = cell_hash(seed, face, gi, gj);
-            // Jittered seed point inside the cell (two 16-bit fractions from h).
-            let jx = (h & 0xFFFF) as f32 / 65535.0;
-            let jy = ((h >> 16) & 0xFFFF) as f32 / 65535.0;
-            let su = (gi as f32 + jx) * CLUSTER_CELL_UV;
-            let sv = (gj as f32 + jy) * CLUSTER_CELL_UV;
-            let d = (((u - su).powi(2) + (v - sv).powi(2)).sqrt()) / CLUSTER_CELL_UV;
-            if d < d1 {
-                d2 = d1;
-                h2 = h1;
-                d1 = d;
-                h1 = h;
-            } else if d < d2 {
-                d2 = d;
-                h2 = h;
-            }
+            let h = seed_hash(seed, face, species_id, gi, gj);
+            // Seed point jittered inside the cell (two 16-bit fractions from h).
+            let jx = (h & 0xFFFF) as f64 / 65535.0;
+            let jy = ((h >> 16) & 0xFFFF) as f64 / 65535.0;
+            let su = (gi as f64 + jx) * cell;
+            let sv = (gj as f64 + jy) * cell;
+            let du = u as f64 - su;
+            let dv = v as f64 - sv;
+            let d = (du * du + dv * dv).sqrt() as f32;
+            best = best.max(1.0 - d / radius_uv); // linear decay; negatives clamp to 0 via max
         }
     }
-    let density = CLUSTER_FLOOR.max(1.0 - planet::smoothstep(CLUSTER_CORE, CLUSTER_EDGE, d1));
-    // Near a stand border, sometimes adopt the neighbour's species so stands
-    // interleave instead of meeting on hard Voronoi lines.
-    let species_hash = if d2 < d1 * (1.0 + CLUSTER_MIX) && rng.random::<f32>() < CLUSTER_MIX {
-        h2
-    } else {
-        h1
-    };
-    Stand { density, species_hash }
+    best
 }
 
-/// Stable hash of a stand-grid cell (per planet, per face).
-fn cell_hash(seed: u64, face: u8, gi: i64, gj: i64) -> u64 {
-    let mut h = seed ^ (face as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+/// Stable hash of a per-species seed-grid cell (per planet, per face, per species).
+fn seed_hash(seed: u64, face: u8, species: u32, gi: i64, gj: i64) -> u64 {
+    let mut h = seed ^ ((face as u64) << 56) ^ (species as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     for x in [gi as u64, gj as u64] {
         h ^= x.wrapping_add(0x9E37_79B9_7F4A_7C15).wrapping_add(h << 6).wrapping_add(h >> 2);
         h = h.wrapping_mul(0x0100_0000_01B3);
@@ -358,4 +360,42 @@ fn biome_coverage(biome: Biome) -> f32 {
 pub struct MeshData {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presence_is_bounded_and_clusters_at_its_scale() {
+        // Walk a fine line (≈50 m steps) sampling a broad species and a tiny one.
+        // Presence stays in [0, 1]; the tiny species flips between patches far faster
+        // than the broad one — i.e. it clusters at a much smaller scale.
+        let big_r = 30_000.0_f32; // ~300 km
+        let small_r = 5.0_f32; // ~50 m
+        let step = 5.0 / PLANET_RADIUS; // ≈50 m in UV
+        let v = 0.1f32;
+        let n = 4000;
+        let (mut max_small, mut min_small) = (0.0f32, 1.0f32);
+        let (mut big_var, mut small_var) = (0.0f64, 0.0f64);
+        let mut prev_big = species_presence(7, 2, 0.0, v, 1, big_r);
+        let mut prev_small = species_presence(7, 2, 0.0, v, 2, small_r);
+        for i in 1..n {
+            let u = i as f32 * step;
+            let pb = species_presence(7, 2, u, v, 1, big_r);
+            let ps = species_presence(7, 2, u, v, 2, small_r);
+            assert!((0.0..=1.0).contains(&pb) && (0.0..=1.0).contains(&ps), "presence out of range");
+            max_small = max_small.max(ps);
+            min_small = min_small.min(ps);
+            big_var += (pb - prev_big).abs() as f64;
+            small_var += (ps - prev_small).abs() as f64;
+            prev_big = pb;
+            prev_small = ps;
+        }
+        // A real linear-decay field: near 1 at seed points, ~0 in the gaps between.
+        assert!(max_small > 0.8 && min_small < 0.2, "presence should span near-1 to near-0 (max {max_small}, min {min_small})");
+        // Across the same 50 m steps the tiny species varies far faster than the broad
+        // one (clusters at metres, not hundreds of km).
+        assert!(small_var > big_var * 5.0, "small-radius species should vary far faster ({small_var:.1} vs {big_var:.1})");
+    }
 }

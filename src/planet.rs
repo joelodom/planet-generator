@@ -309,35 +309,50 @@ impl Planet {
     }
 
     /// Resolve a surface point for queries: its height, biome, and slope. (Vertex
-    /// *color* is a rendering output — use [`Self::sample_terrain`] for that, so
-    /// this gameplay/HUD/vegetation path doesn't compute a color it would ignore.)
+    /// *colour* is a rendering output — use [`Self::sample_terrain`] for that, so
+    /// this gameplay/HUD path doesn't compute a colour it would ignore.)
     pub fn sample(&self, dir: Vec3) -> Surface {
         let d = dir.normalize();
         let height = self.height(d);
         let steepness = self.steepness(d, height);
-        let (biome, _temp, _moisture) = self.classify_at(d, height, steepness);
-        Surface { height, biome, steepness }
+        let (temp, moisture) = self.climate(d, height);
+        Surface { height, biome: classify(height, temp, moisture, steepness), steepness }
     }
 
-    /// Lean terrain sample for chunk meshing: the height and vertex color the mesh
-    /// needs, nothing else. Slope only changes the biome on high ground (the
-    /// Mountain test in [`classify`], gated by `MOUNTAIN_MIN_HEIGHT`), so the two
-    /// extra `height()` probes that [`Self::steepness`] costs are skipped at or
-    /// below that line — the bulk of every chunk's vertices — making this ~2x
-    /// cheaper than a full classify with **identical** color (proven by the
-    /// `sample_terrain_color_is_slope_independent_below_mountains` test).
+    /// Like [`Self::sample`] but dithers the biome across boundaries by nudging the
+    /// climate within ±[`BIOME_BLEND`] (`*_jitter` in -1..1). The mesher feeds it
+    /// per-plant random jitter so flora from neighbouring biomes intermixes across
+    /// the same band the colours blend over, instead of snapping at a hard edge.
+    /// Deep water is unaffected — vegetation is gated by height, not biome.
+    pub fn sample_blended(&self, dir: Vec3, temp_jitter: f32, moisture_jitter: f32) -> Surface {
+        let d = dir.normalize();
+        let height = self.height(d);
+        let steepness = self.steepness(d, height);
+        let (temp, moisture) = self.climate(d, height);
+        let temp = (temp + temp_jitter * BIOME_BLEND).clamp(0.0, 1.0);
+        let moisture = (moisture + moisture_jitter * BIOME_BLEND).clamp(0.0, 1.0);
+        Surface { height, biome: classify(height, temp, moisture, steepness), steepness }
+    }
+
+    /// Lean terrain sample for chunk meshing: the height and smoothly biome-blended
+    /// vertex colour the mesh needs. Slope only shifts the colour on high ground
+    /// (the bare-rock blend, gated by `MOUNTAIN_MIN_HEIGHT`), so the two extra
+    /// `height()` probes [`Self::steepness`] costs are skipped at or below that line
+    /// — the bulk of every chunk's vertices (proven slope-independent there by the
+    /// `color_is_slope_independent_below_mountains` test).
     pub fn sample_terrain(&self, dir: Vec3) -> (f32, Vec3) {
         let d = dir.normalize();
         let height = self.height(d);
-        // Below the mountain line slope can't change the biome — don't pay for it.
         let steepness = if height > MOUNTAIN_MIN_HEIGHT { self.steepness(d, height) } else { 0.0 };
-        let (biome, temp, moisture) = self.classify_at(d, height, steepness);
-        (height, self.terrain_color(d, height, biome, temp, moisture))
+        let (temp, moisture) = self.climate(d, height);
+        let p = [d.x as f64, d.y as f64, d.z as f64];
+        let cnoise = self.detail.get([p[0] * COLOR_DETAIL_FREQ, p[1] * COLOR_DETAIL_FREQ, p[2] * COLOR_DETAIL_FREQ]) as f32;
+        (height, blended_color(height, temp, moisture, steepness, cnoise))
     }
 
-    /// Biome at a point, plus the temperature and moisture fields it (and coloring)
-    /// derive from. Shared by [`Self::sample`] and [`Self::sample_terrain`].
-    fn classify_at(&self, d: Vec3, height: f32, steepness: f32) -> (Biome, f32, f32) {
+    /// Temperature and moisture (each 0..1) at a point — the climate fields the
+    /// biome and its colour derive from.
+    fn climate(&self, d: Vec3, height: f32) -> (f32, f32) {
         let p = [d.x as f64, d.y as f64, d.z as f64];
         let moisture = (self.moisture.get(p) as f32 * 0.5 + 0.5).clamp(0.0, 1.0);
 
@@ -348,15 +363,7 @@ impl Planet {
         // Altitude cooling: high peaks run much colder (so they hold snow).
         let temp = (1.0 - lat - (height.max(0.0) / ALTITUDE_COOLING_SCALE) + tvar).clamp(0.0, 1.0);
 
-        (classify(height, temp, moisture, steepness), temp, moisture)
-    }
-
-    /// Per-vertex terrain color for a classified point (adds the high-frequency
-    /// color-jitter noise). Split out so [`Self::sample`] needn't compute it.
-    fn terrain_color(&self, d: Vec3, height: f32, biome: Biome, temp: f32, moisture: f32) -> Vec3 {
-        let p = [d.x as f64, d.y as f64, d.z as f64];
-        let cnoise = self.detail.get([p[0] * COLOR_DETAIL_FREQ, p[1] * COLOR_DETAIL_FREQ, p[2] * COLOR_DETAIL_FREQ]) as f32;
-        biome_color(biome, height, temp, moisture, cnoise)
+        (temp, moisture)
     }
 
     /// Approximate surface slope at a point: 0 = flat, 1 = ~vertical cliff.
@@ -428,29 +435,77 @@ fn classify(height: f32, temp: f32, moisture: f32, steep: f32) -> Biome {
     }
 }
 
-fn biome_color(biome: Biome, height: f32, _temp: f32, moisture: f32, n: f32) -> Vec3 {
-    let jitter = n * COLOR_JITTER;
-    let base = match biome {
-        Biome::Ocean => {
-            // Depth-shaded sea floor (darker the deeper it is).
-            let depth = (-height / (HEIGHT_SCALE * OCEAN_DEPTH_FRACTION)).clamp(0.0, 1.0);
-            Vec3::new(0.20, 0.30, 0.34).lerp(Vec3::new(0.04, 0.07, 0.13), depth)
-        }
-        Biome::Beach => Vec3::new(0.80, 0.74, 0.55),
-        Biome::PolarIce => Vec3::new(0.82, 0.88, 0.93),
-        Biome::Snow => Vec3::new(0.93, 0.95, 0.98),
-        Biome::Tundra => Vec3::new(0.55, 0.52, 0.44),
-        Biome::BorealForest => Vec3::new(0.13, 0.27, 0.18),
-        Biome::Grassland => Vec3::new(0.50, 0.58, 0.27),
-        Biome::TemperateForest => Vec3::new(0.20, 0.40, 0.20),
-        Biome::Desert => Vec3::new(0.78, 0.62, 0.38),
-        Biome::TropicalForest => Vec3::new(0.13, 0.42, 0.18),
-        Biome::Mountain => {
-            let g = MOUNTAIN_ROCK_GREY + moisture * MOUNTAIN_ROCK_MOISTURE;
-            Vec3::new(g, g * 0.98, g * 0.95)
-        }
-    };
-    (base + Vec3::splat(jitter)).clamp(Vec3::ZERO, Vec3::ONE)
+// --- Smooth biome colouring ----------------------------------------------------
+// Biomes cross-fade at their junctions instead of snapping, over a band BIOME_BLEND
+// wide in climate-variable (0..1) space. Temperature is dominated by latitude
+// (~1.0 across a pole-to-equator quarter ≈ 10,000 km), so a temperature-driven edge
+// smears over roughly `BIOME_BLEND * 20,000` km (a few hundred km here); the noisier
+// moisture edges are shorter. Deep water is the exception — the coastline stays
+// crisp (handled first in `blended_color`).
+const BIOME_BLEND: f32 = 0.05; // half-width of the climate cross-fade (0..1)
+
+// Base biome colours (named per the no-magic-numbers rule).
+const COL_OCEAN_SHALLOW: Vec3 = Vec3::new(0.20, 0.30, 0.34);
+const COL_OCEAN_DEEP: Vec3 = Vec3::new(0.04, 0.07, 0.13);
+const COL_BEACH: Vec3 = Vec3::new(0.80, 0.74, 0.55);
+const COL_POLAR_ICE: Vec3 = Vec3::new(0.82, 0.88, 0.93);
+const COL_SNOW: Vec3 = Vec3::new(0.93, 0.95, 0.98);
+const COL_TUNDRA: Vec3 = Vec3::new(0.55, 0.52, 0.44);
+const COL_BOREAL: Vec3 = Vec3::new(0.13, 0.27, 0.18);
+const COL_GRASS: Vec3 = Vec3::new(0.50, 0.58, 0.27);
+const COL_TEMPERATE: Vec3 = Vec3::new(0.20, 0.40, 0.20);
+const COL_DESERT: Vec3 = Vec3::new(0.78, 0.62, 0.38);
+const COL_TROPICAL: Vec3 = Vec3::new(0.13, 0.42, 0.18);
+
+// Override blend widths for the height/slope-driven layers.
+const SHORE_BLEND: f32 = 4.0; // beach↔inland fade (render units of height) — coasts stay crisp
+const MOUNTAIN_BLEND_H: f32 = 200.0; // bare rock fades in this far above MOUNTAIN_MIN_HEIGHT
+const MOUNTAIN_BLEND_S: f32 = 0.12; // ... and over this slope band (0..1)
+const SNOW_BLEND_H: f32 = 250.0; // snow-line softness (render units)
+
+/// Smoothly biome-blended terrain colour for a point's climate, height and slope.
+/// Neighbouring biomes cross-fade (no hard borders); the ocean is kept crisp at the
+/// shoreline. `cnoise` is the fine per-vertex colour jitter.
+fn blended_color(height: f32, temp: f32, moisture: f32, steepness: f32, cnoise: f32) -> Vec3 {
+    // Deep water — the exception: a crisp coastline and depth shading, no smear.
+    if height < SHORE {
+        let depth = (-height / (HEIGHT_SCALE * OCEAN_DEPTH_FRACTION)).clamp(0.0, 1.0);
+        return COL_OCEAN_SHALLOW.lerp(COL_OCEAN_DEEP, depth);
+    }
+
+    // Each temperature band is a smooth dry↔wet blend across its moisture split.
+    let cold = COL_TUNDRA.lerp(COL_BOREAL, smoothstep(BOREAL_MOISTURE - BIOME_BLEND, BOREAL_MOISTURE + BIOME_BLEND, moisture));
+    let temperate = COL_GRASS.lerp(COL_TEMPERATE, smoothstep(FOREST_MOISTURE - BIOME_BLEND, FOREST_MOISTURE + BIOME_BLEND, moisture));
+    let warm = COL_DESERT.lerp(COL_TROPICAL, smoothstep(DESERT_MOISTURE - BIOME_BLEND, DESERT_MOISTURE + BIOME_BLEND, moisture));
+
+    // Cross-fade across the temperature bands as it cools: warm→temperate→cold→polar.
+    let mut col = warm;
+    col = col.lerp(temperate, smoothstep(TEMPERATE_TEMP + BIOME_BLEND, TEMPERATE_TEMP - BIOME_BLEND, temp));
+    col = col.lerp(cold, smoothstep(COLD_TEMP + BIOME_BLEND, COLD_TEMP - BIOME_BLEND, temp));
+    col = col.lerp(COL_POLAR_ICE, smoothstep(POLAR_TEMP + BIOME_BLEND, POLAR_TEMP - BIOME_BLEND, temp));
+
+    // Beach on low, warm ground near the shore — a narrow height fade keeps it crisp.
+    let beach = smoothstep(BEACH_MAX_HEIGHT, BEACH_MAX_HEIGHT - SHORE_BLEND, height)
+        * smoothstep(BEACH_MIN_TEMP - BIOME_BLEND, BEACH_MIN_TEMP + BIOME_BLEND, temp);
+    col = col.lerp(COL_BEACH, beach);
+
+    // Bare mountain rock: steep AND high. The height gate starts exactly at
+    // MOUNTAIN_MIN_HEIGHT, so below it the colour is slope-independent — which is
+    // what lets `sample_terrain` skip the slope probe there.
+    let g = MOUNTAIN_ROCK_GREY + moisture * MOUNTAIN_ROCK_MOISTURE;
+    let rock = Vec3::new(g, g * 0.98, g * 0.95);
+    let mtn = smoothstep(MOUNTAIN_MIN_HEIGHT, MOUNTAIN_MIN_HEIGHT + MOUNTAIN_BLEND_H, height)
+        * smoothstep(MOUNTAIN_MIN_STEEP - MOUNTAIN_BLEND_S, MOUNTAIN_MIN_STEEP + MOUNTAIN_BLEND_S, steepness);
+    col = col.lerp(rock, mtn);
+
+    // Snow on top: cold poles at any altitude, or anything above the (warmth-raised)
+    // snow line — so high peaks wear caps over the rock.
+    let snow_line = SNOW_BASE + temp * SNOW_TEMP_RANGE;
+    let snow = smoothstep(snow_line - SNOW_BLEND_H, snow_line + SNOW_BLEND_H, height)
+        .max(smoothstep(POLAR_SNOW_TEMP + BIOME_BLEND, POLAR_SNOW_TEMP - BIOME_BLEND, temp));
+    col = col.lerp(COL_SNOW, snow);
+
+    (col + Vec3::splat(cnoise * COLOR_JITTER)).clamp(Vec3::ZERO, Vec3::ONE)
 }
 
 /// Smooth Hermite interpolation, matching the GLSL `smoothstep`.
@@ -494,57 +549,48 @@ mod tests {
     }
 
     #[test]
-    fn sample_terrain_color_is_slope_independent_below_mountains() {
-        // H1: `sample_terrain` skips the slope probe at/below MOUNTAIN_MIN_HEIGHT.
-        // Prove that's color-neutral — its color must equal the color computed with
-        // the slope probe forced on at every point, so meshing output is unchanged.
+    fn color_is_slope_independent_below_mountains() {
+        // Below MOUNTAIN_MIN_HEIGHT the bare-rock blend is gated off, so colour must
+        // not depend on slope — which is exactly why `sample_terrain` may skip the
+        // slope probe there (the H1 optimisation stays valid).
         let p = Planet::new(2024);
         for d in dirs(4000) {
-            // `sample_terrain` normalizes `d` once internally; mirror that exactly
-            // (a second normalize would shift the noise inputs by an ULP and make
-            // this an apples-to-oranges comparison rather than a real equivalence).
-            let (h, lean) = p.sample_terrain(d);
             let dn = d.normalize();
-            let (biome, temp, moisture) = p.classify_at(dn, h, p.steepness(dn, h));
-            let full = p.terrain_color(dn, h, biome, temp, moisture);
-            assert_eq!(lean.to_array(), full.to_array(), "color differs at {dn:?}");
+            let h = p.height(dn);
+            if h > MOUNTAIN_MIN_HEIGHT {
+                continue;
+            }
+            let (temp, moisture) = p.climate(dn, h);
+            let flat = blended_color(h, temp, moisture, 0.0, 0.0);
+            let steep = blended_color(h, temp, moisture, p.steepness(dn, h), 0.0);
+            assert_eq!(flat.to_array(), steep.to_array(), "slope changed colour below the mountain line at h={h}");
         }
     }
 
     #[test]
-    #[ignore = "micro-benchmark; run: cargo test --release planet::tests::h1 -- --ignored --nocapture"]
-    fn h1_steepness_skip_speedup() {
+    #[ignore = "micro-benchmark; run: cargo test --release planet::tests::sampling_cost -- --ignored --nocapture"]
+    fn sampling_cost() {
         use std::time::Instant;
         let p = Planet::new(2024);
         let ds = dirs(20_000);
-        let mut acc = 0.0f32; // keep the calls from being optimized away
+        let mut acc = 0.0f32; // keep the calls from being optimised away
 
-        // Pre-H1 cost: classify with the slope probe forced on everywhere.
+        // Full query path (slope always computed) vs the lean meshing path that
+        // skips the slope probe below the mountain line and blends the colour.
         let t0 = Instant::now();
         for _ in 0..5 {
             for &d in &ds {
-                let dn = d.normalize();
-                let h = p.height(dn);
-                let (b, t, m) = p.classify_at(dn, h, p.steepness(dn, h));
-                acc += p.terrain_color(dn, h, b, t, m).x + h;
+                acc += p.sample(d).height;
             }
         }
-        let before = t0.elapsed();
-
-        // Post-H1: sample_terrain skips the probe below the mountain line.
+        let full = t0.elapsed();
         let t1 = Instant::now();
         for _ in 0..5 {
             for &d in &ds {
-                let (h, c) = p.sample_terrain(d.normalize());
-                acc += c.x + h;
+                acc += p.sample_terrain(d).0;
             }
         }
-        let after = t1.elapsed();
-
-        eprintln!(
-            "grid sample before(slope always)={before:?}  after(H1)={after:?}  \
-             speedup={:.2}x  (acc {acc})",
-            before.as_secs_f64() / after.as_secs_f64()
-        );
+        let lean = t1.elapsed();
+        eprintln!("sample(full slope)={full:?}  sample_terrain(skip+colour)={lean:?}  (acc {acc})");
     }
 }

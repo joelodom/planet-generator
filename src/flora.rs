@@ -19,7 +19,7 @@
 //! upright rotation onto the planet's surface and a small per-plant scale jitter.
 
 use crate::mesh::{MeshData, Vertex};
-use crate::planet::{hsv_to_rgb, Biome, BIOMES, BIOME_COUNT};
+use crate::planet::{hsv_to_rgb, Biome, BIOMES, BIOME_COUNT, METERS_PER_UNIT};
 use glam::Vec3;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -27,7 +27,7 @@ use std::f32::consts::TAU;
 
 /// Procedurally-generated species per vegetated biome. The user-facing "X types
 /// per biome". Barren biomes (ocean, ice, snow) get none; sparse ones fewer.
-pub const SPECIES_PER_BIOME: usize = 100;
+pub const SPECIES_PER_BIOME: usize = 24;
 
 // --- Per-planet flora "personality" --------------------------------------------
 const FLORA_SEED_SALT: u64 = 0xF10A_5EED_C0FF_EE01; // decorrelate flora from terrain
@@ -82,6 +82,10 @@ pub struct Species {
     pub mesh: MeshData,
     pub scale_min: f32,
     pub scale_max: f32,
+    /// Linear-decay clustering radius in render units: this species is certain at a
+    /// seed point and fades to zero this far out. Varies by form — trees blanket
+    /// regions, ground cover clumps tightly (see [`form_cluster_km`]).
+    pub cluster_radius: f32,
 }
 
 /// The whole world's plant library, grouped by biome.
@@ -127,20 +131,10 @@ impl Flora {
         &self.species[id as usize]
     }
 
-    /// Does this biome grow anything at all?
-    pub fn has_vegetation(&self, biome: Biome) -> bool {
-        !self.by_biome[biome as usize].is_empty()
-    }
-
-    /// Pick a species id for `biome` from a hash (stable per cluster cell, so a
-    /// stand grows one species). `None` if the biome is barren.
-    pub fn pick(&self, biome: Biome, hash: u64) -> Option<u32> {
-        let list = &self.by_biome[biome as usize];
-        if list.is_empty() {
-            None
-        } else {
-            Some(list[(hash % list.len() as u64) as usize])
-        }
+    /// The species ids that grow in `biome` (empty if barren). The mesher evaluates
+    /// each one's clustering at a point to decide which (if any) grows there.
+    pub fn biome_species(&self, biome: Biome) -> &[u32] {
+        &self.by_biome[biome as usize]
     }
 }
 
@@ -187,6 +181,23 @@ fn form_height(form: Form) -> (f32, f32) {
         Form::Flower => (0.06, 0.18),
         Form::Grass => (0.12, 0.34),
         Form::Snag => (1.3, 3.2),
+    }
+}
+
+/// Render units per kilometre (1 unit = `METERS_PER_UNIT` m).
+const UNITS_PER_KM: f32 = 1000.0 / METERS_PER_UNIT;
+
+/// Per-form clustering scale as a (min, max) kilometre range for a species'
+/// linear-decay radius (drawn log-uniform per species). Trees blanket regions —
+/// tens to hundreds of km; ground cover clumps tightly — down to tens of metres.
+fn form_cluster_km(form: Form) -> (f32, f32) {
+    match form {
+        Form::Conifer | Form::Broadleaf | Form::Palm | Form::Snag => (30.0, 400.0),
+        Form::Cactus => (3.0, 80.0),
+        Form::Bush => (2.0, 50.0),
+        Form::Shrub => (0.2, 20.0),
+        Form::Grass => (0.05, 6.0),
+        Form::Flower => (0.02, 3.0),
     }
 }
 
@@ -297,7 +308,12 @@ fn build_species(rng: &mut StdRng, profile: &Profile, hue_shift: f32, exotic: f3
         Form::Snag => build_snag(&mut m, rng, height, bark),
     }
 
-    Species { mesh: m, scale_min: SCALE_JITTER_LO, scale_max: SCALE_JITTER_HI }
+    // Clustering scale for this species: log-uniform within its form's km range, so
+    // each plant type spreads (or clumps) at its own distance scale.
+    let (kmin, kmax) = form_cluster_km(form);
+    let cluster_radius = kmin * (kmax / kmin).powf(rng.random::<f32>()) * UNITS_PER_KM;
+
+    Species { mesh: m, scale_min: SCALE_JITTER_LO, scale_max: SCALE_JITTER_HI, cluster_radius }
 }
 
 fn pick_weighted(rng: &mut StdRng, items: &[(Form, f32)]) -> Form {
