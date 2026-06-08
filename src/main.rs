@@ -50,6 +50,20 @@ const MAX_REQUESTS_PER_FRAME: usize = 48;
 /// Soft limit on resident GPU chunks before far ones get evicted.
 const CHUNK_CACHE_LIMIT: usize = 1800;
 
+/// Soundtrack playback volume (0..1).
+const AUDIO_VOLUME: f32 = 0.5;
+/// Initial window size, logical pixels.
+const WINDOW_WIDTH: f64 = 1280.0;
+const WINDOW_HEIGHT: f64 = 800.0;
+/// Aggregate a performance sample to the log this often.
+const PERF_SAMPLE_SECONDS: f32 = 2.0;
+/// Refresh the window-title HUD this often.
+const TITLE_UPDATE_SECONDS: f32 = 0.4;
+/// A frame slower than this is logged as a hitch ...
+const FRAME_HITCH_MS: f32 = 120.0;
+/// ... but at most once per this interval, to avoid log spam.
+const HITCH_LOG_COOLDOWN: f32 = 1.0;
+
 fn main() -> anyhow::Result<()> {
     if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
         println!(
@@ -270,7 +284,7 @@ impl App {
 
         // A single slow frame is worth flagging immediately (rate-limited), so a
         // stutter during testing is easy to find in the log.
-        if frame_ms > 120.0 && time - self.last_hitch > 1.0 {
+        if frame_ms > FRAME_HITCH_MS && time - self.last_hitch > HITCH_LOG_COOLDOWN {
             self.last_hitch = time;
             warn!(
                 target: "perf",
@@ -284,7 +298,7 @@ impl App {
         }
 
         // Aggregate sample every ~2s at DEBUG: the spine of perf analysis.
-        if self.perf_accum >= 2.0 {
+        if self.perf_accum >= PERF_SAMPLE_SECONDS {
             let fps = self.perf_frames as f32 / self.perf_accum;
             let avg_ms = self.perf_accum * 1000.0 / self.perf_frames as f32;
             let (lat, lon) = self.camera.lat_lon();
@@ -312,7 +326,7 @@ impl App {
 
         // Throttled window-title HUD.
         self.title_timer += dt;
-        if self.title_timer > 0.4 {
+        if self.title_timer > TITLE_UPDATE_SECONDS {
             self.title_timer = 0.0;
             let (lat, lon) = self.camera.lat_lon();
             let biome = biome_name(self.planet.sample(self.camera.focus).biome);
@@ -357,7 +371,7 @@ impl ApplicationHandler for App {
         }
         let attrs = Window::default_attributes()
             .with_title(format!("planet-explorer — seed {}", self.seed))
-            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
 
         let mut renderer = pollster::block_on(Renderer::new(window.clone())).expect("renderer init");
@@ -382,7 +396,7 @@ impl ApplicationHandler for App {
 
         // Start the looping soundtrack (non-fatal if there's no audio device).
         if self.audio.is_none() {
-            self.audio = audio::Audio::start(0.5);
+            self.audio = audio::Audio::start(AUDIO_VOLUME);
         }
 
         self.window = Some(window);

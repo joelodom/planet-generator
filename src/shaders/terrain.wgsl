@@ -1,5 +1,14 @@
 // Terrain: vertex-colored, diffuse-lit, distance-fogged.
 
+const FOG_COLOR_SCALE: f32 = 0.85;      // fog tint = atmosphere * this
+const SKY_FILL: f32 = 0.12;             // soft ambient fill from straight up
+const WATER_DETECT_EPS: f32 = 1.5;      // world-radius slack to classify ocean verts
+const RIPPLE_AMPLITUDE: f32 = 0.03;     // normal perturbation driving the sun glint
+const WATER_SPEC_POWER: f32 = 90.0;     // sun-glint tightness
+const WATER_SPEC_STRENGTH: f32 = 1.6;
+const WATER_FRESNEL_POWER: f32 = 4.0;   // rim sheen falloff
+const WATER_FRESNEL_STRENGTH: f32 = 0.25;
+
 struct Globals {
     view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
@@ -36,7 +45,7 @@ fn apply_fog(color: vec3<f32>, world: vec3<f32>) -> vec3<f32> {
     let dist = length(world - g.camera_pos.xyz);
     let d = dist * g.params.x;
     let f = clamp(1.0 - exp(-d * d), 0.0, 1.0);
-    let fog_color = g.atmosphere.rgb * 0.85;
+    let fog_color = g.atmosphere.rgb * FOG_COLOR_SCALE;
     return mix(color, fog_color, f);
 }
 
@@ -49,7 +58,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 
     // The ocean is part of this mesh, sitting at exactly sea level (= planet
     // radius, params.y). Detect it to add a moving sun glint and rim sheen.
-    let is_water = length(in.world) < g.params.y + 1.5;
+    let is_water = length(in.world) < g.params.y + WATER_DETECT_EPS;
 
     var n = radial;
     if (is_water) {
@@ -60,19 +69,19 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
             sin(p.x * 0.7 + t * 1.4) + sin(p.z * 1.1 - t * 1.0),
             0.0,
             cos(p.z * 0.9 + t * 1.2) + sin(p.x * 0.6 - t * 0.8),
-        ) * 0.03;
+        ) * RIPPLE_AMPLITUDE;
         n = normalize(radial + ripple);
     }
 
     let diff = max(dot(n, l), 0.0);
-    let sky_fill = max(dot(radial, vec3<f32>(0.0, 1.0, 0.0)), 0.0) * 0.12;
+    let sky_fill = max(dot(radial, vec3<f32>(0.0, 1.0, 0.0)), 0.0) * SKY_FILL;
     var col = in.color * (amb + diff * (1.0 - amb) + sky_fill);
 
     if (is_water) {
         let h = normalize(l + v);
-        let spec = pow(max(dot(n, h), 0.0), 90.0) * 1.6;
-        let fres = pow(1.0 - max(dot(radial, v), 0.0), 4.0);
-        col = col + vec3<f32>(spec) + g.atmosphere.rgb * fres * 0.25;
+        let spec = pow(max(dot(n, h), 0.0), WATER_SPEC_POWER) * WATER_SPEC_STRENGTH;
+        let fres = pow(1.0 - max(dot(radial, v), 0.0), WATER_FRESNEL_POWER);
+        col = col + vec3<f32>(spec) + g.atmosphere.rgb * fres * WATER_FRESNEL_STRENGTH;
     }
 
     return vec4<f32>(apply_fog(col, in.world), 1.0);

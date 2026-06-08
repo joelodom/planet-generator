@@ -4,6 +4,10 @@
 
 use crate::planet::METERS_PER_UNIT;
 
+const FEET_PER_METER: f64 = 3.280_84;
+const FEET_PER_MILE: f64 = 5280.0;
+const METERS_PER_KM: f64 = 1000.0;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Units {
     Metric,
@@ -37,16 +41,16 @@ pub fn distance(units_value: f32, sys: Units) -> String {
     let m = to_meters(units_value);
     match sys {
         Units::Metric => {
-            if m.abs() >= 1000.0 {
-                format!("{:.1} km", m / 1000.0)
+            if m.abs() >= METERS_PER_KM {
+                format!("{:.1} km", m / METERS_PER_KM)
             } else {
                 format!("{:.0} m", m)
             }
         }
         Units::Us => {
-            let ft = m * 3.280_84;
-            if ft.abs() >= 5280.0 {
-                format!("{:.1} mi", ft / 5280.0)
+            let ft = m * FEET_PER_METER;
+            if ft.abs() >= FEET_PER_MILE {
+                format!("{:.1} mi", ft / FEET_PER_MILE)
             } else {
                 format!("{:.0} ft", ft)
             }
@@ -59,7 +63,7 @@ pub fn elevation(units_value: f32, sys: Units) -> String {
     let m = to_meters(units_value);
     match sys {
         Units::Metric => format!("{:.0} m", m),
-        Units::Us => format!("{:.0} ft", m * 3.280_84),
+        Units::Us => format!("{:.0} ft", m * FEET_PER_METER),
     }
 }
 

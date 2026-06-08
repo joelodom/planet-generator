@@ -24,6 +24,10 @@ pub const MAX_LEVEL: u32 = 16;
 /// `SPLIT_FACTOR * node_world_size` of it. Higher = more detail, more chunks.
 pub const SPLIT_FACTOR: f32 = 1.7;
 
+/// Extra angular slack (radians) on the horizon cull, so chunks right at the
+/// limb aren't popped a frame early.
+const HORIZON_CULL_MARGIN: f32 = 0.06;
+
 /// Identifies one quadtree node: which cube face, how deep, and where within the
 /// face's index grid. Small and `Copy`, so it's the key for every cache/set.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -110,7 +114,7 @@ fn select_node(node: ChunkKey, planet: &Planet, cam: Vec3, horizon: f32, ready: 
     let center_dir = node.center_dir();
     let ang = center_dir.angle_between(cam.normalize_or_zero());
     let node_ang = node.world_size() / PLANET_RADIUS; // ~angular radius
-    if ang > horizon + node_ang + 0.06 {
+    if ang > horizon + node_ang + HORIZON_CULL_MARGIN {
         return;
     }
 

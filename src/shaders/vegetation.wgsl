@@ -11,6 +11,8 @@ struct Globals {
 };
 @group(0) @binding(0) var<uniform> g: Globals;
 
+const FOG_COLOR_SCALE: f32 = 0.85; // fog tint = atmosphere * this (matches terrain)
+
 struct VsIn {
     @location(0) pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
@@ -48,7 +50,7 @@ fn apply_fog(color: vec3<f32>, world: vec3<f32>) -> vec3<f32> {
     let dist = length(world - g.camera_pos.xyz);
     let d = dist * g.params.x;
     let f = clamp(1.0 - exp(-d * d), 0.0, 1.0);
-    return mix(color, g.atmosphere.rgb * 0.85, f);
+    return mix(color, g.atmosphere.rgb * FOG_COLOR_SCALE, f);
 }
 
 @fragment

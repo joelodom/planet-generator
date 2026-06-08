@@ -5,6 +5,9 @@
 @group(0) @binding(0) var tex: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
 
+const DISC_EDGE_INNER: f32 = 0.47; // circular mask: opaque within this radius ...
+const DISC_EDGE_OUTER: f32 = 0.5;  // ... fading to transparent by the quad edge
+
 struct VsIn {
     @location(0) corner: vec2<f32>, // unit quad 0..1
     @location(1) rect: vec4<f32>,   // xy = top-left (NDC), zw = size (NDC, h negative)
@@ -29,7 +32,7 @@ fn vs(in: VsIn) -> VsOut {
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     // Soft circular mask (anti-aliased edge).
     let d = distance(in.uv, vec2<f32>(0.5, 0.5));
-    let alpha = 1.0 - smoothstep(0.47, 0.5, d);
+    let alpha = 1.0 - smoothstep(DISC_EDGE_INNER, DISC_EDGE_OUTER, d);
     if (alpha <= 0.0) {
         discard;
     }

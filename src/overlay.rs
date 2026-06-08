@@ -60,6 +60,17 @@ pub struct OverlayGeometry {
     pub image: OverlayInstance,
 }
 
+// Overlay layout tuning. The embedded font is 8×8 px per glyph.
+const FONT_PX: f32 = 8.0; // glyph cell width
+const LINE_PX: f32 = 10.0; // glyph height + 2 px inter-line gap
+const GAP_CELLS: f32 = 3.0; // gap between text block and image, in glyph cells
+const PAD_CELLS: f32 = 7.0; // panel padding (× scale)
+const SCALE_MIN: f32 = 2.0; // smallest/largest integer pixel scale tried
+const SCALE_MAX: f32 = 5.0;
+const FIT_FRACTION: f32 = 0.9; // the group must fit within this fraction of the screen
+const IMG_HEIGHT_FRACTION: f32 = 0.94; // planet disc a touch shorter than the text block
+const BORDER_PX: f32 = 2.0; // panel border thickness (unscaled)
+
 /// Lay out `lines` centered on a `screen_w` x `screen_h` surface, with the planet
 /// image to the right of the text inside one bordered panel.
 pub fn layout(lines: &[String], screen_w: u32, screen_h: u32) -> OverlayGeometry {
@@ -72,29 +83,28 @@ pub fn layout(lines: &[String], screen_w: u32, screen_h: u32) -> OverlayGeometry
     // The group is [ text block | gap | square planet image (~ text height) ].
     // Pick the largest pixel scale (2..=5) that fits the whole group with margins.
     // Capped at 5 (one notch smaller than before) to leave room for the image.
-    let gap_cells = 3.0; // gap between text and image, in glyph cells
-    let group_cells_w = cols * 8.0 + gap_cells * 8.0 + rows * 10.0; // image ≈ block_h square
-    let mut scale = 5.0f32;
-    while scale > 2.0 {
-        if group_cells_w * scale <= sw * 0.9 && rows * 10.0 * scale <= sh * 0.9 {
+    let group_cells_w = cols * FONT_PX + GAP_CELLS * FONT_PX + rows * LINE_PX; // image ≈ block_h square
+    let mut scale = SCALE_MAX;
+    while scale > SCALE_MIN {
+        if group_cells_w * scale <= sw * FIT_FRACTION && rows * LINE_PX * scale <= sh * FIT_FRACTION {
             break;
         }
         scale -= 1.0;
     }
 
-    let char_adv = 8.0 * scale;
-    let line_h = 10.0 * scale; // 8px glyph + 2px gap
+    let char_adv = FONT_PX * scale;
+    let line_h = LINE_PX * scale;
     let block_w = cols * char_adv;
     let block_h = rows * line_h;
-    let img = block_h * 0.94; // planet disc, a touch shorter than the text block
-    let gap = gap_cells * char_adv;
+    let img = block_h * IMG_HEIGHT_FRACTION; // planet disc, a touch shorter than the text block
+    let gap = GAP_CELLS * char_adv;
     let group_w = block_w + gap + img;
 
     let ox = ((sw - group_w) * 0.5).round(); // text origin
     let oy = ((sh - block_h) * 0.5).round();
     let img_x = ox + block_w + gap;
     let img_y = oy + (block_h - img) * 0.5;
-    let pad = 7.0 * scale;
+    let pad = PAD_CELLS * scale;
 
     let mut quads = Vec::new();
     let mut push = |x, y, w, h, c| quads.push(OverlayInstance::px(x, y, w, h, c, sw, sh));
@@ -102,7 +112,7 @@ pub fn layout(lines: &[String], screen_w: u32, screen_h: u32) -> OverlayGeometry
     // Dim the whole scene, then a bordered panel behind the group.
     push(0.0, 0.0, sw, sh, [0.0, 0.0, 0.0, 0.55]);
     let (px0, py0, pw, ph) = (ox - pad, oy - pad, group_w + 2.0 * pad, block_h + 2.0 * pad);
-    push(px0 - 2.0, py0 - 2.0, pw + 4.0, ph + 4.0, [0.30, 0.52, 0.74, 0.95]); // border
+    push(px0 - BORDER_PX, py0 - BORDER_PX, pw + 2.0 * BORDER_PX, ph + 2.0 * BORDER_PX, [0.30, 0.52, 0.74, 0.95]); // border
     push(px0, py0, pw, ph, [0.05, 0.07, 0.12, 0.94]); // panel
 
     let title = [0.55, 0.80, 1.0, 1.0];

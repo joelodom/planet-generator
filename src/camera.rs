@@ -23,6 +23,30 @@ const MAX_TILT: f32 = 1.30; // ~74.5°, keeps the eye comfortably above the grou
 const ZOOM_RATE: f32 = 1.6; // e-folds per second
 const ROT_RATE: f32 = 1.3; // rad/s
 const TILT_RATE: f32 = 1.2; // rad/s
+const BOOST_MULTIPLIER: f32 = 4.0; // "move faster" (Shift)
+
+const FOV_Y_DEGREES: f32 = 60.0;
+const START_DISTANCE_FACTOR: f32 = 2.2; // * PLANET_RADIUS → opening full-globe view
+const TELEPORT_DISTANCE: f32 = 12.0; // render units off the deck on teleport (~120 m)
+const TELEPORT_TILT: f32 = 0.85; // oblique arrival angle (rad)
+const EYE_GROUND_CLEARANCE: f32 = 1.0; // keep the eye at least this far above terrain
+
+// Panning: speed grows with zoom, clamped so far-out panning stays sane.
+const PAN_DISTANCE_FRACTION: f32 = 0.6; // of distance ...
+const PAN_WORLD_MIN: f32 = 3.0; // ... but at least this (render units/sec) ...
+const PAN_MAX_DISTANCE_FRACTION: f32 = 0.4; // ... and at most this fraction of the radius
+
+// Near/far plane derivation.
+const MAX_TERRAIN_FACTOR: f32 = 1.4; // peak height ≈ HEIGHT_SCALE * this (for the horizon)
+const FAR_RADIUS_MARGIN: f32 = 0.01; // slack on far (* radius)
+const FAR_FIXED_MARGIN: f32 = 100.0;
+const NEAR_DISTANCE_FRACTION: f32 = 0.25; // near ≈ this * focus distance
+const NEAR_MIN: f32 = 0.1;
+const NEAR_MAX_FAR_FRACTION: f32 = 0.4; // never push near past this fraction of far
+
+// Fog: thickens near the ground, gone from orbit.
+const FOG_FADE_DISTANCE: f32 = 3000.0; // fades out above this distance
+const FOG_MAX_DENSITY: f32 = 1.0 / 4000.0;
 
 #[derive(Default)]
 struct Keys {
@@ -58,11 +82,11 @@ impl Camera {
     pub fn new(_planet: &Planet, focus: Vec3) -> Self {
         Self {
             focus: focus.normalize(),
-            distance: PLANET_RADIUS * 2.2, // start with a full-globe view
+            distance: PLANET_RADIUS * START_DISTANCE_FACTOR, // full-globe opening view
             heading: 0.0,
             tilt: 0.0,
             aspect: 1.0,
-            fov_y: 60f32.to_radians(),
+            fov_y: FOV_Y_DEGREES.to_radians(),
             keys: Keys::default(),
         }
     }
@@ -101,7 +125,7 @@ impl Camera {
 
         // Never let the eye dip below the surface (e.g. steep tilt near ground).
         let eye_dir = eye.normalize();
-        let min_r = planet.surface_radius(eye_dir) + 1.0;
+        let min_r = planet.surface_radius(eye_dir) + EYE_GROUND_CLEARANCE;
         if eye.length() < min_r {
             eye = eye_dir * min_r;
         }
@@ -169,14 +193,14 @@ impl Camera {
     /// Drop the focus onto a random surface point, zoomed in at a nice angle.
     pub fn teleport(&mut self, _planet: &Planet, dir: Vec3) {
         self.focus = dir.normalize();
-        self.distance = 12.0;
-        self.tilt = 0.85;
+        self.distance = TELEPORT_DISTANCE;
+        self.tilt = TELEPORT_TILT;
     }
 
     // --- per-frame update ---------------------------------------------------
 
     pub fn update(&mut self, dt: f32, planet: &Planet) {
-        let boost = if self.keys.boost { 4.0 } else { 1.0 };
+        let boost = if self.keys.boost { BOOST_MULTIPLIER } else { 1.0 };
 
         // Zoom (multiplicative, so it's smooth across scales).
         let zoom = (self.keys.zoom_out as i32 - self.keys.zoom_in as i32) as f32;
@@ -200,7 +224,9 @@ impl Camera {
             if dir.length_squared() > 1e-6 {
                 dir = dir.normalize();
                 // Pan speed grows with zoom but is capped so far-out panning is sane.
-                let pan_world = (self.distance * 0.6).clamp(3.0, PLANET_RADIUS * 0.4) * boost;
+                let pan_world = (self.distance * PAN_DISTANCE_FRACTION)
+                    .clamp(PAN_WORLD_MIN, PLANET_RADIUS * PAN_MAX_DISTANCE_FRACTION)
+                    * boost;
                 let ang = pan_world / PLANET_RADIUS * dt;
                 let axis = self.focus.cross(dir).normalize_or_zero();
                 if axis != Vec3::ZERO {
@@ -222,10 +248,10 @@ impl Camera {
         let eye_r = eye.length();
         let horizon = if eye_r > r { (eye_r * eye_r - r * r).max(0.0).sqrt() } else { 0.0 };
         // Peaks beyond the geometric horizon are still visible.
-        let mtn = (2.0 * r * HEIGHT_SCALE * 1.4).sqrt();
-        let far = horizon + mtn + self.distance + r * 0.01 + 100.0;
+        let mtn = (2.0 * r * HEIGHT_SCALE * MAX_TERRAIN_FACTOR).sqrt();
+        let far = horizon + mtn + self.distance + r * FAR_RADIUS_MARGIN + FAR_FIXED_MARGIN;
         // Nothing is closer than ~the focus point, which is `distance` away.
-        let near = (self.distance * 0.25).clamp(0.1, far * 0.4);
+        let near = (self.distance * NEAR_DISTANCE_FRACTION).clamp(NEAR_MIN, far * NEAR_MAX_FAR_FRACTION);
         (near, far)
     }
 
@@ -239,8 +265,8 @@ impl Camera {
 
     /// Fog thickens near the ground (hides far LOD pop-in) and vanishes from orbit.
     pub fn fog_density(&self) -> f32 {
-        let t = (1.0 - self.distance / 3000.0).clamp(0.0, 1.0);
-        t * t * (1.0 / 4000.0)
+        let t = (1.0 - self.distance / FOG_FADE_DISTANCE).clamp(0.0, 1.0);
+        t * t * FOG_MAX_DENSITY
     }
 
     pub fn lat_lon(&self) -> (f32, f32) {

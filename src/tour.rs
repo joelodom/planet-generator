@@ -10,15 +10,45 @@
 //! composes with all the normal rendering and streaming.
 
 use crate::camera::Camera;
-use crate::planet::{self, Planet, PLANET_RADIUS};
+use crate::planet::{self, Planet, PLANET_RADIUS, SHORE};
 use glam::{Quat, Vec3};
 use std::f32::consts::{PI, TAU};
 
 /// Distance (render units) used while gliding between biomes — high enough to see
 /// the planet curve and travel fast, low enough to feel like flying, not orbit.
-const TRAVEL_DIST: f32 = PLANET_RADIUS * 0.16;
+const TRAVEL_DISTANCE_FACTOR: f32 = 0.16; // * PLANET_RADIUS
+const TRAVEL_DIST: f32 = PLANET_RADIUS * TRAVEL_DISTANCE_FACTOR;
 const TRAVEL_TILT: f32 = 0.55;
+
+// Travel timing: duration ≈ arc / speed, clamped to a calm range.
+const TRAVEL_ANGULAR_SPEED: f32 = 0.08; // rad/s
+const TRAVEL_DUR_MIN: f32 = 10.0;
+const TRAVEL_DUR_MAX: f32 = 22.0;
+
 const DESCEND_DUR: f32 = 9.0;
+
+// Cruise (low flyover): randomized per leg so it never feels mechanical.
+const CRUISE_DIST_MIN: f32 = 1800.0; // render units; high enough to clear peaks
+const CRUISE_DIST_MAX: f32 = 4500.0;
+const CRUISE_TILT_MIN: f32 = 0.85; // oblique, scenic horizon angles (rad)
+const CRUISE_TILT_MAX: f32 = 1.18;
+const CRUISE_DUR_MIN: f32 = 24.0; // seconds spent exploring a biome
+const CRUISE_DUR_MAX: f32 = 38.0;
+const CRUISE_PAN_MIN: f32 = 0.000_12; // rad/s great-circle focus drift
+const CRUISE_PAN_MAX: f32 = 0.000_32;
+const CRUISE_HEAD_MIN: f32 = 0.006; // rad/s gentle look-around
+const CRUISE_HEAD_MAX: f32 = 0.018;
+const CRUISE_TILT_AMP_MIN: f32 = 0.04; // gentle tilt bob (rad)
+const CRUISE_TILT_AMP_MAX: f32 = 0.10;
+const CRUISE_TILT_FREQ_MIN: f32 = 0.04; // rad/s
+const CRUISE_TILT_FREQ_MAX: f32 = 0.09;
+const CRUISE_TILT_CLAMP: f32 = 1.28; // keep below the camera's MAX_TILT
+const ARRIVE_HEADING_JITTER: f32 = 0.6; // ± rad turn as we settle onto a biome
+
+// Destination selection.
+const DEST_ARC_MIN: f32 = 0.6; // rad between consecutive biomes (not too near/far)
+const DEST_ARC_MAX: f32 = 2.1;
+const DEST_MIN_HEIGHT: f32 = 5.0; // prefer solid land, above the coast (render units)
 
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
@@ -107,7 +137,7 @@ impl Tour {
                 // Drift the focus slowly along a great circle and pan the view.
                 self.c_focus = (Quat::from_axis_angle(self.drift_axis, self.pan_rate * dt) * self.c_focus).normalize();
                 self.c_head += self.head_rate * dt;
-                let tilt = (self.base_tilt + (self.t * self.tilt_freq).sin() * self.tilt_amp).clamp(0.0, 1.28);
+                let tilt = (self.base_tilt + (self.t * self.tilt_freq).sin() * self.tilt_amp).clamp(0.0, CRUISE_TILT_CLAMP);
                 cam.set_view(self.c_focus, self.c_dist, self.c_head, tilt);
 
                 if self.t >= self.dur {
@@ -133,16 +163,16 @@ impl Tour {
 
         self.phase = Phase::Travel;
         self.t = 0.0;
-        self.dur = (arc / 0.08).clamp(10.0, 22.0);
+        self.dur = (arc / TRAVEL_ANGULAR_SPEED).clamp(TRAVEL_DUR_MIN, TRAVEL_DUR_MAX);
         self.set_segment(from_focus, from_dist, from_head, from_tilt, dest, TRAVEL_DIST, bearing, TRAVEL_TILT);
     }
 
     fn begin_descend(&mut self, _planet: &Planet) {
-        // High enough to clear most peaks (now ~17 km) but still a flying view;
-        // the camera's ground guard gently lifts it over the rare tall summit.
-        let cruise_dist = rand_range(1800.0, 4500.0);
-        let cruise_tilt = rand_range(0.85, 1.18);
-        let arrive_head = self.e_head + rand_range(-0.6, 0.6);
+        // High enough to clear most peaks but still a flying view; the camera's
+        // ground guard gently lifts it over the rare tall summit.
+        let cruise_dist = rand_range(CRUISE_DIST_MIN, CRUISE_DIST_MAX);
+        let cruise_tilt = rand_range(CRUISE_TILT_MIN, CRUISE_TILT_MAX);
+        let arrive_head = self.e_head + rand_range(-ARRIVE_HEADING_JITTER, ARRIVE_HEADING_JITTER);
         self.phase = Phase::Descend;
         self.t = 0.0;
         self.dur = DESCEND_DUR;
@@ -153,7 +183,7 @@ impl Tour {
     fn begin_cruise(&mut self) {
         self.phase = Phase::Cruise;
         self.t = 0.0;
-        self.dur = rand_range(24.0, 38.0);
+        self.dur = rand_range(CRUISE_DUR_MIN, CRUISE_DUR_MAX);
         self.c_focus = self.e_focus;
         self.c_dist = self.e_dist;
         self.c_head = self.e_head;
@@ -166,11 +196,11 @@ impl Tour {
         if self.drift_axis == Vec3::ZERO {
             self.drift_axis = Vec3::Y;
         }
-        self.pan_rate = rand_range(0.00012, 0.00032) * rand_sign();
-        self.head_rate = rand_range(0.006, 0.018) * rand_sign();
+        self.pan_rate = rand_range(CRUISE_PAN_MIN, CRUISE_PAN_MAX) * rand_sign();
+        self.head_rate = rand_range(CRUISE_HEAD_MIN, CRUISE_HEAD_MAX) * rand_sign();
         self.base_tilt = self.e_tilt;
-        self.tilt_amp = rand_range(0.04, 0.10);
-        self.tilt_freq = rand_range(0.04, 0.09);
+        self.tilt_amp = rand_range(CRUISE_TILT_AMP_MIN, CRUISE_TILT_AMP_MAX);
+        self.tilt_freq = rand_range(CRUISE_TILT_FREQ_MIN, CRUISE_TILT_FREQ_MAX);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -202,17 +232,17 @@ fn pick_destination(current: Vec3, planet: &Planet) -> Vec3 {
     for _ in 0..400 {
         let d = random_unit();
         let arc = current.angle_between(d);
-        if !(0.6..2.1).contains(&arc) {
+        if !(DEST_ARC_MIN..DEST_ARC_MAX).contains(&arc) {
             continue;
         }
-        if planet.height(d) > 5.0 {
+        if planet.height(d) > DEST_MIN_HEIGHT {
             return d; // solid land, above the coast
         }
     }
     // Fallback: any land at all.
     for _ in 0..400 {
         let d = random_unit();
-        if planet.height(d) > 0.0 {
+        if planet.height(d) > SHORE {
             return d;
         }
     }

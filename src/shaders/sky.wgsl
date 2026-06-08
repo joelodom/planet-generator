@@ -12,6 +12,13 @@ struct Globals {
 };
 @group(0) @binding(0) var<uniform> g: Globals;
 
+const STAR_DENSITY: f32 = 260.0;    // direction-space cells per unit (star spacing)
+const STAR_SPARSITY: f32 = 0.992;   // fraction of cells with no star
+const STAR_GLOW_RADIUS: f32 = 0.9;  // in-cell falloff of a star's glow
+const STAR_TINT_MIX: f32 = 0.25;    // how far star color leans to the atmosphere hue
+const RIM_GLOW_FALLOFF: f32 = 0.07; // atmosphere rim thickness (× planet radius)
+const RIM_STRENGTH: f32 = 1.5;      // atmosphere rim brightness
+
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) ndc: vec2<f32>,
@@ -34,18 +41,18 @@ fn hash31(p: vec3<f32>) -> f32 {
 
 fn star_field(dir: vec3<f32>, seed: f32) -> vec3<f32> {
     // Bucket the direction into cells; a sparse subset of cells hold a star.
-    let s = dir * 260.0 + vec3<f32>(seed);
+    let s = dir * STAR_DENSITY + vec3<f32>(seed);
     let cell = floor(s);
     let r0 = hash31(cell);
     let r1 = hash31(cell + 11.3);
     let r2 = hash31(cell + 23.7);
-    let present = step(0.992, r0);
+    let present = step(STAR_SPARSITY, r0);
     // Position the star within the cell and fall off with distance.
     let center = cell + vec3<f32>(r1, r2, hash31(cell + 5.1));
     let dist = length(s - center);
-    let glow = present * smoothstep(0.9, 0.0, dist) * (0.4 + 0.6 * r1);
+    let glow = present * smoothstep(STAR_GLOW_RADIUS, 0.0, dist) * (0.4 + 0.6 * r1);
     // Slight color variation, tinted toward the atmosphere hue.
-    let tint = mix(vec3<f32>(1.0), g.atmosphere.rgb, 0.25 * r2);
+    let tint = mix(vec3<f32>(1.0), g.atmosphere.rgb, STAR_TINT_MIX * r2);
     return tint * glow;
 }
 
@@ -67,10 +74,10 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     if (tc > 0.0) {
         let closest = length(c + dir * tc);
         if (closest > radius) {
-            let glow = exp(-(closest - radius) / (radius * 0.07));
+            let glow = exp(-(closest - radius) / (radius * RIM_GLOW_FALLOFF));
             // Brighter on the sunlit side.
             let sun_face = max(dot(dir, normalize(g.sun_dir.xyz)), 0.0) * 0.6 + 0.5;
-            col = col + g.atmosphere.rgb * glow * 1.5 * sun_face;
+            col = col + g.atmosphere.rgb * glow * RIM_STRENGTH * sun_face;
         }
     }
 

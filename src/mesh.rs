@@ -53,6 +53,22 @@ pub const GRID: usize = 20;
 // Earth-sized chunk spans tens of km and individual plants would be invisible.
 pub const VEG_MIN_LEVEL: u32 = 13;
 
+// Crack-hiding skirts around each chunk edge.
+const SKIRT_DEPTH_FACTOR: f32 = 3.0; // skirt depth ≈ this × a terrain quad's width
+const SKIRT_MIN_DEPTH: f32 = 2.0; // render units
+
+// Vegetation scatter.
+const VEG_ATTEMPTS_PER_CHUNK: usize = 70;
+const VEG_MIN_GROUND_HEIGHT: f32 = 1.0; // skip water/waterline (render units)
+const VEG_MAX_STEEPNESS: f32 = 0.5; // skip cliffs
+const TREE_SCALE_MIN: f32 = 0.8; // ~8–26 m trees (render units)
+const TREE_SCALE_MAX: f32 = 2.6;
+const SHRUB_SCALE_MIN: f32 = 0.25; // ~2.5–8 m shrubs
+const SHRUB_SCALE_MAX: f32 = 0.8;
+const TREE_TINT_JITTER: f32 = 0.08; // ± per-plant color variation
+const SHRUB_TINT_JITTER: f32 = 0.10;
+const SHRUB_TINT_BRIGHTEN: f32 = 1.1; // shrubs a touch lighter than the biome tint
+
 impl CpuChunk {
     /// Build the terrain mesh and vegetation for one quadtree node.
     pub fn build(planet: &Planet, key: ChunkKey) -> CpuChunk {
@@ -123,7 +139,7 @@ impl CpuChunk {
         // Skirts: a downward apron around all four edges so neighbouring chunks
         // at a coarser LOD can't reveal cracks/gaps to the sky behind them.
         let quad_arc = (size / GRID as f32) * PLANET_RADIUS;
-        let skirt = (quad_arc * 3.0).max(2.0);
+        let skirt = (quad_arc * SKIRT_DEPTH_FACTOR).max(SKIRT_MIN_DEPTH);
         let add_skirt = |edge: &[usize], vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>| {
             let start = vertices.len() as u32;
             for &gi in edge {
@@ -176,7 +192,7 @@ fn place_vegetation(
     let mut rng = StdRng::seed_from_u64(key.hash(planet.seed));
     // More candidate slots at deeper levels (smaller chunks) keeps on-screen
     // density roughly constant as you descend.
-    let attempts = 70;
+    let attempts = VEG_ATTEMPTS_PER_CHUNK;
 
     for _ in 0..attempts {
         let u = u0 + size * rng.random::<f32>();
@@ -186,7 +202,7 @@ fn place_vegetation(
         let s = planet.sample(dir);
 
         // Nothing grows in water, on ice/snow, on bare rock, or on cliffs.
-        if s.height < 1.0 || s.steepness > 0.5 {
+        if s.height < VEG_MIN_GROUND_HEIGHT || s.steepness > VEG_MAX_STEEPNESS {
             continue;
         }
         let (tree_p, shrub_p, tint) = match s.biome {
@@ -204,7 +220,7 @@ fn place_vegetation(
         let ground = PLANET_RADIUS + s.height;
         let roll = rng.random::<f32>();
         if roll < tree_p {
-            let scale = rng.random_range(0.8..2.6); // ~8–26 m trees (render units)
+            let scale = rng.random_range(TREE_SCALE_MIN..TREE_SCALE_MAX);
             let yaw = rng.random_range(0.0..std::f32::consts::TAU);
             let pos = up * ground;
             let model = Mat4::from_scale_rotation_translation(
@@ -212,10 +228,10 @@ fn place_vegetation(
                 planet::upright_rotation(up, yaw),
                 pos,
             );
-            let var = (rng.random::<f32>() - 0.5) * 0.08;
+            let var = (rng.random::<f32>() - 0.5) * TREE_TINT_JITTER;
             trees.push(InstanceRaw::new(model, (tint + Vec3::splat(var)).clamp(Vec3::ZERO, Vec3::ONE)));
         } else if roll < tree_p + shrub_p {
-            let scale = rng.random_range(0.25..0.8); // ~2.5–8 m shrubs
+            let scale = rng.random_range(SHRUB_SCALE_MIN..SHRUB_SCALE_MAX);
             let yaw = rng.random_range(0.0..std::f32::consts::TAU);
             let pos = up * ground;
             let model = Mat4::from_scale_rotation_translation(
@@ -223,8 +239,8 @@ fn place_vegetation(
                 planet::upright_rotation(up, yaw),
                 pos,
             );
-            let var = (rng.random::<f32>() - 0.5) * 0.10;
-            shrubs.push(InstanceRaw::new(model, (tint * 1.1 + Vec3::splat(var)).clamp(Vec3::ZERO, Vec3::ONE)));
+            let var = (rng.random::<f32>() - 0.5) * SHRUB_TINT_JITTER;
+            shrubs.push(InstanceRaw::new(model, (tint * SHRUB_TINT_BRIGHTEN + Vec3::splat(var)).clamp(Vec3::ZERO, Vec3::ONE)));
         }
     }
 
