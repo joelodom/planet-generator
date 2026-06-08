@@ -1,46 +1,53 @@
 #!/usr/bin/env python3
 """
-evolve.py — Autonomous Photorealism Optimizer
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Drop this file into the root of your procedural 3D object generator project
-and run:   python evolve.py
+evolve.py — Autonomous Photorealism Optimizer (orchestrator)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Drop this file (plus its sibling `tree_optimizer.py`) into the root of the
+procedural object generator and run:   python evolve.py
+
+DESIGN PRINCIPLE — THE HARNESS NEVER CHANGES ITS OWN CODE
+  evolve.py and tree_optimizer.py are FIXED, human-authored harness code. The
+  optimization run never edits them, and never edits itself. The ONLY thing a run
+  ever modifies is the TARGET tree source (src/flora.rs). To improve the
+  optimizer, you read the notes/logs it writes and edit these scripts by hand —
+  the system does not self-modify, so every run is reproducible and analyzable.
+
+  (Earlier versions let Claude rewrite tree_optimizer.py and evolve.py during a
+  periodic "review" and relaunch itself. That made runs non-deterministic and
+  impossible to reason about, so it was removed.)
 
 What it does:
-  1. Scans the project to build context
-  2. Launches Claude Code (headless) to set up the optimization infrastructure:
-       • Adds a headless render-to-image CLI flag to the project
-       • Creates tree_optimizer.py — the AI micro-optimization loop
-       • Creates OPTIMIZATION_NOTES.md with documented strategy
-  3. Owns and supervises tree_optimizer.py; restarts it automatically if it crashes
-  4. Every 30 minutes, pauses the loop and runs a Claude Code strategic review,
-     then restarts the loop
-  5. If Claude Code improves THIS script, relaunches it automatically
-  6. Monitors token usage and, if the 5-hour budget passes 95% or the weekly
-     budget passes 90%, comes to a stopping point and WAITS for the budget to
-     refresh, then resumes on its own — so you can truly walk away
+  1. Scans the project to build context (EVOLVE_CONTEXT.md).
+  2. ONE-TIME bootstrap (only if missing): launches Claude Code to add a headless
+     `--render-to-image` CLI to the TARGET app (Rust). The bootstrap may touch
+     ONLY the target source; any edit to a .py harness file is reverted.
+  3. Owns and supervises tree_optimizer.py — restarts it if it crashes, and emits
+     a fresh status snapshot every minute (to STATUS files and ~/Public) so you
+     can watch progress live from another account.
+  4. Monitors token usage; if the 5-hour budget passes 95% or the weekly budget
+     passes 90% it stops the optimizer, WAITS for the budget to refresh, then
+     resumes on its own — so you can walk away.
 
 Auth — NO API KEY NEEDED:
-  Every model call (the bootstrap/review sessions AND the inner optimization
-  loop) goes through the `claude` CLI, which uses your logged-in Claude Code
-  subscription / OAuth token. To make that guarantee airtight, this script
-  scrubs ANTHROPIC_API_KEY from every Claude Code subprocess's environment (see
-  FORCE_SUBSCRIPTION_AUTH) so it can never silently fall back to metered API
-  billing. Just make sure you're logged in first:  `claude` (then /login).
+  Every model call goes through the `claude` CLI on the logged-in Claude Code
+  subscription / OAuth token. ANTHROPIC_API_KEY is scrubbed from every child
+  process (FORCE_SUBSCRIPTION_AUTH) so it can never silently fall back to metered
+  API billing. Just be logged in first:  `claude`  then  /login.
 
 Requirements:
   • Claude Code installed & logged in:  npm install -g @anthropic-ai/claude-code
   • Python 3.8+   (no `anthropic` SDK, no API key)
+  • tree_optimizer.py present next to this file (it ships with evolve.py)
 
 Resumable: state is saved to evolve_state.json — re-run any time to continue.
 """
 
 import datetime
 import glob
-import hashlib
 import json
 import os
-import shutil
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -56,47 +63,47 @@ SCRIPT_PATH      = Path(__file__).resolve()
 STATE_FILE       = PROJECT_ROOT / "evolve_state.json"
 LOG_FILE         = PROJECT_ROOT / "evolve_log.txt"
 OPTIMIZER_SCRIPT = PROJECT_ROOT / "tree_optimizer.py"
-# We deliberately do NOT touch the project's own CLAUDE.md (it may hold
-# hand-authored project conventions). Our auto-generated context goes here, and
-# the prompts tell Claude Code to read both files.
+# We deliberately do NOT touch the project's own CLAUDE.md (it holds hand-authored
+# project conventions). Our auto-generated context goes here; prompts read both.
 EVOLVE_CONTEXT   = PROJECT_ROOT / "EVOLVE_CONTEXT.md"
-NOTES_FILE       = PROJECT_ROOT / "OPTIMIZATION_NOTES.md"  # living running-notes journal
+NOTES_FILE       = PROJECT_ROOT / "OPTIMIZATION_NOTES.md"  # owned by tree_optimizer.py
+OPT_STATE_FILE   = PROJECT_ROOT / "optimizer_state.json"   # inner loop's state (read-only here)
 
-BOOTSTRAP_TIMEOUT = 7200   # 2 hours — Claude Code sets up all infrastructure
-REVIEW_TIMEOUT    = 3600   # 1 hour  — periodic strategic review
-REVIEW_INTERVAL   = 1800   # run a review every 30 minutes
-MONITOR_INTERVAL  = 60     # health-check the optimizer every 60 seconds
+# Supervisor status mirrors (so the GUI account can watch from elsewhere).
+EVOLVE_STATUS    = PROJECT_ROOT / "EVOLVE_STATUS.md"
+PUBLIC_DIR       = Path.home() / "Public" / "planet-explorer"
+PUBLIC_SUPERVISOR = PUBLIC_DIR / "SUPERVISOR.md"
 
-# Model alias passed to `claude --model` for every session (outer + inner loop).
+# Harness files the bootstrap session must never modify. If it does, we restore
+# their exact bytes — "the harness never changes its own code".
+PROTECTED_FILES  = ("evolve.py", "tree_optimizer.py")
+
+BOOTSTRAP_TIMEOUT = 7200   # 2 hours — Claude Code adds the render CLI to the target
+MONITOR_INTERVAL  = 60     # health-check + write a status snapshot every 60 seconds
+STATUS_LINE_SECONDS = 120  # throttle the stdout/log status LINE (files update every tick)
+
+# Model alias passed to `claude --model` for the bootstrap session.
 CLAUDE_MODEL      = "opus"
 
-# Force Claude Code to authenticate via the logged-in subscription / OAuth token
-# by scrubbing ANTHROPIC_API_KEY from each child process's environment. This is
-# what makes "no API key needed" a guarantee rather than a hope: even if a key
-# is present in your shell, the model calls won't silently bill the metered API.
+# Force subscription / OAuth auth by scrubbing ANTHROPIC_API_KEY from each child
+# process. Makes "no API key needed" a guarantee, not a hope.
 FORCE_SUBSCRIPTION_AUTH = True
 
 # ── Token-budget monitoring ──────────────────────────────────────────────────
-# Reuses the claude-monitor technique (github.com/joelodom/claude-monitor): read
-# the Claude Code OAuth token and query the same usage endpoint that powers
-# `/usage`. When a window crosses its stop threshold we come to a stopping point,
-# stop the optimizer, and WAIT until the budget refreshes before resuming — so an
-# unattended run never blows through your limits. Querying usage costs no tokens.
+# Reads the Claude Code OAuth token and queries the same usage endpoint that
+# powers `/usage` (querying costs no tokens). When a window crosses its stop
+# threshold we stop the optimizer and WAIT until the budget refreshes.
 USAGE_URL          = "https://api.anthropic.com/api/oauth/usage"
 USAGE_HTTP_HEADERS = {
     "anthropic-version": "2023-06-01",
     "anthropic-beta":    "oauth-2025-04-20",
     "User-Agent":        "evolve.py",
 }
-# macOS Keychain services that may hold the Claude Code credentials (tried in
-# order); off macOS we fall back to the on-disk credentials file.
 KEYCHAIN_SERVICES  = ("Claude Code-credentials", "Claude Code", "claude.ai")
 CREDENTIALS_FILE   = Path.home() / ".claude" / ".credentials.json"
 
-# Pause-and-wait thresholds (utilization is a 0–100 percentage from the API).
 FIVE_HOUR_STOP_PCT = 95.0   # 5-hour rolling session budget
 WEEKLY_STOP_PCT    = 90.0   # 7-day budget (all-models, and per-model caps)
-# Windows we enforce → their stop threshold. Missing/null windows are ignored.
 ENFORCED_WINDOWS   = {
     "five_hour":      FIVE_HOUR_STOP_PCT,
     "seven_day":      WEEKLY_STOP_PCT,
@@ -107,7 +114,6 @@ WINDOW_SHORT_NAME  = {
 }
 BUDGET_POLL_SECONDS  = 300  # while paused, re-check at least this often (heartbeat)
 BUDGET_RESUME_BUFFER = 60   # wait this long past a reported reset before resuming
-STATUS_LOG_SECONDS   = 300  # throttle the idle "still alive" status line to this
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -132,7 +138,13 @@ def log(msg: str, level: str = "INFO") -> None:
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            st.setdefault("phase", "bootstrap")
+            st.setdefault("session", 0)
+            st.setdefault("best_score", 0.0)
+            st.setdefault("optimizer_pid", None)
+            st.setdefault("history", [])
+            return st
         except Exception as e:
             log(f"Could not load state ({e}), starting fresh.", "WARN")
     return {
@@ -140,7 +152,6 @@ def load_state() -> dict:
         "session":       0,
         "best_score":    0.0,
         "optimizer_pid": None,
-        "last_review":   None,
         "history":       [],
     }
 
@@ -153,22 +164,48 @@ def save_state(state: dict) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Self-modification detection
+# Harness-protection guard (the bootstrap may only edit the TARGET, never a .py)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def file_hash(path: Path) -> str:
+def snapshot_protected() -> dict:
+    out = {}
+    for rel in PROTECTED_FILES:
+        p = PROJECT_ROOT / rel
+        try:
+            out[rel] = p.read_bytes() if p.exists() else b""
+        except Exception:
+            out[rel] = b""
+    return out
+
+
+def restore_protected(snapshot: dict) -> None:
+    """Restore exact pre-session bytes of any harness file a session changed."""
+    for rel, original in snapshot.items():
+        p = PROJECT_ROOT / rel
+        try:
+            if (p.read_bytes() if p.exists() else b"") != original:
+                p.write_bytes(original)
+                log(f"Reverted out-of-scope edit to harness file: {rel}", "WARN")
+        except Exception as e:
+            log(f"Could not restore protected file {rel}: {e}", "ERROR")
+
+
+def render_harness_ready() -> bool:
+    """True once the TARGET app exposes the headless `--render-to-image` CLI.
+
+    This is the real gate for whether bootstrap is needed (robust to a reverted
+    working tree or a stale phase in state): we just look for the flag in src/.
+    """
+    src = PROJECT_ROOT / "src"
+    if not src.exists():
+        return False
     try:
-        return hashlib.md5(path.read_bytes()).hexdigest()
+        for p in src.rglob("*.rs"):
+            if "render-to-image" in p.read_text(encoding="utf-8", errors="ignore"):
+                return True
     except Exception:
-        return ""
-
-
-def relaunch_if_modified(original_hash: str, state: dict) -> None:
-    if file_hash(SCRIPT_PATH) != original_hash and original_hash:
-        log("evolve.py was modified — relaunching with updated script...")
-        save_state(state)
-        time.sleep(1)
-        os.execv(sys.executable, [sys.executable, str(SCRIPT_PATH)] + sys.argv[1:])
+        pass
+    return False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -184,7 +221,6 @@ def scan_project() -> str:
 
     lines = [f"Project root: {PROJECT_ROOT}", ""]
 
-    # Top-level structure
     lines.append("Top-level contents:")
     for p in sorted(PROJECT_ROOT.iterdir()):
         if p.name not in skip and not p.name.startswith("."):
@@ -192,7 +228,6 @@ def scan_project() -> str:
             lines.append(f"  {tag} {p.name}")
     lines.append("")
 
-    # Build system detection
     build_patterns = [
         "CMakeLists.txt", "Makefile", "makefile", "GNUmakefile",
         "*.sln", "*.vcxproj", "setup.py", "pyproject.toml",
@@ -206,7 +241,6 @@ def scan_project() -> str:
         lines.append(f"Build system files detected: {', '.join(found_build)}")
         lines.append("")
 
-    # Source file counts + tree-related file detection
     ext_labels = {
         ".cpp": "C++", ".cxx": "C++", ".cc": "C++",
         ".c":   "C",
@@ -217,6 +251,7 @@ def scan_project() -> str:
         ".go":  "Go",       ".swift": "Swift",
         ".hlsl": "HLSL shader", ".glsl": "GLSL shader",
         ".frag": "Fragment shader", ".vert": "Vertex shader",
+        ".wgsl": "WGSL shader",
     }
     counts: dict = {}
     tree_files = []
@@ -256,64 +291,49 @@ def scan_project() -> str:
         lines.append("")
 
     context = "\n".join(lines)
-
-    # Write EVOLVE_CONTEXT.md so Claude Code can pick up context. We do NOT
-    # overwrite the project's own CLAUDE.md — it may contain hand-authored
-    # conventions we must preserve. The prompts point Claude at both files.
     _write_evolve_context(context)
-
     return context
 
 
 def _write_evolve_context(context: str) -> None:
-    """Write/update EVOLVE_CONTEXT.md — referenced explicitly by our prompts."""
+    """Write/update EVOLVE_CONTEXT.md — referenced explicitly by the bootstrap prompt."""
     content = f"""# Autonomous Photorealism Optimizer — Context (auto-generated by evolve.py)
 
 This file is written by **evolve.py**. Do not hand-edit — it is regenerated each
 run. The project's own `CLAUDE.md` (if present) is authoritative for project
 conventions; always read it too and respect it.
 
-evolve.py is an autonomous optimization system that uses Claude Code to
-iteratively improve the photorealism of procedurally generated 3D objects.
-Currently focused on **trees**; future objects: rocks, vegetation, terrain.
+evolve.py + tree_optimizer.py form an autonomous loop that improves the
+photorealism of a procedurally generated object. Current focus: **broadleaf
+trees** (initial experiment). Future objects: other tree types, rocks,
+vegetation, terrain.
 
-## What You Are Doing
+## THE ONE RULE: the harness never changes its own code
 
-You have been invoked by evolve.py to either:
-- **Bootstrap**: build the optimization infrastructure (first run), OR
-- **Review**: inspect progress and make strategic improvements (subsequent runs)
-
-Read the specific task list in the prompt carefully.
+`evolve.py` and `tree_optimizer.py` are FIXED, human-maintained harness code.
+**You must NEVER modify them, or any other `.py` / `.md` / build file.** The only
+file the optimization is allowed to change is the **target tree source**
+(`src/flora.rs`). Anything you change outside the target is automatically
+reverted. If you think the optimizer itself should change, do NOT change it —
+instead it writes analyzable notes/logs (OPTIMIZATION_NOTES.md,
+optimizer_history.jsonl) that a human reads to improve it by hand.
 
 ## Auth — No API key
 
 Every model call goes through the `claude` CLI on the logged-in subscription /
-OAuth token. The inner loop (`tree_optimizer.py`) MUST also call the `claude`
-CLI in headless `-p` mode — never the Anthropic SDK and never ANTHROPIC_API_KEY.
-
-## Resilience — keep running notes
-
-This system runs for hours and may be interrupted (Ctrl-C, crash, reboot) at any
-moment, then resumed with `python evolve.py`. So treat `OPTIMIZATION_NOTES.md` as
-a durable running journal: write down what you are about to do BEFORE you do it,
-and the outcome AFTER, so a fresh session can read it and continue seamlessly
-without repeating work. Never leave the project in a half-broken state — keep the
-build green so an interrupted run can always resume from something that compiles.
+OAuth token. Never use the Anthropic SDK and never read ANTHROPIC_API_KEY.
 
 ## Evolve System Files
 
-| File | Purpose |
-|------|---------|
-| `evolve.py` | Orchestrator (this launched you) — you may update it |
-| `tree_optimizer.py` | AI micro-optimization loop (you create/maintain this) |
-| `OPTIMIZATION_NOTES.md` | Living strategy doc + running journal (you maintain this) |
-| `EVOLVE_CONTEXT.md` | This file — auto-generated context |
-| `evolve_state.json` | Orchestrator state |
-| `optimizer_state.json` | Inner loop state |
-| `evolve_log.txt` | Orchestrator log |
-| `optimizer_log.txt` | Per-iteration optimization log |
-| `snapshots/best/` | Source snapshot of best-scoring version |
-| `renders/best/` | Renders of best-scoring version |
+| File | Purpose | May you edit it? |
+|------|---------|------------------|
+| `evolve.py` | Orchestrator (launched you) | NO — never |
+| `tree_optimizer.py` | Inner optimization loop (ships fixed) | NO — never |
+| `OPTIMIZATION_NOTES.md` | Living journal (written by tree_optimizer.py) | NO |
+| `EVOLVE_CONTEXT.md` | This file (auto-generated) | NO |
+| `src/flora.rs` | The TARGET tree source | only this, and only in the inner loop |
+| `optimizer_state.json` / `evolve_state.json` | Loop / orchestrator state | NO |
+| `~/Public/planet-explorer/` | Timestamped samples + STATUS for another account | written by the loop |
 
 ## Project Scan (auto-generated)
 
@@ -326,377 +346,92 @@ build green so an interrupted run can always resume from something that compiles
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Prompts
+# Bootstrap prompt — adds ONLY the target render CLI (never the .py harness)
 # ──────────────────────────────────────────────────────────────────────────────
 
 BOOTSTRAP_PROMPT = """\
-You have been dropped into a procedural 3D object generator project. Your mission
-is to build an autonomous AI optimization infrastructure that will continuously
-improve the photorealism of generated objects — starting with trees.
-
-This system will run unattended for hours. You are building an engine, not a
-one-shot fix. Trees come first; the system is designed to eventually cover rocks,
-ground vegetation, terrain features, and other natural objects.
-
-It can be interrupted at ANY time (Ctrl-C, crash, reboot) and resumed later, so
-build for resumability: keep the build green, persist state to disk, and keep a
-running journal in OPTIMIZATION_NOTES.md (what you are about to do, then the
-outcome) so a fresh session can pick up exactly where this one left off.
-
-TOKEN BUDGET: evolve.py monitors usage and will STOP the optimizer when the
-5-hour or weekly budget is nearly exhausted, then restart it after the budget
-refreshes. So design tree_optimizer.py to be cheap per iteration and safe to
-stop at any point — every iteration must end in a green, saved, revertible
-state. Do NOT add your own budget logic; evolve.py owns that.
-
-Read CLAUDE.md (project conventions — authoritative, respect it) AND
-EVOLVE_CONTEXT.md (this system's context) in this directory before doing
-anything else. Do not modify or overwrite CLAUDE.md.
-
-AUTH — IMPORTANT: This whole system runs on a Claude Code subscription with NO
-API key. Do NOT use the Anthropic Python SDK, do NOT import `anthropic`, and do
-NOT read ANTHROPIC_API_KEY anywhere. Every model call — including the inner
-optimization loop's image scoring and code editing — must go through the
-`claude` command-line tool in headless mode (see Task 4).
+You are setting up a headless render path in a procedural 3D object generator so
+an external optimization loop can render its objects to images. This is a
+ONE-TIME, NARROW setup task — not an open-ended project.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-COMPLETE ALL TASKS IN ORDER
+STRICT SCOPE — THE HARNESS NEVER CHANGES ITS OWN CODE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  • You may edit ONLY the TARGET application source (the Rust code under `src/`,
+    and `Cargo.toml` if a new dependency is truly required).
+  • You must NEVER create or modify `evolve.py`, `tree_optimizer.py`, ANY `.py`
+    file, or `CLAUDE.md`. They are fixed harness/convention files. (Edits to them
+    are auto-reverted, so don't waste effort there.)
+  • Do NOT create tree_optimizer.py — it already exists and ships with the system.
+  • Do NOT start any optimization loop or long-running process. Set up the render
+    CLI, verify it once, and stop.
 
-TASK 1 — EXPLORE THE CODEBASE
-Thoroughly read the relevant source files. You must understand:
-  • Language(s), build system, exact commands to compile and run
-  • Where tree/vegetation generation lives: geometry, branching algorithm,
-    bark texture or shading, leaf/foliage placement, level-of-detail
-  • How the program currently renders or outputs geometry
-  • Existing CLI parameters
-Do not guess or infer — actually read the files.
+Read `CLAUDE.md` (project conventions — authoritative, respect it, do NOT modify
+it) AND `EVOLVE_CONTEXT.md` (this system's context) before doing anything else.
+Respect CLAUDE.md's rules — especially "no magic numbers" (named SCREAMING_SNAKE
+consts) and determinism (everything derives from the seed).
 
-TASK 2 — ADD HEADLESS RENDER-TO-IMAGE OUTPUT
-Add a CLI mode that renders a named procedural object to a PNG without
-opening any window. The interface to implement:
-
-    <program> --render-to-image --object tree --seed 42 \\
-              --yaw 45 --pitch 30 --output render.png \\
-              --width 512 --height 512
-
-  --object   object type identifier (tree, rock, bush, …)
-  --seed     integer seed for reproducible procedural generation
-  --yaw      camera horizontal angle in degrees
-  --pitch    camera vertical angle in degrees
-  --output   output PNG path
-  --width/--height  image size (default 512)
-
-Implementation by tech stack (choose the right one for this project):
-  C++/OpenGL  →  EGL offscreen context, or OSMesa software renderer
-  Python      →  trimesh + pyrender,  open3d,  or pyvista
-  No renderer →  export geometry to OBJ/PLY/glTF, render via Python helper
-  Unreal/Unity →  command-line render target or offscreen headless mode
-
-Run a test render after implementing and verify a valid, non-blank PNG is
-produced before moving on to Task 3.
-
-TASK 3 — CREATE OPTIMIZATION_NOTES.md
-A living document in the project root. Write it thoughtfully — it guides
-all future optimization. Include these exact sections, with Executive Summary
-FIRST so a human can review status at a glance:
-
-  ## Executive Summary
-  ALWAYS the very first section, kept current. 5–10 lines, plain language, for a
-  human skimming progress: current best photorealism score, whether the loop is
-  running or paused (and why, e.g. waiting on token budget), the one-sentence
-  current strategy, the most recent change and whether it helped, and the single
-  next step. Update this every time you touch the file.
-
-  ## Project Architecture
-  Key files, data flow, how the tree generation pipeline works end-to-end.
-
-  ## Build & Render Commands
-  Exact shell commands to build the project and produce a render.
-
-  ## Current Tree Quality Assessment
-  Your honest appraisal of what makes the current trees look non-photorealistic.
-  Be specific: uniform branching angles? flat shading? no bark texture variation?
-  perfect bilateral symmetry? missing secondary detail? no subsurface scattering?
-
-  ## Phase 1 Optimization Strategy
-  What to improve first and why. Name the specific algorithmic changes that
-  will have the most visible impact on photorealism. Be concrete.
-
-  ## Phase 2+ Strategy
-  What comes after Phase 1 for trees, and then the roadmap for:
-  rocks and stones, ground vegetation (grass/ferns/bushes),
-  terrain surface detail, and other natural environment objects.
-
-  ## Assumptions
-  Everything you inferred or could not verify directly from reading the code.
-
-  ## Running Journal  (resume-from-here)
-  A reverse-chronological log of sessions for crash/interrupt recovery. Append a
-  dated entry whenever you start or finish meaningful work: what you were doing,
-  what state things are in, and the single most useful "next step" so a fresh
-  session can resume instantly. Keep the newest entry at the top. Write the
-  "about to do X" line BEFORE doing X, and the outcome AFTER — that way an
-  interruption mid-task still leaves a breadcrumb.
-
-  ## Optimization Log
-  (Leave blank — tree_optimizer.py will append per-iteration entries here.)
-
-TASK 4 — CREATE tree_optimizer.py
-The autonomous micro-optimization loop. It runs the model ONLY by shelling out
-to the `claude` command-line tool in headless mode — NO Anthropic SDK, NO
-ANTHROPIC_API_KEY. Runs indefinitely until interrupted.
-
-  HOW TO CALL THE MODEL — a helper, used for BOTH scoring and code edits:
-
-    import os, subprocess
-    CLAUDE_MODEL = "opus"   # alias → latest Opus; uses the subscription login
-
-    def claude_env():
-        # Force the logged-in subscription / OAuth token; never the metered API.
-        env = dict(os.environ)
-        env.pop("ANTHROPIC_API_KEY", None)
-        env.pop("ANTHROPIC_AUTH_TOKEN", None)
-        return env
-
-    def run_claude(prompt, timeout):
-        # Headless one-shot. Claude Code can Read PNGs (vision) and Edit files
-        # itself, so we let it do the work directly rather than parsing replies.
-        cmd = ["claude", "-p", prompt,
-               "--model", CLAUDE_MODEL,
-               "--dangerously-skip-permissions"]
-        return subprocess.run(cmd, cwd=".", env=claude_env(), timeout=timeout,
-                              capture_output=True, text=True)
-
-  Find the `claude` binary the same way evolve.py does (PATH, then ~/.local/bin,
-  /opt/homebrew/bin, etc.) and fail loudly with a clear message if it is missing.
-
-  STATE FILE: optimizer_state.json
-    {
-      "iteration": 0,
-      "best_score": 0.0,
-      "best_snapshot": "snapshots/best/",
-      "stagnation_count": 0,
-      "current_strategy": "<your strategy from Tasks 1 & 3>",
-      "tried_changes": [],
-      "tree_source_files": ["<files found in Task 1>"],
-      "build_command": "<exact build command>",
-      "render_command": "<exact render command from Task 2>",
-      "history": []
-    }
-  On startup: if optimizer_state.json exists, load it and resume from the best
-  known state (restore files from snapshots/best/ if it exists). Make every step
-  resumable — assume the process can die at any instant and be re-run.
-
-  LOOP — repeat forever:
-
-  1. RENDER
-     Produce 4 PNGs at varied random yaw, pitch, and seed values.
-     Save as renders/current/render_0.png … render_3.png.
-
-  2. SCORE  (one headless `claude` session — it reads the images itself)
-     Call run_claude(...) with a prompt that tells it to READ the four files
-     renders/current/render_0.png … render_3.png and rate each on photorealism:
-       "Read these four PNGs of a procedurally generated tree and rate EACH on
-        photorealism from 0 to 100:
-        0–20 = 1990s video-game quality; 21–40 = basic 3D, obviously synthetic;
-        41–60 = decent CGI; 61–80 = good modern game quality;
-        81–100 = photorealistic, indistinguishable from a photograph.
-        Write ONLY valid JSON (no markdown fences) to the file
-        renders/current/scores.json:
-        {\\"scores\\": [n0,n1,n2,n3],
-          \\"critiques\\": [\\"x\\",\\"y\\",\\"z\\"],
-          \\"top_improvement\\": \\"<single most impactful algorithmic change>\\"}"
-     Then read renders/current/scores.json. composite_score = mean of scores.
-     If the file is missing/invalid, retry once, then skip the iteration.
-
-  3. MODIFY  (one headless `claude` session — it edits the files directly)
-     Call run_claude(...) with a prompt that includes:
-       • The list of tree_source_files (paths) — let Claude Read them itself
-       • composite_score + the critiques and top_improvement from scores.json
-       • current_strategy and tried_changes from state
-       • Last 5 entries from history
-     Instruct it to make ONE specific, surgical change directly via its Edit
-     tool that targets the most impactful issue, keep the change minimal, and
-     write a one-line summary of what it changed to renders/current/change.txt.
-     Read change.txt and append it to tried_changes.
-     (Because Claude edits in place, snapshot BEFORE this step — see step 4.)
-
-  4. SNAPSHOT-THEN-APPLY ordering
-     BEFORE step 3, back up all tree_source_files to snapshots/iteration_N/.
-     Step 3 applies the change in place. This ordering is what makes revert
-     in step 7 possible.
-
-  5. BUILD
-     Run the build command. Capture stdout+stderr.
-     On failure: restore from snapshots/iteration_N/, log BUILD_FAILED, and run
-     another MODIFY session noting "previous change caused a build error, here
-     is the compiler output, try a different approach." After 3 consecutive
-     build failures, do a mini-strategy review before retrying. NEVER leave the
-     tree broken — a reverted/green tree must be the resting state of every
-     iteration so an interrupt can always resume from something that compiles.
-
-  6. RE-RENDER & RE-SCORE
-     Same angles and seeds as step 1. Same scoring method (step 2).
-
-  7. COMPARE
-     new_score > best_score:
-       copy current files → snapshots/best/
-       copy renders       → renders/best/
-       update best_score, reset stagnation_count = 0
-       log: IMPROVEMENT  (old_score → new_score, +delta)
-     new_score ≤ best_score:
-       restore tree_source_files from snapshots/iteration_N/
-       stagnation_count += 1
-       log: NO_IMPROVEMENT  (delta, description of what was tried)
-
-  8. STAGNATION CHECK  (stagnation_count ≥ 5)
-     Run a `claude` session with the last 10 history entries and ask:
-       "My photorealism optimization strategy has stalled. Here are the recent
-        attempts. Propose a fundamentally different strategy — a new algorithmic
-        aspect to focus on, or a completely different approach. Be specific and
-        actionable. Write it to renders/current/strategy.txt."
-     Read strategy.txt → current_strategy, clear tried_changes, reset
-     stagnation_count = 0. Log: STRATEGY_UPDATE with the new strategy.
-
-  9. LOG & ITERATE
-     Append to optimizer_log.txt:
-       [TIMESTAMP] ITER N | score: X.X → Y.Y (Δ+/-Z.Z) | KEPT/REVERTED/FAILED
-       Tried: <one-line description>
-       Strategy: <first 100 chars of current_strategy>
-     Also append a short dated line to the Running Journal in
-     OPTIMIZATION_NOTES.md (newest at top) so progress survives interruption,
-     and refresh the Executive Summary at the top (best score, last change and
-     whether it helped, next step).
-     Trim history to last 50 entries. Save state after EVERY iteration (write to
-     a temp file and rename, so a crash mid-write can't corrupt it). Sleep 2s.
-
-  ERROR HANDLING (subprocess-based — no anthropic exceptions exist here)
-    `claude` returns a non-zero exit code or times out:
-      log a warning, sleep 30s, retry the same step up to 3×, then skip the
-      iteration and continue. Do not exit the loop for a single failed session.
-    scores.json / change.txt / strategy.txt missing or invalid:
-      retry the session once, else skip the iteration.
-    KeyboardInterrupt:
-      save state, print summary (iterations, best score), sys.exit(0)
-    Build failure:
-      revert files, log BUILD_FAILED, continue loop
-    Any other Exception:
-      log full traceback, revert any pending change, continue loop
-
-TASK 5 — INSTALL, VERIFY (DO NOT LEAVE IT RUNNING)
-  Install only what the RENDER step needs (e.g. `pip install Pillow` if you use
-  it). Do NOT install `anthropic` and do NOT require ANTHROPIC_API_KEY.
-  Confirm the `claude` CLI is on PATH and that a trivial `claude -p "say OK"`
-  session succeeds (this proves subscription auth works) — if not, stop and
-  write the problem to OPTIMIZATION_NOTES.md.
-  Run one dry render to confirm the render pipeline works end-to-end, then run
-  ONE full iteration of tree_optimizer.py to prove the loop works
-  (render → score → modify → build → re-score → compare → log).
-  IMPORTANT: do NOT leave tree_optimizer.py running in the background. evolve.py
-  owns the optimizer process lifecycle and will launch and supervise it after
-  you finish. Just verify it works, then stop it.
-
-TASK 6 — OPTIONALLY UPDATE evolve.py
-  evolve.py is the orchestrator that launched you. It lives at the project root.
-  If you find improvements — better prompts, smarter project scanning, better
-  phase or review logic — edit it. It detects modifications and relaunches
-  itself automatically, so your improvements take effect on the next cycle.
+AUTH — IMPORTANT: NO API key. Do NOT use the Anthropic SDK, do NOT import
+`anthropic`, do NOT read ANTHROPIC_API_KEY. (The optimization loop calls the
+`claude` CLI itself; you don't need to wire that up.)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PERMISSIONS: Read, create, modify, or delete any file. Run any shell command.
-Install Python packages with pip. Make concrete, working changes — not outlines,
-not stubs. Every task should leave the project in a measurably better state.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-
-
-def build_review_prompt(state: dict) -> str:
-    # Pull best score from optimizer_state.json if it's been updated
-    opt_state_path = PROJECT_ROOT / "optimizer_state.json"
-    best_score = state.get("best_score", 0.0)
-    if opt_state_path.exists():
-        try:
-            opt = json.loads(opt_state_path.read_text(encoding="utf-8"))
-            best_score = opt.get("best_score", best_score)
-            state["best_score"] = best_score
-        except Exception:
-            pass
-
-    history_lines = []
-    for h in state.get("history", [])[-10:]:
-        history_lines.append(
-            f"  Session {h.get('session','?')}: phase={h.get('phase','?')} "
-            f"at {str(h.get('ts',''))[:19]}"
-        )
-    history_block = (
-        "\nRECENT EVOLVE SESSIONS:\n" + "\n".join(history_lines)
-        if history_lines else ""
-    )
-
-    return f"""\
-You are doing a periodic strategic review of an ongoing autonomous photorealism
-optimization. Read CLAUDE.md (project conventions — respect them) AND
-EVOLVE_CONTEXT.md (this system's context) in this directory first. Do not modify
-CLAUDE.md.
-
-AUTH: subscription only. Do not use the Anthropic SDK or ANTHROPIC_API_KEY; the
-inner loop must keep calling the `claude` CLI in headless mode (see Task 4 of
-the original bootstrap). If you find any SDK/API-key usage, convert it.
-
-PROCESS OWNERSHIP: evolve.py exclusively owns the tree_optimizer.py process. It
-has ALREADY STOPPED the optimizer for the duration of this review and will
-restart it the moment you finish — so you can edit the tree source and
-tree_optimizer.py freely without racing a running loop. Do NOT start, background,
-or `python tree_optimizer.py` yourself; just leave it stopped and in a green,
-buildable state.
-
-CURRENT STATUS
-  Evolve session:  {state['session']}
-  Best score:      {best_score:.1f} / 100
-  Current focus:   trees
-{history_block}
-
 TASKS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. READ THE CURRENT STATE
-   • optimizer_log.txt (last 50 lines)  — recent iteration outcomes
-   • optimizer_state.json               — current score, strategy, stagnation
-   • OPTIMIZATION_NOTES.md             — documented strategy and findings
-   • The tree source files              — see the current state of the code
+TASK 1 — EXPLORE
+  Read the relevant target source. Understand the build command, how the object
+  geometry (trees/vegetation) is generated, how the program currently renders,
+  and the existing CLI parsing. Do not guess — read the files.
 
-2. DIAGNOSE
-   Is tree_optimizer.py making measurable progress?
-   Is it stuck in stagnation or looping on build failures?
-   Is the scoring rubric producing useful, discriminating feedback?
-   Is the modification strategy targeting the right parts of the code?
-   Are there recurring errors in the log?
+TASK 2 — ADD A HEADLESS `--render-to-image` CLI TO THE TARGET APP
+  Implement EXACTLY this interface (the optimizer depends on it verbatim):
 
-3. MAKE CONCRETE IMPROVEMENTS — at least one of:
-   • Fix crashes or recurring build failures in tree_optimizer.py
-   • Improve the modification strategy if stagnated
-   • Refine the vision scoring prompt for better discrimination
-   • Add new tree source files to the optimization scope if they were missed
-   • Try a fundamentally different algorithmic angle if deeply stagnated
+      <program> --render-to-image --object broadleaf --seed 42 \\
+                --yaw 45 --pitch 30 --output render.png \\
+                --width 512 --height 512
 
-4. LEAVE THE BUILD GREEN
-   Whatever you change, end with a tree that compiles and renders. Do NOT start
-   tree_optimizer.py — evolve.py restarts it automatically when you finish.
+    --object   object kind to render. MUST support at least "broadleaf" (a
+               broadleaf tree). Also support a generic "tree" and the other plant
+               forms if cheap, but "broadleaf" is REQUIRED — the current
+               experiment renders broadleaf trees specifically.
+    --seed     integer seed for reproducible procedural generation
+    --yaw      camera horizontal angle in degrees
+    --pitch    camera vertical angle in degrees
+    --output   output PNG path
+    --width / --height   image size in pixels (default 512)
 
-5. UPDATE OPTIMIZATION_NOTES.md
-   Refresh the Executive Summary at the very top (current best score, running vs
-   paused, one-line strategy, last change + whether it helped, next step), and
-   append a dated entry to BOTH the Running Journal (newest at top: what you
-   found, what you changed, the single best next step) and the Optimization Log,
-   noting the current best score. This is the resume point if the run is
-   interrupted before the next review.
+  It must render ONE standalone object (framed to fill the view) to a PNG with NO
+  window/GPU surface — a true offscreen/headless path — then exit before any
+  windowing code. Reuse the project's real shaders/lighting so the look matches
+  the app. Keep determinism: a given (object, seed) must always produce the same
+  mesh. Keep the existing app behavior unchanged when the flag is absent.
 
-6. OPTIONALLY UPDATE evolve.py
-   If you see improvements to the orchestration logic (prompt quality,
-   project scanning, review frequency, etc.), go ahead and update it.
-   It will relaunch itself automatically after modification.
+  This is a Rust + wgpu project: add an offscreen render-to-texture path (no
+  winit surface), parse the flag in main before the event loop, and write the PNG
+  (a `png`/image encoder). Put the standalone-object mesh builder next to the
+  existing vegetation/flora code so "broadleaf" maps to the existing broadleaf
+  form. Add named consts for any new tuning values (no magic numbers).
 
-Make real, concrete changes. Leave everything better than you found it.
+TASK 3 — VERIFY ONCE, THEN STOP
+  Build (release) and run ONE render to a temp PNG, e.g.:
+      <build the project in release>
+      <program> --render-to-image --object broadleaf --seed 42 \\
+                --yaw 45 --pitch 30 --output /tmp/render_test.png \\
+                --width 512 --height 512
+  Confirm it exits 0 and writes a valid, non-blank PNG. Then STOP — do not loop,
+  do not start tree_optimizer.py. evolve.py launches and supervises the optimizer
+  after you finish.
+
+  If you cannot make a valid render work, leave the build GREEN and write a short
+  explanation of the blocker to OPTIMIZATION_NOTES.md (create it if absent) so a
+  human can pick it up. Never leave the project in a non-compiling state.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PERMISSIONS: read/modify the TARGET source under src/ (and Cargo.toml if needed),
+run shell commands, build the project. Make concrete, working changes — not stubs.
+Do NOT touch any .py file or CLAUDE.md. Leave the build green.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 
@@ -716,21 +451,14 @@ def find_claude() -> Optional[str]:
     ]
     for pattern in candidates:
         expanded = os.path.expanduser(pattern)
-        matches = glob.glob(expanded)
-        for path in matches:
+        for path in glob.glob(expanded):
             if os.path.isfile(path) and os.access(path, os.X_OK):
                 return path
     return None
 
 
 def claude_env() -> dict:
-    """Environment for Claude Code subprocesses.
-
-    When FORCE_SUBSCRIPTION_AUTH is set we strip ANTHROPIC_API_KEY (and
-    ANTHROPIC_AUTH_TOKEN) so Claude Code authenticates via the logged-in
-    subscription / OAuth token and can never silently fall back to metered API
-    billing. This is the mechanism behind "no API key needed".
-    """
+    """Environment for Claude Code subprocesses — scrubs API keys for subscription auth."""
     env = dict(os.environ)
     if FORCE_SUBSCRIPTION_AUTH:
         env.pop("ANTHROPIC_API_KEY", None)
@@ -739,12 +467,7 @@ def claude_env() -> dict:
 
 
 def preflight_auth() -> bool:
-    """Verify the `claude` CLI exists and the subscription login works.
-
-    Catches the common walk-away failure (not logged in) up front, before we
-    burn into a multi-hour bootstrap. A trivial headless prompt round-trips the
-    auth path; success means the subscription / OAuth token is good.
-    """
+    """Verify the `claude` CLI exists and the subscription login works."""
     claude = find_claude()
     if not claude:
         log("claude CLI not found. Install + log in: "
@@ -780,43 +503,30 @@ def run_claude_code(prompt: str, timeout: int, label: str) -> Tuple[str, int]:
         return "", 127
 
     session_log = PROJECT_ROOT / f".evolve_session_{label}.log"
-
-    # Full tool access (Bash/Read/Write/Edit/Glob/Grep/…); permission prompts are
-    # skipped for unattended operation. We do NOT pass --allowedTools — narrowing
-    # it would block search tools the bootstrap/review sessions rely on.
     cmd = [
         claude,
         "-p", prompt,                      # -p = non-interactive print mode
         "--model", CLAUDE_MODEL,
         "--dangerously-skip-permissions",  # skip confirmation prompts (unattended)
     ]
-
     log(f"▶ Claude Code '{label}' | model: {CLAUDE_MODEL} | "
         f"prompt: {len(prompt):,} chars | timeout: {timeout//60}m")
-
     try:
         with open(session_log, "w", encoding="utf-8") as out_f:
             result = subprocess.run(
-                cmd,
-                cwd=str(PROJECT_ROOT),
-                stdout=out_f,
-                stderr=subprocess.STDOUT,
-                timeout=timeout,
-                env=claude_env(),
+                cmd, cwd=str(PROJECT_ROOT), stdout=out_f,
+                stderr=subprocess.STDOUT, timeout=timeout, env=claude_env(),
             )
         output = session_log.read_text(encoding="utf-8") if session_log.exists() else ""
         log(f"◼ Session '{label}' done | rc={result.returncode} | {len(output):,} chars output")
         return output, result.returncode
-
     except subprocess.TimeoutExpired:
         output = session_log.read_text(encoding="utf-8") if session_log.exists() else ""
         log(f"⏱ Session '{label}' timed out after {timeout}s", "WARN")
         return output, -1
-
     except FileNotFoundError:
         log(f"Command not found: {claude}", "ERROR")
         return "", 127
-
     except Exception as exc:
         log(f"Error in Claude Code session: {exc}", "ERROR")
         return "", -1
@@ -838,50 +548,43 @@ def process_alive(pid) -> bool:
 
 def ensure_optimizer_running(state: dict) -> dict:
     if not OPTIMIZER_SCRIPT.exists():
-        return state  # Not created yet — bootstrap will handle it
+        log("tree_optimizer.py is missing. It is fixed harness code that ships next "
+            "to evolve.py — restore it before continuing.", "ERROR")
+        return state
 
     pid = state.get("optimizer_pid")
     if process_alive(pid):
-        return state  # Already running fine
+        return state
 
     log("Starting tree_optimizer.py...")
     try:
         out = open(PROJECT_ROOT / "tree_optimizer_stdout.log", "a", encoding="utf-8")
         proc = subprocess.Popen(
             [sys.executable, str(OPTIMIZER_SCRIPT)],
-            cwd=str(PROJECT_ROOT),
-            stdout=out,
-            stderr=subprocess.STDOUT,
+            cwd=str(PROJECT_ROOT), stdout=out, stderr=subprocess.STDOUT,
             env=claude_env(),  # subscription auth flows down to the inner loop too
         )
         state["optimizer_pid"] = proc.pid
         log(f"tree_optimizer.py started (PID {proc.pid})")
     except Exception as exc:
         log(f"Could not start tree_optimizer.py: {exc}", "WARN")
-
     return state
 
 
 def stop_optimizer(state: dict) -> dict:
-    """Stop the optimizer and wait for it to exit.
-
-    evolve.py is the sole owner of this process. We pause it during a strategic
-    review so the review session can edit the tree source without racing a
-    running loop, then restart it afterwards.
-    """
+    """Stop the optimizer and wait for it to exit (used by the budget gate)."""
     pid = state.get("optimizer_pid")
     if not process_alive(pid):
         state["optimizer_pid"] = None
         return state
 
-    log(f"Pausing tree_optimizer.py (PID {pid}) for review...")
+    log(f"Stopping tree_optimizer.py (PID {pid})...")
     try:
         os.kill(int(pid), signal.SIGTERM)
     except (OSError, ValueError, TypeError) as exc:
         log(f"Could not signal optimizer PID {pid}: {exc}", "WARN")
 
-    # Wait up to ~10s for a graceful exit, then SIGKILL.
-    for _ in range(20):
+    for _ in range(20):  # up to ~10s for a graceful exit, then SIGKILL
         if not process_alive(pid):
             break
         time.sleep(0.5)
@@ -901,7 +604,6 @@ def stop_optimizer(state: dict) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _find_access_token(obj) -> Optional[str]:
-    """Recursively pull the first `accessToken` string out of parsed JSON."""
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k == "accessToken" and isinstance(v, str) and v:
@@ -926,12 +628,10 @@ def _extract_token(raw: str) -> Optional[str]:
         tok = (data.get("claudeAiOauth") or {}).get("accessToken") if isinstance(data, dict) else None
         return tok or _find_access_token(data)
     except Exception:
-        # The stored value might be the bare token itself.
         return raw if raw.startswith("sk-ant-oat") else None
 
 
 def _oauth_token() -> Optional[str]:
-    """Locate the Claude Code OAuth token (macOS Keychain, else credentials file)."""
     if sys.platform == "darwin":
         for svc in KEYCHAIN_SERVICES:
             try:
@@ -963,13 +663,7 @@ def _parse_reset(ts) -> Optional[datetime.datetime]:
 
 
 def fetch_usage() -> Optional[dict]:
-    """Query the usage endpoint. Returns parsed JSON, or None on any failure.
-
-    Prefers `curl` (uses the OS trust store — dodges the common "Python has no CA
-    bundle" SSL failure, and matches how claude-monitor queries it). The bearer
-    token is passed via a stdin config file, never on the argv, so it can't leak
-    through `ps`. Falls back to urllib where curl is unavailable.
-    """
+    """Query the usage endpoint. Returns parsed JSON, or None on any failure."""
     token = _oauth_token()
     if not token:
         return None
@@ -977,7 +671,6 @@ def fetch_usage() -> Optional[dict]:
 
     curl = shutil.which("curl")
     if curl:
-        # curl config read from stdin (-K -): keeps the token out of argv.
         cfg_lines = [f'url = "{USAGE_URL}"']
         cfg_lines += [f'header = "{k}: {v}"' for k, v in headers.items()]
         try:
@@ -1005,13 +698,7 @@ def fetch_usage() -> Optional[dict]:
 
 
 def budget_status() -> Tuple[bool, str, Optional[datetime.datetime]]:
-    """Check enforced windows.
-
-    Returns (over_budget, human_summary, resume_at). resume_at is the soonest
-    reset among breached windows (None if unknown). Fails OPEN — if usage can't
-    be read we report "not over budget" so a monitoring glitch never deadlocks
-    the run (degrade, don't panic).
-    """
+    """Check enforced windows. Fails OPEN if usage can't be read (degrade, don't panic)."""
     data = fetch_usage()
     if not isinstance(data, dict):
         return False, "usage unavailable", None
@@ -1033,11 +720,7 @@ def budget_status() -> Tuple[bool, str, Optional[datetime.datetime]]:
 
 
 def wait_for_budget(state: dict) -> dict:
-    """If over budget, stop the optimizer and block until the budget refreshes.
-
-    Always records the latest budget summary in state['budget'] so the status
-    line can show it without a second query. Returns when back under budget.
-    """
+    """If over budget, stop the optimizer and block until the budget refreshes."""
     over, summary, resume_at = budget_status()
     state["budget"] = summary
     if not over:
@@ -1061,6 +744,7 @@ def wait_for_budget(state: dict) -> dict:
         secs = max(60.0, min(secs, float(BUDGET_POLL_SECONDS)))
         log(f"Paused for token budget ({summary}); soonest reset ~{eta}. "
             f"Re-checking in {int(secs)}s. Ctrl+C to stop.")
+        write_status(state, note=f"PAUSED for token budget ({summary}); reset ~{eta}")
         time.sleep(secs)
 
         over, summary, resume_at = budget_status()
@@ -1073,97 +757,138 @@ def wait_for_budget(state: dict) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Status snapshot — written every health-check tick to files + ~/Public
+# ──────────────────────────────────────────────────────────────────────────────
+
+def read_optimizer_progress():
+    """Read the inner loop's progress: (generation, last_verdict, loss_streak).
+
+    generation = number of KEPT A/B improvements (the progress metric). None if the
+    optimizer hasn't written state yet.
+    """
+    if OPT_STATE_FILE.exists():
+        try:
+            d = json.loads(OPT_STATE_FILE.read_text(encoding="utf-8"))
+            return d.get("generation"), d.get("last_verdict", ""), d.get("loss_streak")
+        except Exception:
+            return None, "", None
+    return None, "", None
+
+
+def write_status(state: dict, note: str = "") -> None:
+    """Refresh the supervisor status (EVOLVE_STATUS.md + ~/Public/SUPERVISOR.md)."""
+    pid = state.get("optimizer_pid")
+    alive = process_alive(pid)
+    gen, verdict, streak = read_optimizer_progress()
+    gen_txt = (f"{gen} kept improvement{'s' if gen != 1 else ''}"
+               if gen is not None else "n/a (no head-to-head yet)")
+    opt_status = f"RUNNING (PID {pid})" if alive else ("PAUSED" if state.get("paused") else "NOT RUNNING")
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    body = (
+        f"# evolve.py — supervisor status\n\n"
+        f"_Updated {ts}_\n\n"
+        f"- **Optimizer:** {opt_status}\n"
+        f"- **Progress (generation):** {gen_txt}\n"
+        f"- **Last head-to-head:** {verdict or 'n/a'}"
+        f"{f' (losing streak {streak})' if streak else ''}\n"
+        f"- **Token budget:** {state.get('budget', 'n/a')}\n"
+        f"- **Bootstrap:** {'done (render CLI present)' if render_harness_ready() else 'pending'}\n"
+        f"{('- **Note:** ' + note + chr(10)) if note else ''}"
+        f"\nThe inner loop writes the detailed A/B status and labeled before/after sample "
+        f"PNGs to this same `~/Public/planet-explorer/` folder "
+        f"(`STATUS.md`, `latest/`, `broadleaf_<timestamp>_*_A_best.png` / `_B_cand.png`).\n"
+    )
+    for target in (EVOLVE_STATUS, PUBLIC_SUPERVISOR):
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
+            os.chmod(target, 0o644)
+        except Exception:
+            pass
+    try:
+        os.chmod(PUBLIC_DIR, 0o755)
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Initial README
 # ──────────────────────────────────────────────────────────────────────────────
 
 _README = """\
 # Autonomous Photorealism Optimizer
 
-An AI-driven system that continuously improves the photorealism of procedurally
-generated 3D objects. Drop `evolve.py` in the project root and run it once.
+An AI-driven loop that continuously improves the photorealism of a procedurally
+generated 3D object. Current experiment: **broadleaf trees**. Drop `evolve.py`
+and its sibling `tree_optimizer.py` in the project root and run `python evolve.py`.
+
+## The one rule: the harness never changes its own code
+
+`evolve.py` and `tree_optimizer.py` are **fixed, human-maintained** code. A run
+never edits them and never edits itself — the ONLY file an optimization run
+changes is the target tree source (`src/flora.rs`). Anything a model session
+touches outside the target is auto-reverted. To improve the optimizer, you read
+the notes/logs it leaves and edit the scripts by hand. This keeps every run
+reproducible and analyzable.
 
 ## Architecture
 
 ```
-python evolve.py               ← run once; keeps running in the background
+python evolve.py                ← orchestrator (fixed); supervises + budget-gates
   │
-  ├─ Claude Code (bootstrap)   ← reads the codebase, adds render-to-image CLI,
-  │                               creates tree_optimizer.py, writes strategy docs
+  ├─ Claude Code (bootstrap)    ← ONE-TIME, only if missing: adds a headless
+  │                                `--render-to-image` CLI to the TARGET app.
+  │                                May edit ONLY target source, never any .py.
   │
-  └─ tree_optimizer.py         ← the continuous inner loop:
-                                  render → score with Claude vision (via claude CLI)
-                                  → modify by letting Claude Code edit the source
-                                  → rebuild → compare → keep or revert
+  └─ tree_optimizer.py          ← fixed inner A/B loop. Each iteration:
+        A = current best tree, B = a new candidate the model just wrote
+        → render A and B over the SAME fixed panel of seeds/angles (paired)
+        → a JUDGE picks the more PHOTOREALISTIC of each A/B pair (no rubric —
+          the AI decides what "better" is), order randomized to kill bias
+        → B replaces A only if it wins the panel by a vote margin; else revert
+        → the judge's written reason becomes FEEDBACK for the next rewrite, so
+          the model iterates on real visual signal plus its own creative ideas
+        → every few kept wins, re-judge the best vs the ORIGINAL (cumulative proof)
 ```
 
-Every model call — bootstrap, review, and the inner loop's scoring and code
-edits — goes through the `claude` CLI on your **Claude Code subscription**.
-**No `ANTHROPIC_API_KEY` and no `anthropic` SDK are required or used.**
+## Why the loop is built this way
+
+We don't tell the model what a tree should look like, and we don't score on an
+absolute rubric — an earlier absolute-scoring run re-scored the *same* tree from
+24.5 to 28.5 and could never tell a real change from noise, so every attempt was
+reverted. A direct "which of these two looks more like a real photo?" comparison
+is far more reliable. The loop keeps a change only when the candidate wins the
+paired panel by a margin, carries the judge's reasoning forward as feedback, and
+periodically checks the best against the original so progress is cumulative, not
+just local. Every vote and reason is logged (`optimizer_history.jsonl`).
+
+## Watching it from another account
+
+Every iteration drops timestamped sample renders + a `STATUS.md` into
+`~/Public/planet-explorer/` (world-readable), and the supervisor refreshes
+`SUPERVISOR.md` there every minute. Open that folder from your GUI account to
+watch the trees evolve live. Locally: `optimizer_log.txt`, `OPTIMIZATION_NOTES.md`.
 
 ## Token Budget — Auto Pause / Resume
 
-evolve.py monitors usage via the same endpoint that powers Claude Code's
-`/usage` (it reads your OAuth token; the query itself costs no tokens). When the
-**5-hour** budget passes **95%** or the **weekly** budget passes **90%**, it
-comes to a stopping point — stops the optimizer — and **waits until the budget
-refreshes**, then resumes automatically. The current `OPTIMIZATION_NOTES.md`
-**Executive Summary** (top of file) always reflects status at a glance.
-
-## Object Roadmap
-
-- [x] **Trees** — current focus
-- [ ] Rocks & stones
-- [ ] Ground vegetation (grass, ferns, bushes)
-- [ ] Terrain surface features
-
-## Key Files Created by This System
-
-| File | Description |
-|------|-------------|
-| `tree_optimizer.py` | AI optimization loop (created on first run) |
-| `OPTIMIZATION_NOTES.md` | Strategy docs (created on first run) |
-| `evolve_state.json` | Orchestrator state — delete to start fresh |
-| `optimizer_state.json` | Inner loop state, best score, history |
-| `evolve_log.txt` | Orchestrator log |
-| `optimizer_log.txt` | Per-iteration optimization log |
-| `snapshots/best/` | Source of the highest-scoring version so far |
-| `renders/best/` | Renders of the best version |
-
-## Monitoring
-
-```bash
-tail -f optimizer_log.txt      # live iteration feed
-cat optimizer_state.json       # current best score and strategy
-ls renders/best/               # renders of the best version
-cat OPTIMIZATION_NOTES.md     # Claude's documented strategy
-```
-
-## Resuming After a Stop / Interruption
-
-The system is built to be interrupted (Ctrl-C, crash, reboot) and resumed. State
-is saved continuously to `evolve_state.json` / `optimizer_state.json`, and Claude
-keeps a human-readable running journal in `OPTIMIZATION_NOTES.md` (newest entry
-on top) so a fresh session can see exactly where it left off. Simply re-run:
-```bash
-python evolve.py
-```
+evolve.py reads your OAuth token to query the same usage endpoint that powers
+`/usage` (the query costs no tokens). When the **5-hour** budget passes **95%** or
+the **weekly** budget passes **90%**, it stops the optimizer and **waits for a
+refresh**, then resumes automatically.
 
 ## Requirements
 
-- Claude Code installed **and logged in** to your subscription:
-  `npm install -g @anthropic-ai/claude-code`, then run `claude` once and `/login`.
-- Python 3.8+ (no `anthropic` SDK, no `ANTHROPIC_API_KEY` — it runs entirely on
-  your Claude Code subscription / OAuth token).
+- Claude Code installed **and logged in**: `npm install -g @anthropic-ai/claude-code`,
+  then run `claude` once and `/login`.
+- Python 3.8+ (no `anthropic` SDK, no `ANTHROPIC_API_KEY`).
+- `tree_optimizer.py` present next to `evolve.py` (ships with it).
 """
 
 
 def write_readme() -> None:
     readme = PROJECT_ROOT / "README_EVOLVE.md"
-    if readme.exists():
-        return
     try:
         readme.write_text(_README, encoding="utf-8")
-        log("Created README_EVOLVE.md")
     except Exception as exc:
         log(f"Could not write README_EVOLVE.md: {exc}", "WARN")
 
@@ -1179,132 +904,90 @@ def main() -> None:
 
     write_readme()
 
+    # Harness integrity: tree_optimizer.py ships with evolve.py; we never generate it.
+    if not OPTIMIZER_SCRIPT.exists():
+        log("tree_optimizer.py is missing. It is fixed harness code that must ship "
+            "next to evolve.py. Restore it and re-run.", "ERROR")
+        sys.exit(1)
+
     if not preflight_auth():
         log("Aborting: Claude Code is not ready. Fix auth and re-run.", "ERROR")
         sys.exit(1)
 
-    original_hash = file_hash(SCRIPT_PATH)
     state = load_state()
-    log(f"Phase: {state['phase']} | Session: {state['session']} | "
-        f"Best score: {state['best_score']:.1f}/100")
+    log(f"Phase: {state['phase']} | Session: {state['session']}")
 
     log("Scanning project and writing EVOLVE_CONTEXT.md...")
-    _context = scan_project()
+    scan_project()
 
-    # ── Bootstrap phase ───────────────────────────────────────────────────────
-    if state["phase"] == "bootstrap":
-        state = wait_for_budget(state)  # don't start a 2h bootstrap if already capped
-        log("Bootstrap — Claude Code will set up the optimization infrastructure.")
-        log(f"This may take up to {BOOTSTRAP_TIMEOUT // 60} minutes. "
-            "Output is being logged.")
+    # ── One-time bootstrap: add the render CLI to the TARGET if it's not there ──
+    # Gate on the actual capability (flag present in src/), not just stored phase —
+    # robust to a reverted working tree.
+    if not render_harness_ready():
+        state = wait_for_budget(state)  # don't start a long bootstrap if already capped
+        log("Bootstrap — adding the headless --render-to-image CLI to the target app.")
+        log(f"This may take up to {BOOTSTRAP_TIMEOUT // 60} minutes. Output is logged.")
+        write_status(state, note="bootstrap running (adding render CLI to target)")
 
+        protected = snapshot_protected()
         _, rc = run_claude_code(BOOTSTRAP_PROMPT, BOOTSTRAP_TIMEOUT, "bootstrap")
+        restore_protected(protected)  # the harness never changes its own code
 
         state["session"] += 1
         state["history"].append({
-            "session": state["session"],
-            "phase":   "bootstrap",
-            "rc":      rc,
-            "ts":      datetime.datetime.now().isoformat(),
+            "session": state["session"], "phase": "bootstrap",
+            "rc": rc, "ts": datetime.datetime.now().isoformat(),
         })
         state["phase"] = "optimize"
         save_state(state)
 
-        relaunch_if_modified(original_hash, state)
-        original_hash = file_hash(SCRIPT_PATH)
+        if not render_harness_ready():
+            log("Bootstrap finished but no --render-to-image CLI is present in src/. "
+                "Cannot render → cannot optimize. Check .evolve_session_bootstrap.log "
+                "and OPTIMIZATION_NOTES.md, then re-run.", "ERROR")
+            sys.exit(1)
+        log("Bootstrap complete — render CLI present.")
+    else:
+        state["phase"] = "optimize"
+        log("Render CLI already present — skipping bootstrap.")
 
-        state = ensure_optimizer_running(state)
-        # Count the bootstrap as the first "review" so we don't immediately run a
-        # heavy strategic review on top of a just-finished 2-hour bootstrap.
-        state["last_review"] = datetime.datetime.now().isoformat()
-        save_state(state)
-        log("Bootstrap complete. Entering optimization supervision loop.")
-
-    # ── Optimization supervision loop ─────────────────────────────────────────
-    log(f"Supervision active — reviews every {REVIEW_INTERVAL // 60}m, "
-        f"health checks every {MONITOR_INTERVAL}s")
+    # ── Supervision loop (no strategic review; the harness never self-edits) ───
+    log(f"Supervision active — health check + status every {MONITOR_INTERVAL}s. "
+        "Samples + status go to ~/Public/planet-explorer/.")
     log("Press Ctrl+C to stop gracefully.\n")
 
-    last_review = None
-    if state.get("last_review"):
-        try:
-            last_review = datetime.datetime.fromisoformat(state["last_review"])
-        except Exception:
-            pass
-
-    last_status_at = None  # for throttling the idle status line
-
+    last_status_line_at = None
     while True:
         try:
-            # Token-budget gate: if we're over the 5h/weekly limit this stops the
-            # optimizer and blocks here until the budget refreshes, then returns.
+            # Budget gate: stops the optimizer and blocks here if over the 5h/weekly
+            # limit, returning once the budget refreshes.
             state = wait_for_budget(state)
 
-            # Health check
+            # Health check + status snapshot (files + ~/Public) every tick.
             state = ensure_optimizer_running(state)
+            write_status(state)
             save_state(state)
 
             now = datetime.datetime.now()
-            elapsed = (now - last_review).total_seconds() if last_review else REVIEW_INTERVAL + 1
-
-            if elapsed >= REVIEW_INTERVAL:
-                log(f"Strategic review #{state['session'] + 1} starting...")
-
-                # Pause the optimizer so the review can edit the tree source and
-                # tree_optimizer.py without racing a running loop.
-                state = stop_optimizer(state)
-                save_state(state)
-
-                prompt = build_review_prompt(state)
-                original_hash = file_hash(SCRIPT_PATH)
-
-                _, rc = run_claude_code(
-                    prompt, REVIEW_TIMEOUT, f"review_{state['session'] + 1}"
-                )
-
-                now = datetime.datetime.now()
-                state["session"] += 1
-                state["last_review"] = now.isoformat()
-                last_review = now
-                state["history"].append({
-                    "session": state["session"],
-                    "phase":   "review",
-                    "rc":      rc,
-                    "ts":      now.isoformat(),
-                })
-                if len(state["history"]) > 100:
-                    state["history"] = state["history"][-100:]
-                save_state(state)
-
-                relaunch_if_modified(original_hash, state)
-                original_hash = file_hash(SCRIPT_PATH)
-
-                # Restart the optimizer (the review may have modified it).
-                state = ensure_optimizer_running(state)
-                save_state(state)
-
-            else:
-                # Throttle the routine "still alive" line so stdout stays
-                # readable over a long unattended run (transitions — reviews,
-                # restarts, budget pauses — are always logged as they happen).
-                now_mono = datetime.datetime.now()
-                if last_status_at is None or \
-                   (now_mono - last_status_at).total_seconds() >= STATUS_LOG_SECONDS:
-                    mins_left = int((REVIEW_INTERVAL - elapsed) // 60)
-                    pid = state.get("optimizer_pid")
-                    status = f"PID {pid} ✓" if process_alive(pid) else "NOT RUNNING ✗"
-                    log(f"Optimizer: {status} | "
-                        f"Next review: ~{mins_left}m | "
-                        f"Best: {state['best_score']:.1f}/100 | "
-                        f"Tokens: {state.get('budget', 'n/a')}")
-                    last_status_at = now_mono
+            if last_status_line_at is None or \
+               (now - last_status_line_at).total_seconds() >= STATUS_LINE_SECONDS:
+                pid = state.get("optimizer_pid")
+                status = f"PID {pid} ✓" if process_alive(pid) else "NOT RUNNING ✗"
+                gen, verdict, _ = read_optimizer_progress()
+                gen_txt = f"{gen} kept" if gen is not None else "n/a"
+                log(f"Optimizer: {status} | Generation: {gen_txt} | "
+                    f"Tokens: {state.get('budget', 'n/a')}")
+                last_status_line_at = now
 
             time.sleep(MONITOR_INTERVAL)
 
         except KeyboardInterrupt:
             log("\nStopped by user.")
             save_state(state)
-            log(f"State saved. Best score so far: {state['best_score']:.1f}/100")
+            write_status(state, note="stopped by user")
+            gen, _, _ = read_optimizer_progress()
+            log(f"State saved. Improvements kept so far: {gen}" if gen is not None
+                else "State saved.")
             log("Run 'python evolve.py' to resume.")
             sys.exit(0)
 

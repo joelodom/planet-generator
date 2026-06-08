@@ -42,10 +42,17 @@ ENV/
 .ruff_cache/
 
 # ── evolve.py autonomous-optimizer runtime artifacts ──
-# State, logs, snapshots, and renders the optimizer regenerates each run.
+# State, logs, snapshots, renders, and generated docs the optimizer regenerates
+# each run. The harness CODE (evolve.py, tree_optimizer.py) is tracked; everything
+# it produces at runtime is not.
 EVOLVE_CONTEXT.md
+README_EVOLVE.md
+OPTIMIZATION_NOTES.md
+OPTIMIZER_STATUS.md
+EVOLVE_STATUS.md
 evolve_state.json
 optimizer_state.json
+optimizer_history.jsonl
 evolve_log.txt
 optimizer_log.txt
 tree_optimizer_stdout.log
