@@ -21,23 +21,30 @@ technique, then proves it with a head-to-head:
 
   A = the current best tree.   B = the candidate this iteration produces.
   1. RENDER A over a FIXED PANEL of seeds/angles (paired, same camera).
-  2. CRITIQUE + RESEARCH: a session reads A's renders, names the single biggest
-     remaining photorealism weakness, and uses real WebSearch/WebFetch to find a
-     PROVEN procedural-foliage technique that fixes it within this renderer's
-     limits (geometry + vertex color only — no textures/shaders), writing an
-     implementation plan with cited sources. This is the key step: ideation is
-     grounded in the large body of online work (SpeedTree, space colonization,
-     L-systems, phyllotaxis, …) instead of the model guessing unaided.
-  3. IMPLEMENT: a second session applies that ONE technique to src/flora.rs → B.
-  4. RENDER B over the same panel; a JUDGE picks the MORE PHOTOREALISTIC of each
+  2. CRITIQUE + RESEARCH: a session reads A's renders AND the LEARNINGS file,
+     names the single biggest remaining photorealism weakness, and uses real
+     WebSearch/WebFetch to find a PROVEN procedural-foliage technique that fixes
+     it within this renderer's limits (geometry + vertex color only — no
+     textures/shaders), writing a plan with cited sources. Ideation is grounded in
+     the large body of online work (SpeedTree, space colonization, L-systems,
+     phyllotaxis, …) AND in what prior iterations discovered empirically.
+  3. IMPLEMENT: a second session reads the LEARNINGS file and the research plan,
+     then applies that ONE technique to src/flora.rs → B.
+  4. SELF-CRITIQUE: a quick pass/fail gate looks at A and B renders and asks "is
+     B an obvious regression?" Only obvious failures are filtered here (bias is
+     strongly toward pass); this saves judge tokens and adds a failure reason to
+     LEARNINGS so the loop does not repeat the same mistake.
+  5. RENDER B over the same panel; a JUDGE picks the MORE PHOTOREALISTIC of each
      pair (no rubric; the AI decides what "better" is; order randomized to cancel
      position bias). B replaces A only if it wins by VOTE_MARGIN net votes.
-  5. The judge's written reason feeds the NEXT round's research.
+  6. LEARNINGS.md is updated with the technique, vote, judge reason, and
+     self-critique result. This is the persistent knowledge base: the RESEARCH and
+     IMPLEMENT sessions read it next round to avoid repeating failures.
 
-So: current state → render → feedback+research → implement → render → A/B keep-or-
-revert → (the feedback drives the next research). Periodically the best is also
-judged against the ORIGINAL (the "anchor") to prove cumulative — not just local —
-progress.
+So: state → render → critique+research (reads learnings) → implement (reads
+learnings) → render → self-critique → A/B judge → keep-or-revert → update
+learnings → (repeat). Periodically the best is also judged against the ORIGINAL
+(the "anchor") to prove cumulative — not just local — progress.
 
 Why A/B instead of absolute scores: an earlier absolute-scoring run re-scored the
 *same* tree from 24.5 to 28.5 and could never tell a real change from noise — so
@@ -121,19 +128,22 @@ ANCHOR_EVERY = 5
 BOLD_STREAK = 3
 
 # ── Model / sessions ─────────────────────────────────────────────────────────
-CLAUDE_MODEL     = "opus"  # alias → latest Opus on the subscription login
-RESEARCH_TIMEOUT = 720     # seconds for one critique+web-research planning session
-IMPLEMENT_TIMEOUT = 600    # seconds for one code-implementation session
-JUDGE_TIMEOUT    = 300     # seconds for one A/B judging session
-CLAUDE_RETRIES   = 3       # attempts per model session before giving up the step
+CLAUDE_MODEL          = "opus"  # alias → latest Opus on the subscription login
+RESEARCH_TIMEOUT      = 720    # seconds for one critique+web-research planning session
+IMPLEMENT_TIMEOUT     = 600    # seconds for one code-implementation session
+SELF_CRITIQUE_TIMEOUT = 180    # seconds for the quick B self-eval pass/fail gate
+JUDGE_TIMEOUT         = 300    # seconds for one A/B judging session
+CLAUDE_RETRIES        = 3      # attempts per model session before giving up the step
 RETRY_SLEEP    = 30       # seconds between model retries
 SKIP_SLEEP     = 30       # seconds to wait after skipping an iteration (avoid a hot loop)
 ITER_SLEEP     = 2        # seconds between successful iterations
 
 # ── Housekeeping ─────────────────────────────────────────────────────────────
-HISTORY_KEEP   = 60   # iteration history / tried-changes entries retained in state
-JOURNAL_KEEP   = 40   # running-journal entries retained in the notes file
-SNAPSHOT_KEEP  = 8    # per-iteration source snapshots retained on disk
+HISTORY_KEEP     = 60   # iteration history / tried-changes entries retained in state
+JOURNAL_KEEP     = 40   # running-journal entries retained in the notes file
+SNAPSHOT_KEEP    = 8    # per-iteration source snapshots retained on disk
+LEARNINGS_KEEP   = 30   # max entries in the persistent learnings file (oldest pruned)
+LEARNINGS_IN_PROMPT = 10  # how many recent learnings entries to inline into prompts
 BUILD_FAIL_NOTE = "the previous change did not COMPILE"
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -146,6 +156,7 @@ SNAPSHOTS     = PROJECT_ROOT / "snapshots"
 A_DIR         = RENDERS / "current_best"   # renders of A (current best)
 B_DIR         = RENDERS / "candidate"      # renders of B (candidate)
 RESEARCH_PLAN = RENDERS / "research_plan.md"  # latest critique + researched technique + sources
+LEARNINGS_FILE = PROJECT_ROOT / "LEARNINGS.md"  # persistent cross-iteration knowledge base
 ANCHOR_DIR    = RENDERS / "anchor"         # renders of the original tree
 ANCHOR_CMP_DIR = RENDERS / "anchor_current"  # current-best renders for the anchor check
                                              # (separate dir so A_DIR stays valid for publish)
@@ -377,6 +388,62 @@ def _tally(data, orient, a_panel):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Self-critique — quick pass/fail gate between implement and the full judge
+# ──────────────────────────────────────────────────────────────────────────────
+
+def self_critique(a_panel, b_panel, out_path: Path):
+    """Quick pass/fail gate: is B an obvious regression vs A, or worth a full judge eval?
+
+    Returns {"verdict": "pass"|"fail", "reason": str} or None on session failure.
+    None is treated as pass so infrastructure failure never blocks a real improvement.
+    Biases strongly toward pass — only filters unambiguous regressions (broken
+    geometry, massive color loss, clearly flatter than A) to save judge tokens.
+    Its reason is stored in LEARNINGS.md so the loop learns from filtered failures.
+    """
+    if not a_panel or not b_panel or len(a_panel) != len(b_panel):
+        return None
+    listing_a = "\n".join(f"  A{i}: {p}" for i, (p, _) in enumerate(a_panel))
+    listing_b = "\n".join(f"  B{i}: {p}" for i, (p, _) in enumerate(b_panel))
+    if out_path.exists():
+        try:
+            out_path.unlink()
+        except Exception:
+            pass
+    example = '{"verdict": "pass" or "fail", "reason": "<one sentence why>"}'
+    prompt = (
+        "You are a QUICK QUALITY GATE for a procedural tree photorealism optimizer.\n\n"
+        "CURRENT BEST (A) renders:\n" + listing_a + "\n\n"
+        "CANDIDATE (B) renders — a modified version of A:\n" + listing_b + "\n\n"
+        "Each image is an offscreen render of a procedurally generated 3D broadleaf tree "
+        "(geometry + vertex color only, no textures). A and B use identical camera angles; "
+        "only the geometry and vertex colors differ.\n\n"
+        "TASK: is B an OBVIOUS REGRESSION — clearly and unambiguously worse than A in a way "
+        "any observer would immediately agree on (e.g. broken/missing geometry, degenerate "
+        "canopy, severe color loss across all views, clearly more flat/uniform where A had "
+        "visible depth)? Or is B worth a full judge evaluation (comparable, ambiguous, or "
+        "plausibly better in any respect)?\n\n"
+        "BIAS STRONGLY toward 'pass'. Return 'fail' ONLY if B is obviously, unambiguously "
+        "worse. When in doubt — even slight doubt — return 'pass'.\n\n"
+        f"Write ONLY valid JSON (no markdown fences) to:\n  {out_path}\nSchema: {example}"
+    )
+    if run_claude(prompt, SELF_CRITIQUE_TIMEOUT, "self_critique") and out_path.exists():
+        try:
+            txt = out_path.read_text(encoding="utf-8", errors="ignore").strip()
+            txt = re.sub(r"^```[a-zA-Z]*", "", txt).strip()
+            txt = re.sub(r"```$", "", txt).strip()
+            data = json.loads(txt)
+            v = str(data.get("verdict", "pass")).strip().lower()
+            if v not in ("pass", "fail"):
+                v = "pass"
+            return {"verdict": v, "reason": str(data.get("reason", "")).strip()}
+        except Exception as exc:
+            log(f"self_critique: JSON parse error ({exc}); defaulting to pass", "WARN")
+            return {"verdict": "pass", "reason": "parse error — defaulting to pass"}
+    log("self_critique: session failed; defaulting to pass", "WARN")
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Code-rewrite session — feedback-driven, NON-prescriptive (model decides "better")
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -396,12 +463,20 @@ def research(state, a_panel, plan_path: Path):
     tried = state.get("tried_changes", [])[-15:]
     tried_block = "\n".join(
         f"  - [{t.get('result','?')}] {t.get('desc','')}" for t in tried) or "  (none yet)"
+    learnings = _recent_learnings()
+    learnings_block = (
+        "Accumulated cross-iteration learnings (newest first — use these to understand what "
+        "has already been tried, what renderer constraints were discovered, and what the judge "
+        "consistently responds to; do NOT propose anything already attempted):\n\n"
+        + learnings + "\n\n"
+    ) if learnings else ""
     prompt = (
         "You are improving the photorealism of a procedurally generated BROADLEAF tree in a Rust + wgpu "
         "renderer. In THIS step you do NOT write code — you CRITIQUE the current tree, RESEARCH a proven "
         "technique to fix its biggest flaw, and write an implementation plan for the next step to follow.\n\n"
         f"Renders of the CURRENT tree (read them):\n{listing}\n\n"
         + (f"Most recent A/B judge feedback on it:\n\"\"\"\n{fb}\n\"\"\"\n\n" if fb else "")
+        + learnings_block
         + "Techniques already tried (newest last — do NOT repeat these; note that color/shading tweaks "
         "have been heavily explored, so favor the highest-impact remaining weakness even if it is "
         "STRUCTURAL and harder):\n" + tried_block + "\n\n"
@@ -457,6 +532,13 @@ def implement(state, plan, change_path: Path) -> bool:
     streak = state.get("loss_streak", 0)
     nudge = ("You have lost several head-to-heads in a row — make a bolder, materially different change.\n\n"
              if streak >= BOLD_STREAK else "")
+    learnings = _recent_learnings()
+    learnings_block = (
+        "Cross-iteration learnings (read BEFORE implementing — these record what has been tried, "
+        "what the judge responded to, self-critique failures, and renderer constraints discovered "
+        "empirically; avoid repeating anything that has failed):\n\n"
+        + learnings + "\n\n"
+    ) if learnings else ""
     prompt = (
         "You are improving a procedurally generated BROADLEAF tree in a Rust + wgpu renderer so it looks "
         f"MORE photorealistic. Implement ONE concrete change in `{SRC_TARGET}`.\n\n"
@@ -469,7 +551,7 @@ def implement(state, plan, change_path: Path) -> bool:
         "remove existing RNG draws — add new draws only at the END of a builder, or derive from existing "
         "values); stay under 30k verts/species; lighting/shaders are fixed, so work in geometry & vertex "
         "color.\n\n"
-        + guidance + nudge +
+        + learnings_block + guidance + nudge +
         "Make the change minimal, self-contained, green, and faithful to the planned TECHNIQUE. Then write "
         f"to `{change_path}` a ONE-LINE plain-text summary naming the technique and what you changed."
     )
@@ -764,16 +846,20 @@ This optimizer is **fixed harness code**: neither `tree_optimizer.py` nor
 - **`~/Public/planet-explorer/`** — labeled A (best) vs B (candidate) sample PNGs +
   a per-iteration `.md` (researched technique + sources + judge feedback) + `STATUS.md`.
 
-**The method — research-driven A/B:** each iteration (1) renders the current best,
-(2) a CRITIQUE+RESEARCH session reads those renders, names the biggest remaining
-weakness, and uses real WebSearch/WebFetch to find a PROVEN procedural-foliage
-technique that fits this renderer (geometry + vertex color only), writing a plan
-with sources; (3) an IMPLEMENT session applies that ONE technique to `src/flora.rs`;
-(4) the candidate is rendered and a JUDGE picks the more photorealistic of each
-paired view (no rubric; order randomized to cancel position bias). B replaces A only
-if it wins by `VOTE_MARGIN` net votes. The judge's reason feeds the NEXT round's
-research. Every `ANCHOR_EVERY` kept improvements the best is judged against the
-ORIGINAL to confirm cumulative progress.
+**The method — research-driven A/B with self-critique and learnings:** each iteration
+(1) renders the current best; (2) a CRITIQUE+RESEARCH session reads those renders
+AND `LEARNINGS.md`, names the biggest remaining weakness, and uses real
+WebSearch/WebFetch to find a PROVEN procedural-foliage technique that fits this
+renderer (geometry + vertex color only), writing a plan with sources; (3) an
+IMPLEMENT session reads `LEARNINGS.md` and applies that ONE technique to
+`src/flora.rs`; (4) a SELF-CRITIQUE quick gate asks "is B an obvious regression?"
+and filters unambiguous failures before spending judge tokens; (5) the candidate is
+rendered and a JUDGE picks the more photorealistic of each paired view (no rubric;
+order randomized to cancel position bias); (6) `LEARNINGS.md` is updated with the
+technique, vote, and judge's key finding — the persistent cross-iteration knowledge
+base. B replaces A only if it wins by `VOTE_MARGIN` net votes. Every `ANCHOR_EVERY`
+kept improvements the best is judged against the ORIGINAL to confirm cumulative
+progress.
 
 Tuning: if real wins keep getting rejected, lower `VOTE_MARGIN` or add panel views;
 if the research keeps proposing the same thing, it's in `tried_changes` — check the
@@ -831,6 +917,87 @@ def append_jsonl(record):
             f.write(json.dumps(record) + "\n")
     except Exception as exc:
         log(f"could not append jsonl: {exc}", "WARN")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Persistent knowledge base — LEARNINGS.md
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _learnings_header() -> str:
+    return (
+        "# Tree Optimizer — Accumulated Learnings\n\n"
+        "Maintained by `tree_optimizer.py`. Accumulates structured knowledge across "
+        "iterations so RESEARCH and IMPLEMENT sessions can avoid repeating failed "
+        "approaches and build on what has worked. Newest entries first.\n"
+    )
+
+
+def _read_learnings_entries():
+    """Return (header_str, [entry_str, ...]) from LEARNINGS.md, newest-first."""
+    if not LEARNINGS_FILE.exists():
+        return _learnings_header(), []
+    try:
+        content = LEARNINGS_FILE.read_text(encoding="utf-8")
+    except Exception:
+        return _learnings_header(), []
+    parts = re.split(r'\n(?=### Iter )', content)
+    header = parts[0] if parts else _learnings_header()
+    entries = [p.strip() for p in parts[1:] if p.strip()]
+    return header, entries
+
+
+def _recent_learnings(n: int = LEARNINGS_IN_PROMPT) -> str:
+    """Return the N most recent LEARNINGS.md entries as a block, or '' if none."""
+    _, entries = _read_learnings_entries()
+    if not entries:
+        return ""
+    return "\n\n".join(entries[:n])
+
+
+def update_learnings(iteration: int, generation: int, change_desc: str,
+                     verdict, kept: bool, plan: str = "", sc_result=None) -> None:
+    """Prepend one structured entry to LEARNINGS.md; prune oldest beyond LEARNINGS_KEEP.
+
+    Called after every evaluation (kept, rejected, build-failed, or self-critique
+    filtered) so the file accumulates a full history of what worked and why.
+    """
+    outcome = "KEPT ✅" if kept else "REJECTED ↩"
+    if verdict:
+        vote_str = f"B {verdict['b_votes']}–{verdict['a_votes']} A (ties {verdict['ties']})"
+        judge_note = (verdict["reason"] or "").strip()[:400]
+    else:
+        vote_str = "no judge verdict"
+        judge_note = ""
+    sc_line = ""
+    if sc_result:
+        sc_line = f"**Self-critique:** {sc_result['verdict'].upper()} — {sc_result['reason']}\n"
+    plan_line = ""
+    if plan:
+        lines = plan.strip().splitlines()
+        for i, ln in enumerate(lines):
+            if ln.startswith("## Technique") and i + 1 < len(lines):
+                tech = lines[i + 1].strip()
+                if tech:
+                    plan_line = f"**Research technique:** {tech}\n"
+                    break
+        if not plan_line:
+            plan_line = f"**Research:** {' '.join(plan.split())[:180]}\n"
+    entry = (
+        f"### Iter {iteration} (gen {generation}) — {outcome}\n"
+        f"**Technique:** {change_desc}\n"
+        f"{plan_line}"
+        f"**Vote:** {vote_str}\n"
+        f"**Judge's key finding:** {judge_note or '(no judge verdict)'}\n"
+        f"{sc_line}"
+    )
+    header, entries = _read_learnings_entries()
+    entries.insert(0, entry)
+    entries = entries[:LEARNINGS_KEEP]
+    content = header.rstrip() + "\n\n" + "\n\n".join(entries)
+    try:
+        LEARNINGS_FILE.write_text(content, encoding="utf-8")
+    except Exception as exc:
+        log(f"could not update LEARNINGS.md: {exc}", "WARN")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1040,6 +1207,7 @@ def run_iteration(state: dict) -> dict:
         state["last_verdict"] = "build failed"
         log(f"ITER {it}: BUILD_FAILED — reverted. {change_desc}", "WARN")
         rec = _record(it, change_desc, False, "BUILD_FAILED", None, reverted, plan)
+        update_learnings(it, state["generation"], change_desc, None, False, plan or "")
         _finish(state, rec, change_desc, kept=False)
         return state
 
@@ -1050,6 +1218,18 @@ def run_iteration(state: dict) -> dict:
         state["loss_streak"] += 1
         log(f"ITER {it}: candidate render incomplete; reverted", "WARN")
         time.sleep(SKIP_SLEEP)
+        return state
+
+    # 3b. SELF-CRITIQUE: quick pass/fail gate before spending full judge tokens.
+    #     Errs toward pass — only filters unambiguous regressions.
+    sc_result = self_critique(a_panel, b_panel, B_DIR / "self_critique.json")
+    if sc_result is not None and sc_result["verdict"] == "fail":
+        restore_from(snap)
+        state["loss_streak"] += 1
+        log(f"ITER {it}: SELF-CRITIQUE rejected B (saved judge tokens) — {sc_result['reason']}")
+        rec = _record(it, change_desc, True, "SELF_CRITIQUE_REJECTED", None, reverted, plan)
+        update_learnings(it, state["generation"], change_desc, None, False, plan or "", sc_result)
+        _finish(state, rec, change_desc, kept=False)
         return state
 
     # 4. A/B JUDGE (no rubric; randomized order; per-view vote + a written reason).
@@ -1097,6 +1277,7 @@ def run_iteration(state: dict) -> dict:
         state["anchor"]["since_check"] = 0
 
     rec = _record(it, change_desc, True, "KEPT" if kept else "REJECTED", verdict, reverted, plan)
+    update_learnings(it, state["generation"], change_desc, verdict, kept, plan or "")
     _finish(state, rec, change_desc, kept)
     publish(it, state["generation"], a_panel, b_panel, verdict, kept, change_desc, anchor_note, plan)
     return state
