@@ -102,6 +102,22 @@ _(none)_
 
 ## Low
 
+- [ ] **Seasons — different parts of the planet in different seasons at once.**
+  Drive a per-sample seasonal state from latitude + hemisphere (and an axial-tilt /
+  time-of-year phase), so at any instant the two hemispheres sit in opposite seasons
+  and the equator stays roughly aseasonal — the way a real planet looks from space.
+  Season then modulates the *appearance* layers that already exist: foliage
+  hue/value (deciduous greens → autumn golds/reds → bare/sparse winter), the snow
+  line (`classify()`'s `SNOW_BASE`/`SNOW_TEMP_RANGE` push equatorward in local
+  winter), and grassland/tundra colour. Keep it **deterministic** — derive the
+  year-phase from the seed (and, if it should animate, from the same time source the
+  water/wind use), never from wall-clock; biome *classification* should stay stable
+  (seasons recolour and adjust the snow line, they don't re-roll the world). Prefer a
+  shader-side tint/snow-line shift (no new memory) over regenerating chunks. New
+  tuning (tilt angle, season→colour ramps, snow-line swing) must be named consts per
+  the no-magic-numbers rule. Effort: **M–L**. _(Stacks on the day/night terminator and
+  the flora colour work — same shading layer, same determinism constraints.)_
+
 - [ ] **Flora photoreal leap — leaf-card textures + impostors + MSAA.** The only flora
   items that add (fixed, preset-gated) VRAM: alpha-tested **leaf-card** clusters + a
   small bark/leaf atlas (Pool C +5–50 MB) for lacy canopy silhouettes; **vegetation
