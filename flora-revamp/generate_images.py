@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Generate photorealistic reference plates for the P0 flora/object targets.
+"""Generate photorealistic reference plates for the P0/P1 flora/object targets.
 
 Pipeline context: these PNGs are the *reference images* fed to ../formcast to
 produce 3D models that replace Planet Explorer's procedural flora. See
-FLORA_MODEL_TARGETS.md for the full catalogue; this script covers only the
-**P0** items (the prompts below are copied verbatim from that doc's
-"Image-Generator Prompt" column).
+FLORA_MODEL_TARGETS.md for the full catalogue; this script covers the **P0** and
+**P1** items (the prompts below are copied verbatim from that doc's
+"Image-Generator Prompt" column). Each item carries its priority so you can
+generate one tier at a time with --priority.
 
 It calls OpenAI's **GPT Image 2** (`gpt-image-2`) — the current best image model
 (reasoning/"thinking mode", up to 4K) — via the synchronous Images API. The call
@@ -19,10 +20,11 @@ environment variable if already set.
 Usage:
     pip install openai
     # key lives in flora-revamp/.env as: OPENAI_API_KEY=sk-...
-    python flora-revamp/generate_images.py             # generate any MISSING P0 plates
-    python flora-revamp/generate_images.py --force      # regenerate ALL P0 plates
-    python flora-revamp/generate_images.py --only columnar-cactus   # just one
-    python flora-revamp/generate_images.py --list       # list item ids and exit
+    python flora-revamp/generate_images.py                  # any MISSING plate (P0+P1)
+    python flora-revamp/generate_images.py --priority P1     # only the P1 plates
+    python flora-revamp/generate_images.py --force           # regenerate ALL plates
+    python flora-revamp/generate_images.py --only barrel-cactus  # just one
+    python flora-revamp/generate_images.py --list            # list item ids and exit
 """
 
 from __future__ import annotations
@@ -70,9 +72,11 @@ _RECIPE = (
     "no text, no people, no watermark."
 )
 
+# --- P0: highest visual payoff (the iconic form of each dominant biome) ---
 ITEMS = [
     {
         "id": "granite-boulder",
+        "priority": "P0",
         "size": SIZE_SQUARE,
         "prompt": (
             "A single weathered grey granite boulder, rounded by glaciation with "
@@ -81,6 +85,7 @@ ITEMS = [
     },
     {
         "id": "broadleaf-hardwood",
+        "priority": "P0",
         "size": SIZE_PORTRAIT,
         "prompt": (
             "A single mature deciduous hardwood tree with a dense rounded full green "
@@ -90,6 +95,7 @@ ITEMS = [
     },
     {
         "id": "spreading-oak",
+        "priority": "P0",
         "size": SIZE_SQUARE,
         "prompt": (
             "A single large mature oak tree with a broad irregular spreading crown, a "
@@ -99,6 +105,7 @@ ITEMS = [
     },
     {
         "id": "spruce-spire-conifer",
+        "priority": "P0",
         "size": SIZE_PORTRAIT,
         "prompt": (
             "A single tall narrow spruce tree, steeply conical with a pointed top and "
@@ -108,6 +115,7 @@ ITEMS = [
     },
     {
         "id": "tropical-emergent-tree",
+        "priority": "P0",
         "size": SIZE_PORTRAIT,
         "prompt": (
             "A single towering rainforest kapok tree with a tall straight pale trunk "
@@ -117,6 +125,7 @@ ITEMS = [
     },
     {
         "id": "feather-frond-palm",
+        "priority": "P0",
         "size": SIZE_PORTRAIT,
         "prompt": (
             "A single tall coconut palm with a slender slightly curved trunk topped by "
@@ -125,6 +134,7 @@ ITEMS = [
     },
     {
         "id": "bunchgrass-tussock",
+        "priority": "P0",
         "size": SIZE_SQUARE,
         "prompt": (
             "A single dense tussock of tall bunchgrass, fine arching golden-green "
@@ -133,6 +143,7 @@ ITEMS = [
     },
     {
         "id": "savanna-acacia",
+        "priority": "P0",
         "size": SIZE_SQUARE,
         "prompt": (
             "A single umbrella acacia tree with a clear trunk and a high wide "
@@ -142,10 +153,218 @@ ITEMS = [
     },
     {
         "id": "columnar-cactus",
+        "priority": "P0",
         "size": SIZE_PORTRAIT,
         "prompt": (
             "A single tall saguaro cactus, a ribbed green column with two raised "
             "curving arms and rows of spines along the ridges, whole plant shown."
+            + _RECIPE
+        ),
+    },
+    # --- P1: variety + realism (build after the P0 layer reads well) -------
+    {
+        "id": "rock-outcrop",
+        "priority": "P1",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single low outcrop of fractured stratified sandstone bedrock, "
+            "horizontal layered beds with cracked weathered edges, sun-bleached tan "
+            "and grey." + _RECIPE
+        ),
+    },
+    {
+        "id": "fallen-log",
+        "priority": "P1",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single fallen tree trunk lying horizontally, bark mostly stripped to "
+            "bare weathered grey wood, split and cracked along its length with a "
+            "broken root flare at one end." + _RECIPE
+        ),
+    },
+    {
+        "id": "white-birch",
+        "priority": "P1",
+        "size": SIZE_PORTRAIT,
+        "prompt": (
+            "A single tall slender birch tree with smooth white papery bark marked "
+            "with dark scars and a light airy canopy of small green leaves, whole "
+            "tree shown." + _RECIPE
+        ),
+    },
+    {
+        "id": "understory-shrub",
+        "priority": "P1",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single rounded leafy deciduous shrub about waist-to-head height, dense "
+            "green foliage on several woody stems rising from the base, hazel form."
+            + _RECIPE
+        ),
+    },
+    {
+        "id": "dense-fir",
+        "priority": "P1",
+        "size": SIZE_PORTRAIT,
+        "prompt": (
+            "A single full conical fir tree with soft dense deep-green foliage in "
+            "layered branches and a slightly rounded profile, balsam-fir form, whole "
+            "tree shown." + _RECIPE
+        ),
+    },
+    {
+        "id": "long-needle-pine",
+        "priority": "P1",
+        "size": SIZE_PORTRAIT,
+        "prompt": (
+            "A single open irregular pine tree with long green needles in tufts, a "
+            "visible reddish-brown trunk and bare lower branches, Scots-pine form, "
+            "whole tree shown." + _RECIPE
+        ),
+    },
+    {
+        "id": "tree-fern",
+        "priority": "P1",
+        "size": SIZE_PORTRAIT,
+        "prompt": (
+            "A single tree fern with a short slender fibrous brown trunk topped by a "
+            "rosette of large lacy arching green fronds, whole plant shown." + _RECIPE
+        ),
+    },
+    {
+        "id": "broadleaf-understory",
+        "priority": "P1",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single banana-like understory plant with very large broad paddle-shaped "
+            "bright-green leaves rising and arching from the base." + _RECIPE
+        ),
+    },
+    {
+        "id": "hanging-liana",
+        "priority": "P1",
+        "size": SIZE_PORTRAIT,
+        "prompt": (
+            "A single woody jungle liana vine, twisting and looping with sparse green "
+            "leaves." + _RECIPE
+        ),
+    },
+    {
+        "id": "sagebrush",
+        "priority": "P1",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single low silvery sagebrush shrub, a woody base with soft grey-green "
+            "aromatic foliage in a rounded sparse form." + _RECIPE
+        ),
+    },
+    {
+        "id": "meadow-wildflower",
+        "priority": "P1",
+        "size": SIZE_PORTRAIT,
+        "prompt": (
+            "A single tall prairie wildflower plant, a green stem topped with bright "
+            "red and yellow blooms." + _RECIPE
+        ),
+    },
+    {
+        "id": "sandstone-hoodoo",
+        "priority": "P1",
+        "size": SIZE_PORTRAIT,
+        "prompt": (
+            "A single eroded red-orange sandstone hoodoo, a wind-carved layered rock "
+            "spire with horizontal striations and a rounded balanced cap." + _RECIPE
+        ),
+    },
+    {
+        "id": "barrel-cactus",
+        "priority": "P1",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single squat barrel cactus, a ribbed green sphere with dense radiating "
+            "spines." + _RECIPE
+        ),
+    },
+    {
+        "id": "creosote-shrub",
+        "priority": "P1",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single sparse wiry creosote bush, thin woody branches with tiny "
+            "dark-green leaves in an open airy desert shrub form." + _RECIPE
+        ),
+    },
+    {
+        "id": "dwarf-shrub",
+        "priority": "P1",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single low ground-hugging dwarf willow plant, small woody stems with "
+            "tiny green leaves spreading flat and wind-pruned." + _RECIPE
+        ),
+    },
+    {
+        "id": "cotton-grass",
+        "priority": "P1",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single tussock cottongrass plant, a tuft of fine green sedge blades "
+            "topped with fluffy white seed-heads." + _RECIPE
+        ),
+    },
+    {
+        "id": "lichen-boulder",
+        "priority": "P1",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single grey granite boulder crusted with orange, pale-green and grey "
+            "lichen blotches, weathered tundra rock." + _RECIPE
+        ),
+    },
+    {
+        "id": "leaning-palm",
+        "priority": "P1",
+        "size": SIZE_PORTRAIT,
+        "prompt": (
+            "A single coconut palm with a curved wind-leaned trunk and a crown of long "
+            "arching green fronds, tropical shoreline form, whole tree shown." + _RECIPE
+        ),
+    },
+    {
+        "id": "dune-grass",
+        "priority": "P1",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single tuft of tall wispy marram dune grass, thin pale-green blades "
+            "rising from one sandy base." + _RECIPE
+        ),
+    },
+    {
+        "id": "talus-rock",
+        "priority": "P1",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single angular broken grey rock fragment with sharp fractured edges, "
+            "alpine scree stone." + _RECIPE
+        ),
+    },
+    {
+        "id": "krummholz-conifer",
+        "priority": "P1",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single stunted wind-bent krummholz conifer, a low gnarled twisted trunk "
+            "with foliage flagged to one side, treeline dwarf, whole plant shown."
+            + _RECIPE
+        ),
+    },
+    {
+        "id": "snow-laden-conifer",
+        "priority": "P1",
+        "size": SIZE_PORTRAIT,
+        "prompt": (
+            "A single spruce tree heavily laden with snow, dark green branches bowed "
+            "under thick white snow caps, conical winter form, whole tree shown."
             + _RECIPE
         ),
     },
@@ -234,12 +453,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--force", action="store_true", help="regenerate plates that already exist")
     parser.add_argument("--only", metavar="ID", help="generate only this item id (see --list)")
+    parser.add_argument("--priority", choices=["P0", "P1"], help="generate only items of this priority tier")
     parser.add_argument("--list", action="store_true", help="print the item ids and exit")
     args = parser.parse_args()
 
     if args.list:
         for item in ITEMS:
-            print(f"{item['id']:28} {item['size']}")
+            print(f"{item['id']:28} {item['priority']}  {item['size']}")
         return 0
 
     items = ITEMS
@@ -247,6 +467,10 @@ def main() -> int:
         items = [it for it in ITEMS if it["id"] == args.only]
         if not items:
             sys.exit(f"error: no item with id '{args.only}'. Run --list to see ids.")
+    if args.priority:
+        items = [it for it in items if it["priority"] == args.priority]
+        if not items:
+            sys.exit(f"error: no items with priority '{args.priority}'.")
 
     try:
         from openai import OpenAI
