@@ -53,13 +53,34 @@ impl MeshConfig {
     }
 }
 
-/// Per-vertex terrain/veg attributes. Plain data, uploaded straight to the GPU.
+/// Per-vertex terrain attributes. Plain data, uploaded straight to the GPU.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Vertex {
     pub pos: [f32; 3],
     pub normal: [f32; 3],
     pub color: [f32; 3],
+}
+
+/// Per-vertex vegetation attributes. Unlike terrain, plants are **textured**: the
+/// 3D models (see `crate::models`) carry UVs into a shared `texture_2d_array`, and
+/// each vertex names its material's `layer` in that array. 36 B, no padding —
+/// uploaded straight to the GPU as the vegetation base-mesh vertex.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct VegVertex {
+    pub pos: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
+    pub layer: u32, // index into the shared vegetation texture array
+}
+
+/// An indexed vegetation mesh in local space (base at the origin, +Y up, height
+/// normalised to 1.0 render unit — the placer scales by the species' target size).
+/// One per archetype; the renderer concatenates them into a single base buffer.
+pub struct VegMesh {
+    pub vertices: Vec<VegVertex>,
+    pub indices: Vec<u32>,
 }
 
 /// One planted instance: the local→world transform (columns of a `Mat4`) and a
@@ -72,9 +93,9 @@ pub struct VegInstance {
     pub tint: [f32; 4], // rgb tint; a unused
 }
 
-/// A chunk's vegetation as instances grouped by species: `instances` is one flat
-/// buffer, and `draws` is a `(species_id, start, count)` run per species so the
-/// renderer issues one instanced draw of each species' base mesh.
+/// A chunk's vegetation as instances grouped by archetype mesh: `instances` is one
+/// flat buffer, and `draws` is a `(mesh_index, start, count)` run per mesh so the
+/// renderer issues one instanced draw of each archetype's base mesh.
 #[derive(Default)]
 pub struct VegChunk {
     pub instances: Vec<VegInstance>,
@@ -99,7 +120,11 @@ const SKIRT_MIN_DEPTH: f32 = 2.0; // render units
 // MeshConfig); the rest is fixed tuning.
 const VEG_MIN_GROUND_HEIGHT: f32 = 1.0; // skip water/waterline (render units)
 const VEG_MAX_STEEPNESS: f32 = 0.5; // skip cliffs
-const VEG_SINK: f32 = 0.15; // bury a full-size plant's base this deep to hide the seam (× scale)
+// Bury a plant's base this fraction of its height to hide the ground seam. Models
+// sit base-on-ground (y=0) and `scale` is now the plant's true height in units, so
+// this is small: a ~30 m tree sinks ~1.5 m, grass a few cm. (Was 0.15 when `scale`
+// was a ~1.0 jitter; lowered for the real-height archetype models.)
+const VEG_SINK: f32 = 0.05;
 const VEG_TINT_JITTER: f32 = 0.06; // ± per-plant brightness so a stand isn't uniform
 
 // Area-proportional placement. The old model made a flat `density` attempts for
@@ -292,11 +317,12 @@ fn place_vegetation(
         }
 
         // Each species' presence here is a linear decay from its nearest seed point
-        // at that species' own cluster scale. The sum drives how likely a plant
-        // grows; the per-species presences weight which one does.
+        // at that species' own cluster scale, times its mix weight. The sum drives
+        // how likely a plant grows; the per-species presences weight which one does.
         let mut sum = 0.0f32;
         for (k, &id) in species_ids.iter().enumerate() {
-            let w = species_presence(planet.seed, key.face, u, v, id, planet.flora.species(id).cluster_radius);
+            let sp = planet.flora.species(id);
+            let w = species_presence(planet.seed, key.face, u, v, id, sp.cluster_radius) * sp.weight;
             presence[k] = w;
             sum += w;
         }
@@ -328,10 +354,12 @@ fn place_vegetation(
         let rot = planet::upright_rotation(up, yaw);
         let model = Mat4::from_scale_rotation_translation(Vec3::splat(scale), rot, pos);
         let t = 1.0 + (rng.random::<f32>() - 0.5) * VEG_TINT_JITTER;
-        planted.push((chosen, VegInstance { model: model.to_cols_array_2d(), tint: [t, t, t, 1.0] }));
+        // Key the instance by its archetype MESH index (not species id): species that
+        // share a mesh — e.g. the boulder across biomes — then merge into one draw.
+        planted.push((species.mesh_index, VegInstance { model: model.to_cols_array_2d(), tint: [t, t, t, 1.0] }));
     }
 
-    // Group instances by species into contiguous runs, one instanced draw each.
+    // Group instances by mesh into contiguous runs, one instanced draw each.
     planted.sort_by_key(|(id, _)| *id);
     let mut veg = VegChunk::default();
     for (id, inst) in planted {
@@ -350,9 +378,13 @@ fn place_vegetation(
 #[cfg(test)]
 impl VegChunk {
     pub fn bake(&self, flora: &crate::flora::Flora) -> MeshData {
+        // Veg meshes are textured (no per-vertex colour), but this baker feeds the
+        // untextured terrain shader, so it flattens each vertex to its texture
+        // layer's average colour — enough for the silhouette/clustering visual tools.
+        let avg = &flora.textures().layer_avg;
         let mut m = MeshData { vertices: Vec::new(), indices: Vec::new() };
-        for &(species, start, count) in &self.draws {
-            let src = &flora.species(species).mesh;
+        for &(mesh_id, start, count) in &self.draws {
+            let src = flora.mesh(mesh_id);
             for inst in &self.instances[start as usize..(start + count) as usize] {
                 let model = Mat4::from_cols_array_2d(&inst.model);
                 let nmat = glam::Mat3::from_mat4(model);
@@ -361,7 +393,7 @@ impl VegChunk {
                 for v in &src.vertices {
                     let p = model.transform_point3(Vec3::from(v.pos));
                     let n = (nmat * Vec3::from(v.normal)).normalize_or_zero();
-                    let c = (Vec3::from(v.color) * tint).clamp(Vec3::ZERO, Vec3::ONE);
+                    let c = (Vec3::from(avg[v.layer as usize]) * tint).clamp(Vec3::ZERO, Vec3::ONE);
                     m.vertices.push(Vertex { pos: p.into(), normal: n.into(), color: c.into() });
                 }
                 m.indices.extend(src.indices.iter().map(|&i| base + i));
@@ -432,8 +464,11 @@ fn biome_coverage(biome: Biome) -> f32 {
 // Mesh container
 // ---------------------------------------------------------------------------
 
-/// A simple indexed mesh of [`Vertex`]. Used for terrain chunks and as the
-/// container the flora module grows plant species into (see `crate::flora`).
+/// A simple indexed mesh of [`Vertex`]. Now only the headless visual tools use it,
+/// to bake instanced vegetation back to world space for the terrain shader
+/// (`VegChunk::bake`); runtime terrain builds `Vec<Vertex>` directly and runtime
+/// vegetation uses [`VegMesh`].
+#[cfg(test)]
 pub struct MeshData {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,

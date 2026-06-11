@@ -7,7 +7,8 @@
 //! the rendering layer a thin, replaceable slab beneath the simulation.
 
 use crate::lod::ChunkKey;
-use crate::mesh::{CpuChunk, MeshData, VegInstance, Vertex};
+use crate::mesh::{CpuChunk, VegInstance, VegMesh, VegVertex, Vertex};
+use crate::models::TextureArray;
 use crate::overlay::{self, OverlayInstance};
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
@@ -157,29 +158,44 @@ impl MeshArena {
     }
 }
 
-/// Every species' base mesh concatenated into one static vertex+index buffer, so
-/// the vegetation pass binds geometry ONCE and selects a species by base_vertex/
-/// first_index — instead of re-binding a base buffer per species per chunk.
-struct VegBaseMeshes {
+/// All vegetation GPU state: the textured instanced pipeline, every archetype's base
+/// mesh concatenated into one static vertex+index buffer (a mesh is selected by
+/// base_vertex/first_index, so geometry binds ONCE per frame), and the shared
+/// texture-array bind group. Built once at startup; the draw loop binds this and
+/// issues each chunk's per-mesh instance runs.
+struct VegGpu {
+    pipeline: wgpu::RenderPipeline,
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
-    species: Vec<SpeciesRange>,
+    ranges: Vec<MeshRange>,
+    tex_bind: wgpu::BindGroup,
 }
 
 #[derive(Clone, Copy)]
-struct SpeciesRange {
+struct MeshRange {
     base_vertex: i32,
     first_index: u32,
     count: u32,
 }
 
-impl VegBaseMeshes {
-    fn build(device: &wgpu::Device, meshes: &[&MeshData]) -> Self {
-        let mut verts: Vec<Vertex> = Vec::new();
+impl VegGpu {
+    /// Build the vegetation pipeline + base meshes + texture array. `globals_layout`
+    /// is bind group 0 (shared with terrain/sky); group 1 is the texture array +
+    /// repeat sampler this owns.
+    fn build(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        globals_layout: &wgpu::BindGroupLayout,
+        format: wgpu::TextureFormat,
+        meshes: &[VegMesh],
+        textures: &TextureArray,
+    ) -> Self {
+        // Concatenate every archetype's base mesh; remember each one's slot.
+        let mut verts: Vec<VegVertex> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
-        let mut species = Vec::with_capacity(meshes.len());
+        let mut ranges = Vec::with_capacity(meshes.len());
         for m in meshes {
-            species.push(SpeciesRange {
+            ranges.push(MeshRange {
                 base_vertex: verts.len() as i32,
                 first_index: indices.len() as u32,
                 count: m.indices.len() as u32,
@@ -187,10 +203,10 @@ impl VegBaseMeshes {
             verts.extend_from_slice(&m.vertices);
             indices.extend_from_slice(&m.indices);
         }
-        // BufferInit can't make a zero-sized buffer; with no vegetation at all (no
-        // species) fall back to a 1-element dummy that is simply never drawn.
+        // BufferInit can't make a zero-sized buffer; with no vegetation at all fall
+        // back to a 1-element dummy that is simply never drawn (ranges stays empty).
         if verts.is_empty() {
-            verts.push(Vertex { pos: [0.0; 3], normal: [0.0, 1.0, 0.0], color: [0.0; 3] });
+            verts.push(VegVertex { pos: [0.0; 3], normal: [0.0, 1.0, 0.0], uv: [0.0; 2], layer: 0 });
             indices.push(0);
         }
         let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -203,13 +219,102 @@ impl VegBaseMeshes {
             contents: bytemuck::cast_slice(&indices),
             usage: wgpu::BufferUsages::INDEX,
         });
-        Self { vbuf, ibuf, species }
+
+        // Texture array (group 1): one repeat-sampled, mipped array shared by all
+        // archetypes; each vertex carries its layer.
+        let tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("veg-tex-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let (tex_view, sampler) = upload_veg_textures(device, queue, textures);
+        let tex_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("veg-tex-bind"),
+            layout: &tex_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&tex_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("veg-pipeline-layout"),
+            bind_group_layouts: &[Some(globals_layout), Some(&tex_bgl)],
+            immediate_size: 0,
+        });
+        let veg_sh = shader(device, "vegetation", include_str!("shaders/vegetation.wgsl"));
+        let pipeline = make_pipeline(device, &layout, &veg_sh, &[veg_vertex_layout(), veg_instance_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
+
+        Self { pipeline, vbuf, ibuf, ranges, tex_bind }
     }
 }
 
-/// A chunk's vegetation on the GPU: one instance buffer plus a `(species, start,
-/// count)` run per species. Each run is one instanced draw of that species' shared
-/// base mesh (the renderer's combined `VegBaseMeshes`), so the chunk stores only
+/// Create and fill the vegetation `texture_2d_array` (all layers + their mip chains)
+/// and a repeat, trilinear sampler. sRGB so sampling linearises the model albedo.
+fn upload_veg_textures(device: &wgpu::Device, queue: &wgpu::Queue, textures: &TextureArray) -> (wgpu::TextureView, wgpu::Sampler) {
+    let layer_count = textures.layers.len().max(1) as u32;
+    let mips = textures.mip_levels();
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("veg-tex-array"),
+        size: wgpu::Extent3d { width: textures.size, height: textures.size, depth_or_array_layers: layer_count },
+        mip_level_count: mips,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (layer, chain) in textures.layers.iter().enumerate() {
+        for (mip, data) in chain.iter().enumerate() {
+            let edge = (textures.size >> mip).max(1);
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: mip as u32,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer as u32 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(edge * 4), rows_per_image: Some(edge) },
+                wgpu::Extent3d { width: edge, height: edge, depth_or_array_layers: 1 },
+            );
+        }
+    }
+    let view = tex.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("veg-sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        ..Default::default()
+    });
+    (view, sampler)
+}
+
+/// A chunk's vegetation on the GPU: one instance buffer plus a `(mesh_index, start,
+/// count)` run per archetype mesh. Each run is one instanced draw of that mesh's
+/// shared base geometry (the renderer's combined `VegGpu`), so the chunk stores only
 /// the instances.
 struct GpuVeg {
     instances: wgpu::Buffer,
@@ -239,9 +344,22 @@ fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
-// Per-instance vegetation attributes: the 4 columns of the model matrix + a tint.
+// Vegetation base-mesh vertex: pos, normal, uv, and the texture-array layer.
+const VEG_VERT_ATTRS: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Uint32];
+
+fn veg_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<VegVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &VEG_VERT_ATTRS,
+    }
+}
+
+// Per-instance vegetation attributes: the 4 columns of the model matrix + a tint
+// (locations 4–8, after the base-mesh vertex's 0–3).
 const VEG_INSTANCE_ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
-    3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4];
+    4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4, 8 => Float32x4];
 
 fn veg_instance_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
@@ -290,9 +408,9 @@ pub struct Renderer {
     terrain_pipeline: wgpu::RenderPipeline,
     terrain_wire: Option<wgpu::RenderPipeline>,
 
-    // Vegetation: every species' base mesh concatenated (uploaded once), drawn instanced.
-    veg_pipeline: wgpu::RenderPipeline,
-    veg_base: VegBaseMeshes,
+    // Vegetation: textured, instanced archetype models (pipeline + concatenated base
+    // meshes + shared texture array), all uploaded once.
+    veg: VegGpu,
 
     overlay_pipeline: wgpu::RenderPipeline,
     overlay_quad: wgpu::Buffer,
@@ -321,7 +439,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>, veg_meshes: &[&MeshData]) -> anyhow::Result<Self> {
+    pub async fn new(window: Arc<Window>, veg_meshes: &[VegMesh], veg_textures: &TextureArray) -> anyhow::Result<Self> {
         let size = window.inner_size();
         let size = (size.width.max(1), size.height.max(1));
 
@@ -443,11 +561,10 @@ impl Renderer {
         } else {
             None
         };
-        // Vegetation: instanced plants. Upload each species' base mesh once, plus a
-        // pipeline that transforms them per-instance (model matrix + tint).
-        let veg_sh = shader(&device, "vegetation", include_str!("shaders/vegetation.wgsl"));
-        let veg_pipeline = make_pipeline(&device, &pipeline_layout, &veg_sh, &[vertex_layout(), veg_instance_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
-        let veg_base = VegBaseMeshes::build(&device, veg_meshes);
+        // Vegetation: textured, instanced archetype models — pipeline + concatenated
+        // base meshes + shared texture array, built once (group 0 = globals shared with
+        // terrain, group 1 = the texture array this owns).
+        let veg = VegGpu::build(&device, &queue, &bind_layout, format, veg_meshes, veg_textures);
 
         // Overlay pipeline: no bind groups (pure screen-space), alpha blended.
         let overlay_sh = shader(&device, "overlay", include_str!("shaders/overlay.wgsl"));
@@ -530,8 +647,7 @@ impl Renderer {
             sky_pipeline,
             terrain_pipeline,
             terrain_wire,
-            veg_pipeline,
-            veg_base,
+            veg,
             overlay_pipeline,
             overlay_quad,
             overlay_instances: None,
@@ -784,19 +900,20 @@ impl Renderer {
                 }
             }
 
-            // Vegetation: bind the combined base-mesh buffers ONCE (a species is
-            // selected by base_vertex/first_index), then per veg chunk bind its
-            // instance buffer once and draw each species' run — instead of rebinding
-            // a base buffer per species per chunk. Skipped in wireframe mode.
-            if !self.wireframe && !self.veg_base.species.is_empty() {
-                pass.set_pipeline(&self.veg_pipeline);
-                pass.set_vertex_buffer(0, self.veg_base.vbuf.slice(..));
-                pass.set_index_buffer(self.veg_base.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            // Vegetation: bind the combined base-mesh buffers + texture array ONCE (a
+            // mesh is selected by base_vertex/first_index), then per veg chunk bind its
+            // instance buffer once and draw each mesh's run — instead of rebinding a
+            // base buffer per mesh per chunk. Skipped in wireframe mode.
+            if !self.wireframe && !self.veg.ranges.is_empty() {
+                pass.set_pipeline(&self.veg.pipeline);
+                pass.set_bind_group(1, &self.veg.tex_bind, &[]);
+                pass.set_vertex_buffer(0, self.veg.vbuf.slice(..));
+                pass.set_index_buffer(self.veg.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 for key in draw {
                     if let Some(GpuChunk { veg: Some(veg), .. }) = self.chunks.get(key) {
                         pass.set_vertex_buffer(1, veg.instances.slice(..));
-                        for &(species, start, count) in &veg.draws {
-                            let s = self.veg_base.species[species as usize];
+                        for &(mesh_id, start, count) in &veg.draws {
+                            let s = self.veg.ranges[mesh_id as usize];
                             pass.draw_indexed(s.first_index..s.first_index + s.count, s.base_vertex, start..start + count);
                         }
                     }
@@ -1080,8 +1197,6 @@ mod smoke {
 
         let sky_p = make_pipeline(&device, &layout, &sky_sh, &[], format, PassKind::Sky, wgpu::PolygonMode::Fill);
         let terrain_p = make_pipeline(&device, &layout, &terrain_sh, &[vertex_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
-        let veg_sh = shader(&device, "vegetation", include_str!("shaders/vegetation.wgsl"));
-        let veg_p = make_pipeline(&device, &layout, &veg_sh, &[vertex_layout(), veg_instance_layout()], format, PassKind::Opaque, wgpu::PolygonMode::Fill);
 
         // Overlay pipeline (no bind groups) + its geometry.
         let overlay_sh = shader(&device, "overlay", include_str!("shaders/overlay.wgsl"));
@@ -1164,13 +1279,11 @@ mod smoke {
         let slot = arena.alloc(&device);
         assert_ne!(arena.base_vertex(slot), 0, "second slot must have a nonzero base_vertex to test");
         arena.write(&queue, slot, &cpu.vertices, &cpu.indices);
-        // Vegetation: the combined base-mesh buffer + a synthetic instance at the
-        // chunk centre, validating the instanced pipeline/draw and the per-species
-        // base_vertex/first_index selection (real placement is shown by the closeup).
-        let species: Vec<&MeshData> = (0..planet.flora.species_count())
-            .map(|i| &planet.flora.species(i as u32).mesh)
-            .collect();
-        let veg_base = VegBaseMeshes::build(&device, &species);
+        // Vegetation: the full textured pipeline + combined base-mesh buffer + texture
+        // array + a synthetic instance at the chunk centre, validating the instanced
+        // pipeline/draw and the per-mesh base_vertex/first_index selection (real
+        // placement is shown by the closeup).
+        let veg = VegGpu::build(&device, &queue, &bind_layout, format, planet.flora.meshes(), planet.flora.textures());
         let veg_dir = key.center_dir();
         let veg_inst = VegInstance {
             model: glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(40.0), glam::Quat::IDENTITY, veg_dir * planet.surface_radius(veg_dir)).to_cols_array_2d(),
@@ -1253,13 +1366,14 @@ mod smoke {
                 let first = arena.first_index(slot);
                 pass.draw_indexed(first..first + arena.slot_indices, arena.base_vertex(slot), 0..1);
             }
-            // Vegetation: instanced via the combined base buffer (validates
-            // vegetation.wgsl + the base_vertex/first_index species selection). The
-            // LAST species is drawn so nonzero offsets are exercised.
-            if let Some(s) = veg_base.species.last().copied() {
-                pass.set_pipeline(&veg_p);
-                pass.set_vertex_buffer(0, veg_base.vbuf.slice(..));
-                pass.set_index_buffer(veg_base.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            // Vegetation: instanced via the combined base buffer + texture array
+            // (validates vegetation.wgsl + the base_vertex/first_index mesh selection).
+            // The LAST mesh is drawn so nonzero offsets are exercised.
+            if let Some(s) = veg.ranges.last().copied() {
+                pass.set_pipeline(&veg.pipeline);
+                pass.set_bind_group(1, &veg.tex_bind, &[]);
+                pass.set_vertex_buffer(0, veg.vbuf.slice(..));
+                pass.set_index_buffer(veg.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.set_vertex_buffer(1, veg_buf.slice(..));
                 pass.draw_indexed(s.first_index..s.first_index + s.count, s.base_vertex, 0..1);
             }
@@ -1504,12 +1618,14 @@ mod gallery {
         true
     }
 
-    /// Append a local-space mesh to a scene buffer at `off`, scaled by `scale`.
-    fn add(verts: &mut Vec<Vertex>, idx: &mut Vec<u32>, src: &crate::mesh::MeshData, off: Vec3, scale: f32) {
+    /// Append a local-space veg mesh to a scene buffer at `off`, scaled by `scale`,
+    /// flattening each vertex to its texture layer's average colour (this gallery
+    /// renders through the untextured terrain shader).
+    fn add(verts: &mut Vec<Vertex>, idx: &mut Vec<u32>, src: &VegMesh, avg: &[[f32; 3]], off: Vec3, scale: f32) {
         let base = verts.len() as u32;
         for v in &src.vertices {
             let p = Vec3::from(v.pos) * scale + off;
-            verts.push(Vertex { pos: p.into(), normal: v.normal, color: v.color });
+            verts.push(Vertex { pos: p.into(), normal: v.normal, color: avg[v.layer as usize] });
         }
         idx.extend(src.indices.iter().map(|&i| base + i));
     }
@@ -1548,8 +1664,11 @@ mod gallery {
                     continue;
                 }
                 let id = ids[(hash % ids.len() as u64) as usize];
+                let sp = flora.species(id);
+                // Meshes are height-normalised to 1.0; show each at its mid target size.
+                let scale = (sp.scale_min + sp.scale_max) * 0.5;
                 let off = Vec3::new((c as f32 - (cols as f32 - 1.0) * 0.5) * sx, 0.0, r as f32 * sz);
-                add(&mut verts, &mut idx, &flora.species(id).mesh, off, 1.0);
+                add(&mut verts, &mut idx, flora.mesh(sp.mesh_index), &flora.textures().layer_avg, off, scale);
             }
         }
 

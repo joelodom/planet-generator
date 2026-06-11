@@ -24,6 +24,7 @@ mod gfx;
 mod lod;
 mod logging;
 mod mesh;
+mod models;
 mod overlay;
 mod planet;
 mod settings;
@@ -416,11 +417,10 @@ impl ApplicationHandler for App {
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
 
         let mut renderer = {
-            // Per-species base meshes for instanced vegetation (uploaded once).
-            let veg_meshes: Vec<&mesh::MeshData> = (0..self.planet.flora.species_count())
-                .map(|i| &self.planet.flora.species(i as u32).mesh)
-                .collect();
-            pollster::block_on(Renderer::new(window.clone(), &veg_meshes)).expect("renderer init")
+            // Archetype base meshes + shared texture array for instanced vegetation
+            // (uploaded once). See crate::models / crate::flora.
+            let flora = &self.planet.flora;
+            pollster::block_on(Renderer::new(window.clone(), flora.meshes(), flora.textures())).expect("renderer init")
         };
         self.camera.set_aspect(renderer.size.0, renderer.size.1);
         let (lines, hl) = overlay::menu(&self.graphics, self.menu_tab, self.menu_sel, self.units);

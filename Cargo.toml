@@ -7,6 +7,10 @@ edition = "2024"
 anyhow = "1.0.102"
 bytemuck = "1.25.0"
 glam = "0.33.1"
+# glTF 2.0 loader for the embedded flora .glb models (src/models.rs). default
+# features off to skip the heavy `image` crate — we decode the embedded PNG
+# textures with the `png` dep we already have; `utils` gives the accessor readers.
+gltf = { version = "1.4.1", default-features = false, features = ["utils"] }
 noise = "0.9.0"
 png = "0.18.1"
 pollster = "0.4.0"
