@@ -60,8 +60,11 @@ OUTPUT_DIR = SCRIPT_DIR / "images"
 # --- The P0 targets (prompts copied verbatim from FLORA_MODEL_TARGETS.md) ----
 # id == output filename stem (the link in the doc's "Image" column).
 
+# Shared capture recipe. Every subject is ONE instance ("A single ..."): the
+# renderer instances the model many times, so a cluster baked into the plate would
+# become one un-repeatable mesh. See FLORA_MODEL_TARGETS.md "Prompt conventions".
 _RECIPE = (
-    " Photorealistic, single isolated {framing} centered and fully in frame, "
+    " Photorealistic, single isolated specimen centered and fully in frame, "
     "plain seamless neutral mid-grey background, soft even diffuse lighting, "
     "no cast shadows, slight 3/4 viewing angle, sharp focus, high detail, "
     "no text, no people, no watermark."
@@ -69,90 +72,98 @@ _RECIPE = (
 
 ITEMS = [
     {
-        "id": "granite-boulder-cluster",
+        "id": "granite-boulder",
         "size": SIZE_SQUARE,
         "prompt": (
-            "A cluster of three or four weathered grey granite boulders grouped "
-            "together, rounded by glaciation with angular fractured faces and faint "
-            "lichen flecks." + _RECIPE.format(framing="group")
+            "A single weathered grey granite boulder, rounded by glaciation with "
+            "angular fractured faces and faint lichen flecks." + _RECIPE
         ),
     },
     {
         "id": "broadleaf-hardwood",
         "size": SIZE_PORTRAIT,
         "prompt": (
-            "A mature deciduous hardwood tree with a dense rounded full green canopy, "
-            "a single sturdy trunk and a branching crown in summer foliage, sugar-maple "
-            "form, whole tree shown." + _RECIPE.format(framing="specimen")
+            "A single mature deciduous hardwood tree with a dense rounded full green "
+            "canopy, a sturdy single trunk and a branching crown in summer foliage, "
+            "sugar-maple form, whole tree shown." + _RECIPE
         ),
     },
     {
         "id": "spreading-oak",
         "size": SIZE_SQUARE,
         "prompt": (
-            "A large mature oak tree with a broad irregular spreading crown, a thick "
-            "gnarled trunk and heavy lateral limbs, dense dark-green summer foliage, "
-            "whole tree shown." + _RECIPE.format(framing="specimen")
+            "A single large mature oak tree with a broad irregular spreading crown, a "
+            "thick gnarled trunk and heavy lateral limbs, dense dark-green summer "
+            "foliage, whole tree shown." + _RECIPE
         ),
     },
     {
         "id": "spruce-spire-conifer",
         "size": SIZE_PORTRAIT,
         "prompt": (
-            "A tall narrow spruce tree, steeply conical with a pointed top and dense "
-            "dark blue-green needled branches drooping slightly, straight trunk, whole "
-            "tree shown." + _RECIPE.format(framing="specimen")
+            "A single tall narrow spruce tree, steeply conical with a pointed top and "
+            "dense dark blue-green needled branches drooping slightly, straight trunk, "
+            "whole tree shown." + _RECIPE
         ),
     },
     {
         "id": "tropical-emergent-tree",
         "size": SIZE_PORTRAIT,
         "prompt": (
-            "A towering rainforest kapok tree with a tall straight pale trunk and a "
-            "wide flat umbrella-shaped crown of green foliage high above, emergent "
-            "giant, whole tree shown." + _RECIPE.format(framing="specimen")
+            "A single towering rainforest kapok tree with a tall straight pale trunk "
+            "and a wide flat umbrella-shaped crown of green foliage high above, "
+            "emergent giant, whole tree shown." + _RECIPE
         ),
     },
     {
         "id": "feather-frond-palm",
         "size": SIZE_PORTRAIT,
         "prompt": (
-            "A tall coconut palm with a slender slightly curved trunk topped by a crown "
-            "of long arching pinnate green fronds, whole tree shown."
-            + _RECIPE.format(framing="specimen")
+            "A single tall coconut palm with a slender slightly curved trunk topped by "
+            "a crown of long arching pinnate green fronds, whole tree shown." + _RECIPE
         ),
     },
     {
         "id": "bunchgrass-tussock",
         "size": SIZE_SQUARE,
         "prompt": (
-            "A dense clump of tall bunchgrass, fine arching golden-green blades "
-            "radiating from a tight base, prairie tussock."
-            + _RECIPE.format(framing="specimen")
+            "A single dense tussock of tall bunchgrass, fine arching golden-green "
+            "blades radiating from one tight base." + _RECIPE
         ),
     },
     {
         "id": "savanna-acacia",
         "size": SIZE_SQUARE,
         "prompt": (
-            "A lone umbrella acacia tree with a clear trunk and a high wide flat-topped "
-            "canopy of fine green foliage, classic savanna form, whole tree shown."
-            + _RECIPE.format(framing="specimen")
+            "A single umbrella acacia tree with a clear trunk and a high wide "
+            "flat-topped canopy of fine green foliage, classic savanna form, whole "
+            "tree shown." + _RECIPE
         ),
     },
     {
         "id": "columnar-cactus",
         "size": SIZE_PORTRAIT,
         "prompt": (
-            "A tall saguaro cactus, a single ribbed green column with two raised curving "
-            "arms and rows of spines along the ridges, whole plant shown."
-            + _RECIPE.format(framing="specimen")
+            "A single tall saguaro cactus, a ribbed green column with two raised "
+            "curving arms and rows of spines along the ridges, whole plant shown."
+            + _RECIPE
         ),
     },
 ]
 
 
 # --- Helpers ----------------------------------------------------------------
+
+
+def log(msg: str) -> None:
+    """Timestamped, immediately-flushed stdout line.
+
+    The explicit flush matters: Python block-buffers stdout when it is NOT a
+    terminal (redirected to a file, piped to `tee`, run under a wrapper), so
+    without this you'd see no progress for minutes and then a burst at the end.
+    flush=True keeps every line live regardless of where stdout goes.
+    """
+    print(f"{time.strftime('%H:%M:%S')}  {msg}", flush=True)
 
 
 def load_env_key() -> str:
@@ -201,14 +212,22 @@ def generate_one(client, item: dict) -> bytes:
                 with urllib.request.urlopen(url, timeout=REQUEST_TIMEOUT_SECONDS) as r:
                     return r.read()
             raise RuntimeError("response contained neither b64_json nor url")
-        except Exception as err:  # noqa: BLE001 — retry anything transient-looking
+        except Exception as err:  # noqa: BLE001 — retry only transient failures
             last_err = err
+            # Retry transient failures only: 429 (rate limit), 5xx (server), or no
+            # HTTP status at all (connection/timeout). A 4xx like 401/400/404 is a
+            # permanent client error — retrying just wastes time and floods the log.
+            status = getattr(err, "status_code", None)
+            retryable = status is None or status == 429 or status >= 500
+            if not retryable:
+                log(f"        non-retryable error (HTTP {status}); not retrying")
+                break
             if attempt == MAX_ATTEMPTS:
                 break
             wait = min(BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)), BACKOFF_MAX_SECONDS)
-            print(f"    attempt {attempt}/{MAX_ATTEMPTS} failed: {err}; retrying in {wait:.0f}s")
+            log(f"        attempt {attempt}/{MAX_ATTEMPTS} failed: {err}; retrying in {wait:.0f}s")
             time.sleep(wait)
-    raise RuntimeError(f"giving up after {MAX_ATTEMPTS} attempts: {last_err}")
+    raise RuntimeError(f"giving up after {attempt} attempt(s): {last_err}")
 
 
 def main() -> int:
@@ -237,25 +256,31 @@ def main() -> int:
     client = OpenAI(api_key=load_env_key(), timeout=REQUEST_TIMEOUT_SECONDS)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    total = len(items)
+    log(f"model={MODEL} quality={QUALITY} | {total} item(s) -> {OUTPUT_DIR}")
     generated = skipped = failed = 0
-    for item in items:
+    for idx, item in enumerate(items, 1):
+        tag = f"[{idx}/{total}] {item['id']}"
         out_path = OUTPUT_DIR / f"{item['id']}.png"
         if out_path.exists() and not args.force:
-            print(f"skip   {item['id']} (exists; use --force to regenerate)")
+            log(f"{tag}: skip (exists; use --force to regenerate)")
             skipped += 1
             continue
-        print(f"gen    {item['id']} [{item['size']}] ...")
+        log(f"{tag}: sending [{item['size']}] -> GPT Image 2")
+        log(f"        prompt: {item['prompt']}")
+        start = time.perf_counter()
         try:
             png = generate_one(client, item)
         except Exception as err:  # noqa: BLE001
-            print(f"FAIL   {item['id']}: {err}")
+            log(f"{tag}: FAIL after {time.perf_counter() - start:.1f}s: {err}")
             failed += 1
             continue
         out_path.write_bytes(png)
-        print(f"  ->   {out_path.relative_to(SCRIPT_DIR.parent)} ({len(png) // 1024} KB)")
+        rel = out_path.relative_to(SCRIPT_DIR.parent)
+        log(f"{tag}: saved {rel} ({len(png) // 1024} KB, {time.perf_counter() - start:.1f}s)")
         generated += 1
 
-    print(f"\ndone: {generated} generated, {skipped} skipped, {failed} failed -> {OUTPUT_DIR}")
+    log(f"done: {generated} generated, {skipped} skipped, {failed} failed -> {OUTPUT_DIR}")
     return 1 if failed else 0
 
 
