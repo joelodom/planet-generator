@@ -3,8 +3,8 @@
 
 Pipeline context: these PNGs are the *reference images* fed to ../formcast to
 produce 3D models that replace Planet Explorer's procedural flora. See
-FLORA_MODEL_TARGETS.md for the full catalogue; this script covers the **P0** and
-**P1** items (the prompts below are copied verbatim from that doc's
+FLORA_MODEL_TARGETS.md for the full catalogue; this script covers the **P0**,
+**P1** and **P2** items (the prompts below are copied verbatim from that doc's
 "Image-Generator Prompt" column). Each item carries its priority so you can
 generate one tier at a time with --priority.
 
@@ -20,8 +20,8 @@ environment variable if already set.
 Usage:
     pip install openai
     # key lives in flora-revamp/.env as: OPENAI_API_KEY=sk-...
-    python flora-revamp/generate_images.py                  # any MISSING plate (P0+P1)
-    python flora-revamp/generate_images.py --priority P1     # only the P1 plates
+    python flora-revamp/generate_images.py                  # any MISSING plate (P0+P1+P2)
+    python flora-revamp/generate_images.py --priority P2     # only the P2 plates
     python flora-revamp/generate_images.py --force           # regenerate ALL plates
     python flora-revamp/generate_images.py --only barrel-cactus  # just one
     python flora-revamp/generate_images.py --list            # list item ids and exit
@@ -368,6 +368,189 @@ ITEMS = [
             + _RECIPE
         ),
     },
+    # --- P2: sparse/rare/polish (fills thin & barren biomes last) ----------
+    {
+        "id": "standing-dead-snag",
+        "priority": "P2",
+        "size": SIZE_PORTRAIT,
+        "prompt": (
+            "A single bare standing dead tree snag, branchless weathered silver-grey "
+            "trunk with a broken jagged top and remnants of cracked bark, no leaves."
+            + _RECIPE
+        ),
+    },
+    {
+        "id": "fern",
+        "priority": "P2",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single bracken fern plant, lacy arching green fronds radiating from one "
+            "central base." + _RECIPE
+        ),
+    },
+    {
+        "id": "woodland-wildflower",
+        "priority": "P2",
+        "size": SIZE_PORTRAIT,
+        "prompt": (
+            "A single woodland wildflower plant, a slender green stem topped with "
+            "purple and white blossoms." + _RECIPE
+        ),
+    },
+    {
+        "id": "juniper-scrub",
+        "priority": "P2",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single low sprawling juniper shrub, a spreading mat of blue-green "
+            "needled evergreen foliage close to the ground on a woody base." + _RECIPE
+        ),
+    },
+    {
+        "id": "moss-rock",
+        "priority": "P2",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single granite boulder draped in thick green moss and pale grey-green "
+            "lichen patches, damp surface." + _RECIPE
+        ),
+    },
+    {
+        "id": "buttress-root-tree",
+        "priority": "P2",
+        "size": SIZE_PORTRAIT,
+        "prompt": (
+            "A single tall straight tropical rainforest tree with dramatic flared "
+            "buttress roots fanning out at its base, smooth grey trunk and a high "
+            "green canopy, whole tree shown." + _RECIPE
+        ),
+    },
+    {
+        "id": "bromeliad",
+        "priority": "P2",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single tank bromeliad, a rosette of stiff arching strap-shaped leaves "
+            "with red-and-green coloration and a bright central bloom." + _RECIPE
+        ),
+    },
+    {
+        "id": "grassland-rock",
+        "priority": "P2",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single low sun-bleached grey rock outcrop with a weathered rounded top "
+            "and a few dry grass blades at the base." + _RECIPE
+        ),
+    },
+    {
+        "id": "agave-rosette",
+        "priority": "P2",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single agave rosette of thick stiff blue-green sword-shaped leaves with "
+            "sharp tips, radiating symmetrically from one center." + _RECIPE
+        ),
+    },
+    {
+        "id": "dead-bush",
+        "priority": "P2",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single small leafless tangled dead shrub, dry grey woody twigs in a "
+            "rounded brittle tumbleweed mass." + _RECIPE
+        ),
+    },
+    {
+        "id": "cushion-plant",
+        "priority": "P2",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single tight low dome-shaped moss campion cushion plant, a dense mound "
+            "of tiny green leaves studded with small pink flowers." + _RECIPE
+        ),
+    },
+    {
+        "id": "driftwood-log",
+        "priority": "P2",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single bleached smooth driftwood log, pale silver-grey weathered wood "
+            "smoothed by surf with a tangle of worn roots at one end." + _RECIPE
+        ),
+    },
+    {
+        "id": "coastal-scrub",
+        "priority": "P2",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single low salt-pruned coastal shrub, a dense rounded mound of small "
+            "waxy green leaves, sea-grape form." + _RECIPE
+        ),
+    },
+    {
+        "id": "sea-stack",
+        "priority": "P2",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single dark wet surf-rounded boulder, smooth rock streaked with damp "
+            "and a band of barnacles near the base." + _RECIPE
+        ),
+    },
+    {
+        "id": "rock-spire",
+        "priority": "P2",
+        "size": SIZE_PORTRAIT,
+        "prompt": (
+            "A single sharp fractured granite rock spire, a vertical jagged pinnacle "
+            "with cracked angular faces in grey alpine stone." + _RECIPE
+        ),
+    },
+    {
+        "id": "alpine-cushion",
+        "priority": "P2",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single small alpine cushion plant, a tight low dome of tiny green "
+            "leaves and minute flowers." + _RECIPE
+        ),
+    },
+    {
+        "id": "snow-boulder",
+        "priority": "P2",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single rounded boulder topped with a smooth cap of white snow, grey "
+            "rock showing on the lower sides." + _RECIPE
+        ),
+    },
+    {
+        "id": "snow-snag",
+        "priority": "P2",
+        "size": SIZE_PORTRAIT,
+        "prompt": (
+            "A single dark bare leafless dead tree snag with weathered grey wood and "
+            "broken branches, its base in a mound of white snow." + _RECIPE
+        ),
+    },
+    {
+        "id": "ice-hummock",
+        "priority": "P2",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single buckled hummock of fractured pale-blue sea ice, one tilted "
+            "jagged block of ice." + _RECIPE
+        ),
+    },
+    {
+        "id": "glacial-erratic",
+        "priority": "P2",
+        "size": SIZE_SQUARE,
+        "prompt": (
+            "A single dark grey glacial erratic boulder, rounded and weathered, "
+            "resting on a small patch of white ice." + _RECIPE
+        ),
+    },
 ]
 
 
@@ -453,7 +636,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--force", action="store_true", help="regenerate plates that already exist")
     parser.add_argument("--only", metavar="ID", help="generate only this item id (see --list)")
-    parser.add_argument("--priority", choices=["P0", "P1"], help="generate only items of this priority tier")
+    parser.add_argument("--priority", choices=["P0", "P1", "P2"], help="generate only items of this priority tier")
     parser.add_argument("--list", action="store_true", help="print the item ids and exit")
     args = parser.parse_args()
 
