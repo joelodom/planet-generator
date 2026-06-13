@@ -1,9 +1,9 @@
 //! Per-planet vegetation: the species library and biome assignment.
 //!
-//! Vegetation is built from a small library of **photoreal 3D archetype models**
-//! (see [`crate::models`], loaded from embedded `.glb`) — boulders, hardwoods,
-//! conifers, a palm, a cactus, bunchgrass, an acacia — replacing the old
-//! procedurally-grown plants. Each biome maps to a weighted set of those archetypes
+//! Vegetation is built from a library of **photoreal 3D archetype models** (see
+//! [`crate::models`], loaded from embedded `.glb`) — boulders and rock outcrops,
+//! deadwood, hardwoods and conifers, palms, cacti, shrubs, grasses and forbs —
+//! replacing the old procedurally-grown plants. Each biome maps to a weighted set of those archetypes
 //! at biome-specific sizes (a shared mesh can be dwarfed where a biome needs it
 //! smaller). The library is a pure function of the model assets plus the world seed
 //! (which only sets per-species clustering), so every machine and meshing thread
@@ -21,8 +21,8 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
 /// Max archetype slots any one biome lists — sizes the per-attempt presence scratch
-/// array in `mesh::place_vegetation`. The current table peaks at 4 (temperate
-/// forest); the headroom is for the P1 archetypes to come.
+/// array in `mesh::place_vegetation`. The table peaks at 8 (temperate forest), now
+/// that the P1 archetypes have landed.
 pub const SPECIES_PER_BIOME: usize = 8;
 
 /// Render units per kilometre (1 unit = `METERS_PER_UNIT` m).
@@ -53,10 +53,13 @@ macro_rules! archetype {
     };
 }
 
-/// The 9 P0 archetypes. **Index = mesh index = texture-load order**; the biome
-/// table and [`models::load`] both key off this order. Heights/clustering per
-/// `flora-revamp/FLORA_P0_INTEGRATION_PLAN.md` §3.
-const ARCHETYPES: [Archetype; 9] = [
+/// The archetypes (9 P0 + 15 P1). **Index = mesh index = texture-load order**; the
+/// biome tables and [`models::load`] both key off this order. P0 heights/clustering
+/// per `flora-revamp/FLORA_P0_INTEGRATION_PLAN.md` §3; the P1 rows follow the same
+/// scheme — rock/deadwood sit low and scatter broadly, trees are tall and tightly
+/// clustered, shrubs/forbs are small.
+const ARCHETYPES: [Archetype; 24] = [
+    // --- P0 ---
     archetype!("granite-boulder", 0.10, 0.45, 2.0, 8.0),
     archetype!("broadleaf-hardwood", 1.8, 3.6, 30.0, 400.0),
     archetype!("spreading-oak", 1.5, 3.0, 30.0, 400.0),
@@ -66,9 +69,25 @@ const ARCHETYPES: [Archetype; 9] = [
     archetype!("bunchgrass-tussock", 0.10, 0.26, 0.05, 6.0),
     archetype!("savanna-acacia", 1.4, 2.6, 8.0, 120.0),
     archetype!("columnar-cactus", 0.5, 1.6, 3.0, 80.0),
+    // --- P1 ---
+    archetype!("rock-outcrop", 0.12, 0.55, 2.0, 10.0),
+    archetype!("fallen-log", 0.12, 0.30, 8.0, 120.0),
+    archetype!("white-birch", 1.6, 3.4, 30.0, 400.0),
+    archetype!("understory-shrub", 0.30, 0.80, 8.0, 150.0),
+    archetype!("dense-fir", 2.0, 4.2, 30.0, 400.0),
+    archetype!("long-needle-pine", 2.2, 4.6, 30.0, 400.0),
+    archetype!("tree-fern", 0.8, 1.8, 10.0, 200.0),
+    archetype!("broadleaf-understory", 0.4, 1.0, 8.0, 150.0),
+    archetype!("hanging-liana", 1.0, 2.6, 10.0, 200.0),
+    archetype!("sagebrush", 0.20, 0.50, 1.0, 20.0),
+    archetype!("meadow-wildflower", 0.08, 0.20, 0.5, 10.0),
+    archetype!("sandstone-hoodoo", 0.5, 2.0, 3.0, 60.0),
+    archetype!("barrel-cactus", 0.10, 0.35, 1.0, 30.0),
+    archetype!("creosote-shrub", 0.20, 0.60, 1.0, 25.0),
+    archetype!("dwarf-shrub", 0.06, 0.18, 0.5, 8.0),
 ];
 
-// Archetype indices (into ARCHETYPES) used by the biome table.
+// Archetype indices (into ARCHETYPES) used by the biome tables.
 const BOULDER: usize = 0;
 const HARDWOOD: usize = 1;
 const OAK: usize = 2;
@@ -78,6 +97,22 @@ const PALM: usize = 5;
 const BUNCHGRASS: usize = 6;
 const ACACIA: usize = 7;
 const CACTUS: usize = 8;
+// P1
+const ROCK_OUTCROP: usize = 9;
+const FALLEN_LOG: usize = 10;
+const BIRCH: usize = 11;
+const UNDERSTORY: usize = 12;
+const FIR: usize = 13;
+const PINE: usize = 14;
+const TREE_FERN: usize = 15;
+const BROADLEAF_UNDER: usize = 16;
+const LIANA: usize = 17;
+const SAGEBRUSH: usize = 18;
+const WILDFLOWER: usize = 19;
+const HOODOO: usize = 20;
+const BARREL: usize = 21;
+const CREOSOTE: usize = 22;
+const DWARF_SHRUB: usize = 23;
 
 /// One entry in a biome's planting table: which archetype, its relative weight in
 /// the local mix, and a multiplier on the archetype's base height range (so a
@@ -91,18 +126,19 @@ const fn plant(arch: usize, weight: f32, scale: f32) -> Plant {
     Plant { arch, weight, scale }
 }
 
-// Per-biome planting tables (`FLORA_P0_INTEGRATION_PLAN.md` §2). The granite
-// boulder is the cross-biome object — it appears in every vegetated biome.
-// Bunchgrass stands in for dune grass (beach) and sedge (tundra), and spruce for
-// krummholz (mountain), until the P1 archetypes land.
-const TEMPERATE_FOREST: &[Plant] = &[plant(HARDWOOD, 0.40, 1.0), plant(OAK, 0.25, 1.0), plant(SPRUCE, 0.20, 1.0), plant(BOULDER, 0.15, 1.0)];
-const BOREAL_FOREST: &[Plant] = &[plant(SPRUCE, 0.80, 1.0), plant(BOULDER, 0.20, 1.0)];
-const TROPICAL_FOREST: &[Plant] = &[plant(EMERGENT, 0.45, 1.0), plant(PALM, 0.40, 1.0), plant(BOULDER, 0.15, 1.0)];
-const GRASSLAND: &[Plant] = &[plant(BUNCHGRASS, 0.75, 1.0), plant(ACACIA, 0.12, 1.0), plant(BOULDER, 0.13, 1.0)];
-const DESERT: &[Plant] = &[plant(CACTUS, 0.60, 1.0), plant(BOULDER, 0.40, 1.0)];
-const BEACH: &[Plant] = &[plant(PALM, 0.50, 1.0), plant(BUNCHGRASS, 0.35, 0.8), plant(BOULDER, 0.15, 1.0)];
-const TUNDRA: &[Plant] = &[plant(BUNCHGRASS, 0.55, 0.8), plant(BOULDER, 0.45, 1.0)];
-const MOUNTAIN: &[Plant] = &[plant(SPRUCE, 0.45, 0.5), plant(BOULDER, 0.55, 1.0)];
+// Per-biome planting tables (`FLORA_P0_INTEGRATION_PLAN.md` §2, extended with the P1
+// archetypes). Weights are relative within a biome; the granite boulder and the P1
+// rock-outcrop are the cross-biome ground objects. Still standing in until their P1
+// models bake: bunchgrass for dune grass (beach) and for sedge alongside the dwarf
+// shrub (tundra); spruce/fir for krummholz (mountain).
+const TEMPERATE_FOREST: &[Plant] = &[plant(HARDWOOD, 0.26, 1.0), plant(OAK, 0.18, 1.0), plant(BIRCH, 0.16, 1.0), plant(SPRUCE, 0.10, 1.0), plant(UNDERSTORY, 0.12, 1.0), plant(FALLEN_LOG, 0.06, 1.0), plant(ROCK_OUTCROP, 0.06, 1.0), plant(BOULDER, 0.06, 1.0)];
+const BOREAL_FOREST: &[Plant] = &[plant(SPRUCE, 0.34, 1.0), plant(FIR, 0.26, 1.0), plant(PINE, 0.16, 1.0), plant(BIRCH, 0.08, 0.9), plant(FALLEN_LOG, 0.06, 1.0), plant(ROCK_OUTCROP, 0.05, 1.0), plant(BOULDER, 0.05, 1.0)];
+const TROPICAL_FOREST: &[Plant] = &[plant(EMERGENT, 0.28, 1.0), plant(PALM, 0.24, 1.0), plant(TREE_FERN, 0.16, 1.0), plant(BROADLEAF_UNDER, 0.14, 1.0), plant(LIANA, 0.08, 1.0), plant(FALLEN_LOG, 0.05, 1.0), plant(BOULDER, 0.05, 1.0)];
+const GRASSLAND: &[Plant] = &[plant(BUNCHGRASS, 0.52, 1.0), plant(WILDFLOWER, 0.16, 1.0), plant(SAGEBRUSH, 0.12, 1.0), plant(ACACIA, 0.08, 1.0), plant(ROCK_OUTCROP, 0.06, 1.0), plant(BOULDER, 0.06, 1.0)];
+const DESERT: &[Plant] = &[plant(CACTUS, 0.30, 1.0), plant(BARREL, 0.18, 1.0), plant(CREOSOTE, 0.18, 1.0), plant(SAGEBRUSH, 0.10, 0.9), plant(HOODOO, 0.12, 1.0), plant(BOULDER, 0.12, 1.0)];
+const BEACH: &[Plant] = &[plant(PALM, 0.46, 1.0), plant(BUNCHGRASS, 0.34, 0.8), plant(ROCK_OUTCROP, 0.10, 1.0), plant(BOULDER, 0.10, 1.0)];
+const TUNDRA: &[Plant] = &[plant(BUNCHGRASS, 0.40, 0.8), plant(DWARF_SHRUB, 0.26, 1.0), plant(ROCK_OUTCROP, 0.18, 1.0), plant(BOULDER, 0.16, 1.0)];
+const MOUNTAIN: &[Plant] = &[plant(SPRUCE, 0.30, 0.5), plant(FIR, 0.16, 0.5), plant(ROCK_OUTCROP, 0.30, 1.0), plant(BOULDER, 0.24, 1.0)];
 
 /// Per-biome planting table (`None` for barren ocean/ice/snow — the placer skips them).
 fn biome_plants(biome: Biome) -> Option<&'static [Plant]> {
