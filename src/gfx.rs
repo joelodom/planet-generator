@@ -392,11 +392,29 @@ fn overlay_instance_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
+/// Bytes per pixel of the offscreen RGBA8 readback (R,G,B,A × u8).
+const RGBA_BYTES_PER_PIXEL: u32 = 4;
+
+/// Where a [`Renderer`] sends its frames: a window's swapchain (the normal app) or
+/// an owned offscreen texture copied back to CPU (the headless `--video` mode).
+enum RenderTarget {
+    Window {
+        surface: wgpu::Surface<'static>,
+        config: wgpu::SurfaceConfiguration,
+    },
+    /// `color` is the render target; each frame is `copy_texture_to_buffer`'d into
+    /// `readback` (`row_bytes` = the 256-aligned padded stride wgpu requires).
+    Offscreen {
+        color: wgpu::Texture,
+        readback: wgpu::Buffer,
+        row_bytes: u32,
+    },
+}
+
 pub struct Renderer {
-    surface: wgpu::Surface<'static>,
+    target: RenderTarget,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
     pub size: (u32, u32),
 
     depth_view: wgpu::TextureView,
@@ -514,6 +532,111 @@ impl Renderer {
             "surface configured"
         );
 
+        Ok(Self::assemble(
+            device,
+            queue,
+            format,
+            size,
+            RenderTarget::Window { surface, config },
+            supports_wireframe,
+            veg_meshes,
+            veg_textures,
+        ))
+    }
+
+    /// Headless constructor — no window, no surface. Renders into an owned offscreen
+    /// texture of `width`×`height` that [`Renderer::render_to_rgba`] copies back to
+    /// CPU each frame. Used by the `--video` mode (see [`crate::video`]); the normal
+    /// app uses [`Renderer::new`].
+    pub async fn new_offscreen(
+        width: u32,
+        height: u32,
+        veg_meshes: &[VegMesh],
+        veg_textures: &TextureArray,
+    ) -> anyhow::Result<Self> {
+        let size = (width.max(1), height.max(1));
+
+        let mut idesc = wgpu::InstanceDescriptor::new_without_display_handle();
+        idesc.backends = wgpu::Backends::METAL | wgpu::Backends::DX12 | wgpu::Backends::VULKAN | wgpu::Backends::GL;
+        let instance = wgpu::Instance::new(idesc);
+
+        // No surface to be compatible with — that's the whole point of headless.
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .await?;
+        let info = adapter.get_info();
+        tracing::info!(
+            name = %info.name,
+            backend = ?info.backend,
+            device_type = ?info.device_type,
+            "gpu adapter selected (headless)"
+        );
+
+        let supports_wireframe = adapter.features().contains(wgpu::Features::POLYGON_MODE_LINE);
+        let required_features = if supports_wireframe { wgpu::Features::POLYGON_MODE_LINE } else { wgpu::Features::empty() };
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("planet-device-headless"),
+                required_features,
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                experimental_features: wgpu::ExperimentalFeatures::default(),
+                trace: wgpu::Trace::Off,
+            })
+            .await?;
+
+        // A plain sRGB target the pipelines render into; the readback bytes are RGBA
+        // in this (already sRGB-encoded) space, fed straight to the encoder as `rgba`.
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen-color"),
+            size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        // wgpu requires each readback row padded to COPY_BYTES_PER_ROW_ALIGNMENT.
+        let row_bytes = (size.0 * RGBA_BYTES_PER_PIXEL).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("offscreen-readback"),
+            size: (row_bytes * size.1) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        tracing::info!(size = ?size, format = ?format, supports_wireframe, "headless renderer configured");
+
+        Ok(Self::assemble(
+            device,
+            queue,
+            format,
+            size,
+            RenderTarget::Offscreen { color, readback, row_bytes },
+            supports_wireframe,
+            veg_meshes,
+            veg_textures,
+        ))
+    }
+
+    /// Build the pipelines, buffers, and bind groups shared by both constructors,
+    /// once `device`/`queue`/`format`/`target` are set up.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        format: wgpu::TextureFormat,
+        size: (u32, u32),
+        target: RenderTarget,
+        supports_wireframe: bool,
+        veg_meshes: &[VegMesh],
+        veg_textures: &TextureArray,
+    ) -> Self {
         let depth_view = create_depth(&device, size.0, size.1);
 
         // Globals uniform + bind group (group 0, binding 0) used by all shaders.
@@ -635,11 +758,10 @@ impl Renderer {
             wgpu::PolygonMode::Fill,
         );
 
-        Ok(Self {
-            surface,
+        Self {
+            target,
             device,
             queue,
-            config,
             size,
             depth_view,
             globals_buf,
@@ -663,17 +785,22 @@ impl Renderer {
             tick: 0,
             wireframe: false,
             supports_wireframe,
-        })
+        }
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {
         if w == 0 || h == 0 {
             return;
         }
+        // Only a windowed swapchain resizes; the offscreen video target is fixed-size.
+        if let RenderTarget::Window { surface, config } = &mut self.target {
+            config.width = w;
+            config.height = h;
+            surface.configure(&self.device, config);
+        } else {
+            return;
+        }
         self.size = (w, h);
-        self.config.width = w;
-        self.config.height = h;
-        self.surface.configure(&self.device, &self.config);
         self.depth_view = create_depth(&self.device, w, h);
         if self.overlay_visible {
             self.rebuild_overlay();
@@ -815,22 +942,19 @@ impl Renderer {
     }
 
     pub fn render(&mut self, draw: &[ChunkKey]) {
-        // LRU bookkeeping: stamp the chunks we're about to draw as used this tick, so
-        // eviction keeps the working set (and recently-left areas) and drops the rest.
-        self.tick += 1;
-        let tick = self.tick;
-        for key in draw {
-            if let Some(c) = self.chunks.get_mut(key) {
-                c.last_used = tick;
-            }
-        }
+        self.stamp_drawn(draw);
 
+        let RenderTarget::Window { surface, config } = &self.target else {
+            // render() is the windowed path; the headless target uses render_to_rgba().
+            debug_assert!(false, "render() called on a headless renderer");
+            return;
+        };
         use wgpu::CurrentSurfaceTexture as Cst;
-        let frame = match self.surface.get_current_texture() {
+        let frame = match surface.get_current_texture() {
             Cst::Success(f) | Cst::Suboptimal(f) => f,
             Cst::Outdated | Cst::Lost => {
                 tracing::debug!("surface lost/outdated; reconfiguring");
-                self.surface.configure(&self.device, &self.config);
+                surface.configure(&self.device, config);
                 return;
             }
             other => {
@@ -841,107 +965,162 @@ impl Renderer {
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        self.record_scene(&mut encoder, &view, draw);
+        self.queue.submit(Some(encoder.finish()));
+        frame.present();
+    }
 
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("main-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.01, g: 0.01, b: 0.02, a: 1.0 }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
+    /// Headless render: draw one frame into the offscreen texture and return tight
+    /// RGBA8 bytes (`size.0 * size.1 * 4`, row padding stripped). Only valid on a
+    /// renderer built with [`Renderer::new_offscreen`]; see [`crate::video`].
+    pub fn render_to_rgba(&mut self, draw: &[ChunkKey]) -> Vec<u8> {
+        self.stamp_drawn(draw);
+
+        let RenderTarget::Offscreen { color, readback, row_bytes } = &self.target else {
+            debug_assert!(false, "render_to_rgba() called on a windowed renderer");
+            return Vec::new();
+        };
+        let (w, h) = self.size;
+        let view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame-headless") });
+        self.record_scene(&mut encoder, &view, draw);
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: color, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo {
+                buffer: readback,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(*row_bytes), rows_per_image: Some(h) },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        // Map the readback buffer and strip each row's 256-alignment padding into a
+        // tight RGBA frame, then unmap so the buffer is reusable next frame.
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range();
+        let unpadded = (w * RGBA_BYTES_PER_PIXEL) as usize;
+        let mut rgba = Vec::with_capacity(unpadded * h as usize);
+        for row in 0..h as usize {
+            let start = row * *row_bytes as usize;
+            rgba.extend_from_slice(&data[start..start + unpadded]);
+        }
+        drop(data);
+        readback.unmap();
+        rgba
+    }
+
+    /// Stamp the chunks about to be drawn as used this tick (LRU bookkeeping shared by
+    /// the windowed and headless render paths): eviction keeps the working set (and
+    /// recently-left areas) and drops the rest.
+    fn stamp_drawn(&mut self, draw: &[ChunkKey]) {
+        self.tick += 1;
+        let tick = self.tick;
+        for key in draw {
+            if let Some(c) = self.chunks.get_mut(key) {
+                c.last_used = tick;
+            }
+        }
+    }
+
+    /// Record the full scene (sky, terrain, vegetation, overlay) into `encoder`,
+    /// drawing into `color_view` against the shared depth buffer. Identical for the
+    /// windowed swapchain and the offscreen video target.
+    fn record_scene(&self, encoder: &mut wgpu::CommandEncoder, color_view: &wgpu::TextureView, draw: &[ChunkKey]) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("main-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.01, g: 0.01, b: 0.02, a: 1.0 }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
                 }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
 
-            pass.set_bind_group(0, &self.globals_bind, &[]);
+        pass.set_bind_group(0, &self.globals_bind, &[]);
 
-            // Sky first (depth-always, no write) to fill the background.
-            pass.set_pipeline(&self.sky_pipeline);
-            pass.draw(0..3, 0..1);
+        // Sky first (depth-always, no write) to fill the background.
+        pass.set_pipeline(&self.sky_pipeline);
+        pass.draw(0..3, 0..1);
 
-            // Terrain.
-            let terrain_pipe = if self.wireframe {
-                self.terrain_wire.as_ref().unwrap_or(&self.terrain_pipeline)
-            } else {
-                &self.terrain_pipeline
-            };
-            pass.set_pipeline(terrain_pipe);
-            // All resident terrain lives in the shared arena: bind each block's
-            // buffers ONCE, then draw every visible chunk in that block by
-            // base_vertex/first_index — a handful of binds per frame instead of two
-            // per drawn chunk (the draw-call bottleneck on the RTX 5090).
-            if let Some(arena) = &self.terrain_arena {
-                for (bi, block) in arena.blocks.iter().enumerate() {
-                    let bi = bi as u32;
-                    pass.set_vertex_buffer(0, block.vbuf.slice(..));
-                    pass.set_index_buffer(block.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                    for key in draw {
-                        if let Some(chunk) = self.chunks.get(key)
-                            && chunk.terrain.block == bi
-                        {
-                            let first = arena.first_index(chunk.terrain);
-                            pass.draw_indexed(first..first + arena.slot_indices, arena.base_vertex(chunk.terrain), 0..1);
-                        }
-                    }
-                }
-            }
-
-            // Vegetation: bind the combined base-mesh buffers + texture array ONCE (a
-            // mesh is selected by base_vertex/first_index), then per veg chunk bind its
-            // instance buffer once and draw each mesh's run — instead of rebinding a
-            // base buffer per mesh per chunk. Skipped in wireframe mode.
-            if !self.wireframe && !self.veg.ranges.is_empty() {
-                pass.set_pipeline(&self.veg.pipeline);
-                pass.set_bind_group(1, &self.veg.tex_bind, &[]);
-                pass.set_vertex_buffer(0, self.veg.vbuf.slice(..));
-                pass.set_index_buffer(self.veg.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+        // Terrain.
+        let terrain_pipe = if self.wireframe {
+            self.terrain_wire.as_ref().unwrap_or(&self.terrain_pipeline)
+        } else {
+            &self.terrain_pipeline
+        };
+        pass.set_pipeline(terrain_pipe);
+        // All resident terrain lives in the shared arena: bind each block's buffers
+        // ONCE, then draw every visible chunk in that block by base_vertex/first_index
+        // — a handful of binds per frame instead of two per drawn chunk.
+        if let Some(arena) = &self.terrain_arena {
+            for (bi, block) in arena.blocks.iter().enumerate() {
+                let bi = bi as u32;
+                pass.set_vertex_buffer(0, block.vbuf.slice(..));
+                pass.set_index_buffer(block.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 for key in draw {
-                    if let Some(GpuChunk { veg: Some(veg), .. }) = self.chunks.get(key) {
-                        pass.set_vertex_buffer(1, veg.instances.slice(..));
-                        for &(mesh_id, start, count) in &veg.draws {
-                            let s = self.veg.ranges[mesh_id as usize];
-                            pass.draw_indexed(s.first_index..s.first_index + s.count, s.base_vertex, start..start + count);
-                        }
+                    if let Some(chunk) = self.chunks.get(key)
+                        && chunk.terrain.block == bi
+                    {
+                        let first = arena.first_index(chunk.terrain);
+                        pass.draw_indexed(first..first + arena.slot_indices, arena.base_vertex(chunk.terrain), 0..1);
                     }
-                }
-            }
-
-            // (Ocean is part of the terrain mesh now — no separate water pass.)
-
-            // Help overlay on top of everything (screen-space).
-            if self.overlay_visible {
-                if let Some((buf, count)) = &self.overlay_instances {
-                    pass.set_pipeline(&self.overlay_pipeline);
-                    pass.set_vertex_buffer(0, self.overlay_quad.slice(..));
-                    pass.set_vertex_buffer(1, buf.slice(..));
-                    pass.draw(0..6, 0..*count);
-                }
-                if let Some(img) = &self.image_instance {
-                    pass.set_pipeline(&self.image_pipeline);
-                    pass.set_bind_group(0, &self.planet_bind, &[]);
-                    pass.set_vertex_buffer(0, self.overlay_quad.slice(..));
-                    pass.set_vertex_buffer(1, img.slice(..));
-                    pass.draw(0..6, 0..1);
                 }
             }
         }
 
-        self.queue.submit(Some(encoder.finish()));
-        frame.present();
+        // Vegetation: bind the combined base-mesh buffers + texture array ONCE (a mesh
+        // is selected by base_vertex/first_index), then per veg chunk bind its instance
+        // buffer once and draw each mesh's run. Skipped in wireframe mode.
+        if !self.wireframe && !self.veg.ranges.is_empty() {
+            pass.set_pipeline(&self.veg.pipeline);
+            pass.set_bind_group(1, &self.veg.tex_bind, &[]);
+            pass.set_vertex_buffer(0, self.veg.vbuf.slice(..));
+            pass.set_index_buffer(self.veg.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            for key in draw {
+                if let Some(GpuChunk { veg: Some(veg), .. }) = self.chunks.get(key) {
+                    pass.set_vertex_buffer(1, veg.instances.slice(..));
+                    for &(mesh_id, start, count) in &veg.draws {
+                        let s = self.veg.ranges[mesh_id as usize];
+                        pass.draw_indexed(s.first_index..s.first_index + s.count, s.base_vertex, start..start + count);
+                    }
+                }
+            }
+        }
+
+        // (Ocean is part of the terrain mesh now — no separate water pass.)
+
+        // Help overlay on top of everything (screen-space).
+        if self.overlay_visible {
+            if let Some((buf, count)) = &self.overlay_instances {
+                pass.set_pipeline(&self.overlay_pipeline);
+                pass.set_vertex_buffer(0, self.overlay_quad.slice(..));
+                pass.set_vertex_buffer(1, buf.slice(..));
+                pass.draw(0..6, 0..*count);
+            }
+            if let Some(img) = &self.image_instance {
+                pass.set_pipeline(&self.image_pipeline);
+                pass.set_bind_group(0, &self.planet_bind, &[]);
+                pass.set_vertex_buffer(0, self.overlay_quad.slice(..));
+                pass.set_vertex_buffer(1, img.slice(..));
+                pass.draw(0..6, 0..1);
+            }
+        }
     }
 }
 
@@ -1120,6 +1299,44 @@ mod smoke {
             assert_eq!(a.base_vertex(s), (k * sv) as i32);
             assert_eq!(a.first_index(s), k * si);
         }
+    }
+
+    /// The public headless path `--video` relies on: build a surfaceless renderer,
+    /// upload the root chunks, and render one frame to RGBA. Asserts a correctly
+    /// sized, non-uniform image (sky + planet actually drew). Skips if no adapter.
+    #[test]
+    fn headless_renderer_draws_a_frame() {
+        const W: u32 = 96;
+        const H: u32 = 64;
+        let planet = std::sync::Arc::new(Planet::new(0x00C0_FFEE));
+        let flora = &planet.flora;
+        let Ok(mut renderer) = pollster::block_on(Renderer::new_offscreen(W, H, flora.meshes(), flora.textures())) else {
+            eprintln!("no GPU adapter; skipping headless render test");
+            return;
+        };
+        let graphics = crate::settings::Graphics::default();
+        let cfg = crate::mesh::MeshConfig::new(graphics.mesh_res, graphics.veg_min_level, graphics.veg_density);
+        let roots: Vec<ChunkKey> = ChunkKey::roots().into_iter().collect();
+        for &root in &roots {
+            renderer.upload_chunk(root, crate::mesh::CpuChunk::build(&planet, root, &cfg));
+        }
+        let mut cam = crate::camera::Camera::new(&planet, glam::Vec3::new(0.4, 0.5, 0.77).normalize());
+        cam.set_aspect(W, H);
+        let (vp, _v, pos) = cam.view_proj(&planet);
+        let inv = vp.inverse();
+        let g = Globals {
+            view_proj: vp.to_cols_array_2d(),
+            inv_view_proj: inv.to_cols_array_2d(),
+            camera_pos: [pos.x, pos.y, pos.z, 0.0],
+            sun_dir: [planet.sun_dir.x, planet.sun_dir.y, planet.sun_dir.z, 0.32],
+            params: [cam.fog_density(), crate::planet::PLANET_RADIUS, crate::planet::SEA_LEVEL, cam.altitude()],
+            atmosphere: [planet.atmosphere.x, planet.atmosphere.y, planet.atmosphere.z, 0.0],
+        };
+        renderer.update_globals(&g);
+        let frame = renderer.render_to_rgba(&roots);
+        assert_eq!(frame.len(), (W * H * 4) as usize, "frame is the wrong size");
+        let first = &frame[0..4];
+        assert!(frame.chunks_exact(4).any(|px| px != first), "headless frame is a flat color — nothing drew");
     }
 
     #[test]

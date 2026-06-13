@@ -129,6 +129,15 @@ pub struct Tour {
 }
 
 impl Tour {
+    /// Human-readable current phase, for the `--video` progress log.
+    pub fn phase_label(&self) -> &'static str {
+        match self.phase {
+            Phase::Travel => "Travel",
+            Phase::Descend => "Descend",
+            Phase::Cruise => "Cruise",
+        }
+    }
+
     /// Begin a tour from the camera's current view.
     pub fn new(cam: &Camera, planet: &Planet) -> Self {
         let mut tour = Self {

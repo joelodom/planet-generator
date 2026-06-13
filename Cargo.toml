@@ -6,6 +6,9 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 bytemuck = "1.25.0"
+# Cross-platform Ctrl+C handler — used only by headless `--video` to stop the
+# tour and finalize the file cleanly. The normal app never installs it.
+ctrlc = "3.5"
 glam = "0.33.1"
 # glTF 2.0 loader for the embedded flora .glb models (src/models.rs). default
 # features off to skip the heavy `image` crate — we decode the embedded PNG

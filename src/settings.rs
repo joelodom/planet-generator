@@ -119,6 +119,15 @@ impl Default for Graphics {
 }
 
 impl Graphics {
+    /// The maximum-detail preset (a 5090 pushed to its limit). Offline video
+    /// recording isn't real-time bound, so it can afford the highest LOD/mesh/veg
+    /// settings regardless of the host GPU — [`crate::run_video`] uses this.
+    pub fn ultra() -> Self {
+        let mut g = Graphics::default();
+        g.apply_preset(PRESETS.len() - 1); // Ultra is the last (highest) tier
+        g
+    }
+
     /// Resident-geometry budget in bytes — the renderer evicts cached chunks to keep
     /// real GPU memory (terrain + vegetation) under this.
     pub fn mem_budget_bytes(&self) -> usize {

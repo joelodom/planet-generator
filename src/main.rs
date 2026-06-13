@@ -30,6 +30,7 @@ mod planet;
 mod settings;
 mod tour;
 mod units;
+mod video;
 #[cfg(test)]
 mod tests;
 
@@ -38,8 +39,11 @@ use gfx::{Globals, Renderer};
 use glam::Vec3;
 use lod::Streamer;
 use planet::Planet;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+use anyhow::Context;
 use tracing::{debug, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
@@ -71,6 +75,20 @@ const HITCH_LOG_COOLDOWN: f32 = 1.0;
 /// Bytes per MiB, for the resident-memory readout (HUD + perf log).
 const BYTES_PER_MIB: f32 = 1024.0 * 1024.0;
 
+// --- Headless `--video` recorder (see `parse_video` / `run_video`) ---
+/// Default recording resolution — 1080p, YouTube's 16:9 standard.
+const VIDEO_WIDTH: u32 = 1920;
+const VIDEO_HEIGHT: u32 = 1080;
+/// Default recording framerate.
+const VIDEO_FPS: u32 = 60;
+/// Per recorded frame, let the chunk streamer load the visible terrain/vegetation
+/// before capture — bounded so a chunk that never meshes can't hang a frame.
+const VIDEO_SETTLE_MAX_MS: u128 = 2000;
+const VIDEO_SETTLE_SLEEP_MS: u64 = 15;
+/// Heartbeat progress line every this many recorded seconds (the tour also logs a
+/// line at each phase change).
+const VIDEO_LOG_EVERY_SECONDS: u64 = 5;
+
 fn main() -> anyhow::Result<()> {
     if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
         println!(
@@ -85,6 +103,7 @@ fn main() -> anyhow::Result<()> {
     let log_path = logging::init();
     let seed = parse_seed();
     let unit_system = parse_units();
+    let video = parse_video();
     let planet = Arc::new(Planet::new(seed));
 
     // Console banner (handy when launched from a terminal; invisible under
@@ -96,7 +115,9 @@ fn main() -> anyhow::Result<()> {
     println!("  reproduce  : cargo run -- --seed {seed}");
     println!("  units      : {} (use --units us for imperial)", unit_system.label());
     println!("  log        : {}", log_path.display());
-    print_controls();
+    if video.is_none() {
+        print_controls();
+    }
 
     info!(
         seed,
@@ -109,6 +130,12 @@ fn main() -> anyhow::Result<()> {
         log = %log_path.display(),
         "planet-explorer starting"
     );
+
+    // Headless video mode: render the guided tour to an MP4 and exit — no window,
+    // no event loop. (`--video`, optionally `--video-out/-size/-fps/-seconds`.)
+    if let Some(opts) = video {
+        return run_video(seed, planet, unit_system, opts);
+    }
 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -163,6 +190,212 @@ fn print_controls() {
          Esc             graphics settings + help (arrows adjust)\n  \
          {quit} / close  quit\n"
     );
+}
+
+/// Options for the headless `--video` recorder (parsed by [`parse_video`]).
+struct VideoOptions {
+    path: PathBuf,
+    width: u32,
+    height: u32,
+    fps: u32,
+    /// Auto-stop after this many recorded seconds; `None` = run until Ctrl+C.
+    max_seconds: Option<u32>,
+}
+
+/// Parse `--video` and its options, or `None` if not recording. Tolerant of bad
+/// values (warn + fall back to defaults), like the other CLI parsers.
+fn parse_video() -> Option<VideoOptions> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.iter().any(|a| a == "--video") {
+        return None;
+    }
+    let mut path: Option<PathBuf> = None;
+    let (mut width, mut height, mut fps) = (VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS);
+    let mut max_seconds = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--video-out" => {
+                if let Some(v) = it.next() {
+                    path = Some(PathBuf::from(v));
+                }
+            }
+            "--video-size" => {
+                if let Some(v) = it.next() {
+                    match v
+                        .split_once(['x', 'X'])
+                        .and_then(|(a, b)| Some((a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?)))
+                    {
+                        Some((w, h)) => {
+                            width = w;
+                            height = h;
+                        }
+                        None => eprintln!("warning: bad --video-size '{v}', using {VIDEO_WIDTH}x{VIDEO_HEIGHT}"),
+                    }
+                }
+            }
+            "--video-fps" => {
+                if let Some(v) = it.next() {
+                    match v.parse::<u32>() {
+                        Ok(n) => fps = n,
+                        Err(_) => eprintln!("warning: bad --video-fps '{v}', using {VIDEO_FPS}"),
+                    }
+                }
+            }
+            "--video-seconds" => {
+                if let Some(v) = it.next() {
+                    match v.parse::<u32>() {
+                        Ok(n) => max_seconds = Some(n),
+                        Err(_) => eprintln!("warning: bad --video-seconds '{v}', recording until Ctrl+C"),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // yuv420p needs even dimensions; keep at least 2 px and ≥ 1 fps.
+    width = (width & !1).max(2);
+    height = (height & !1).max(2);
+    fps = fps.max(1);
+    Some(VideoOptions { path: path.unwrap_or_else(default_video_path), width, height, fps, max_seconds })
+}
+
+/// Where `--video` writes by default: the shared drop point on macOS (reachable from
+/// the GUI account, like the log and the app bundle), the OS temp dir elsewhere.
+fn default_video_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/Users/Shared/planet-explorer-tour.mp4")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::temp_dir().join("planet-explorer-tour.mp4")
+    }
+}
+
+/// Headless tour recorder: build a surfaceless renderer, fly the guided tour at a
+/// fixed timestep, and pipe each rendered frame to ffmpeg as an MP4. Ctrl+C stops
+/// the loop and finalizes the file. No window or event loop is created, so it runs
+/// on a headless box.
+fn run_video(seed: u64, planet: Arc<Planet>, units: units::Units, opts: VideoOptions) -> anyhow::Result<()> {
+    let (w, h, fps) = (opts.width, opts.height, opts.fps);
+
+    // Ctrl+C → stop flag: the loop breaks and we finalize, so the file stays playable.
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst)).context("installing Ctrl+C handler")?;
+    }
+
+    // Start ffmpeg FIRST so a missing/broken encoder fails fast, before any GPU work.
+    let mut encoder = video::VideoEncoder::start(&opts.path, w, h, fps).context("starting the video encoder")?;
+
+    // Headless renderer + streamer — mirrors App::resumed, minus window and audio.
+    // Video isn't real-time bound, so always record at maximum detail regardless of
+    // the host GPU: the live frame rate doesn't matter (we encode a fixed timestep),
+    // and per-frame settling lets the streamer fully resolve each Ultra frame.
+    let graphics = settings::Graphics::ultra();
+    let mesh_cfg = mesh::MeshConfig::new(graphics.mesh_res, graphics.veg_min_level, graphics.veg_density);
+    let flora = &planet.flora;
+    let mut renderer = pollster::block_on(Renderer::new_offscreen(w, h, flora.meshes(), flora.textures())).context("creating the headless renderer")?;
+
+    let mut camera = Camera::new(&planet, Vec3::new(0.4, 0.5, 0.77).normalize());
+    camera.set_aspect(w, h);
+
+    // Seed the six root chunks so the first frame is never blank.
+    for root in lod::ChunkKey::roots() {
+        let cpu = mesh::CpuChunk::build(&planet, root, &mesh_cfg);
+        renderer.upload_chunk(root, cpu);
+    }
+    let threads = std::thread::available_parallelism().map(|n| n.get().saturating_sub(1)).unwrap_or(3).max(1);
+    let mut streamer = Streamer::new(planet.clone(), threads, mesh_cfg.clone());
+
+    let mut tour = tour::Tour::new(&camera, &planet);
+    let dt = 1.0 / fps as f32;
+    let max_frames = opts.max_seconds.map(|s| s as u64 * fps as u64);
+
+    println!("recording {w}x{h} @ {fps}fps ({} detail) -> {}", graphics.preset, opts.path.display());
+    match opts.max_seconds {
+        Some(s) => println!("  stopping after {s}s (Ctrl+C to stop sooner)"),
+        None => println!("  press Ctrl+C to stop and finalize the file"),
+    }
+    info!(w, h, fps, detail = graphics.preset, path = %opts.path.display(), seconds = ?opts.max_seconds, "video recording started");
+
+    let mut frame_idx: u64 = 0;
+    let mut sim_time = 0.0f32;
+    let mut last_phase = "";
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            println!("\nCtrl+C received — finalizing…");
+            break;
+        }
+        if let Some(mf) = max_frames
+            && frame_idx >= mf
+        {
+            println!("\nreached target length — finalizing…");
+            break;
+        }
+
+        // Advance the tour with a fixed timestep (smooth, render-speed independent).
+        tour.update(dt, &planet, &mut camera);
+        sim_time += dt;
+
+        // Let the streamer load the visible terrain/veg before we capture (bounded).
+        let cam_pos = camera.position(&planet);
+        let settle = Instant::now();
+        let sel = loop {
+            for (key, cpu) in streamer.poll() {
+                renderer.upload_chunk(key, cpu);
+            }
+            let sel = lod::select(&planet, cam_pos, graphics.split_factor, &|k| renderer.has_chunk(k));
+            if sel.want.is_empty() || settle.elapsed().as_millis() >= VIDEO_SETTLE_MAX_MS {
+                break sel;
+            }
+            for key in &sel.want {
+                streamer.request(*key);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(VIDEO_SETTLE_SLEEP_MS));
+        };
+
+        let keep: std::collections::HashSet<_> = sel.draw.iter().copied().collect();
+        renderer.evict(&keep, graphics.mem_budget_bytes());
+
+        // Per-frame uniforms — identical to App::frame's globals.
+        let (view_proj, _view, pos) = camera.view_proj(&planet);
+        let inv = view_proj.inverse();
+        let globals = Globals {
+            view_proj: view_proj.to_cols_array_2d(),
+            inv_view_proj: inv.to_cols_array_2d(),
+            camera_pos: [pos.x, pos.y, pos.z, sim_time],
+            sun_dir: [planet.sun_dir.x, planet.sun_dir.y, planet.sun_dir.z, SUN_AMBIENT],
+            params: [camera.fog_density(), planet::PLANET_RADIUS, planet::SEA_LEVEL, camera.altitude()],
+            atmosphere: [planet.atmosphere.x, planet.atmosphere.y, planet.atmosphere.z, (seed % 997) as f32],
+        };
+        renderer.update_globals(&globals);
+
+        let rgba = renderer.render_to_rgba(&sel.draw);
+        encoder.write_frame(&rgba).context("piping a frame to ffmpeg")?;
+        frame_idx += 1;
+
+        // Progress on stdout: a line at each phase change, plus a periodic heartbeat,
+        // so the user can gauge the tour and decide when to Ctrl+C.
+        let phase = tour.phase_label();
+        let heartbeat = frame_idx.is_multiple_of(fps as u64 * VIDEO_LOG_EVERY_SECONDS);
+        if phase != last_phase || heartbeat {
+            let (lat, lon) = camera.lat_lon();
+            let biome = planet.sample(camera.focus).biome.name();
+            println!(
+                "  [{sim_time:>6.1}s] {phase:<7} {biome:<16} {lat:>6.1}°,{lon:>7.1}°  alt {}  ({frame_idx} frames)",
+                units::distance(camera.altitude(), units)
+            );
+            last_phase = phase;
+        }
+    }
+
+    let path = encoder.finish().context("finalizing the video")?;
+    println!("video written: {}", path.display());
+    info!(path = %path.display(), frames = frame_idx, seconds = round1(sim_time), "video finalized");
+    Ok(())
 }
 
 struct App {
