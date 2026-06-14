@@ -53,12 +53,12 @@ macro_rules! archetype {
     };
 }
 
-/// The archetypes (9 P0 + 15 P1). **Index = mesh index = texture-load order**; the
+/// The archetypes (9 P0 + 22 P1). **Index = mesh index = texture-load order**; the
 /// biome tables and [`models::load`] both key off this order. P0 heights/clustering
 /// per `flora-revamp/FLORA_P0_INTEGRATION_PLAN.md` §3; the P1 rows follow the same
 /// scheme — rock/deadwood sit low and scatter broadly, trees are tall and tightly
 /// clustered, shrubs/forbs are small.
-const ARCHETYPES: [Archetype; 24] = [
+const ARCHETYPES: [Archetype; 31] = [
     // --- P0 ---
     archetype!("granite-boulder", 0.10, 0.45, 2.0, 8.0),
     archetype!("broadleaf-hardwood", 1.8, 3.6, 30.0, 400.0),
@@ -69,7 +69,7 @@ const ARCHETYPES: [Archetype; 24] = [
     archetype!("bunchgrass-tussock", 0.10, 0.26, 0.05, 6.0),
     archetype!("savanna-acacia", 1.4, 2.6, 8.0, 120.0),
     archetype!("columnar-cactus", 0.5, 1.6, 3.0, 80.0),
-    // --- P1 ---
+    // --- P1 (first 15) ---
     archetype!("rock-outcrop", 0.12, 0.55, 2.0, 10.0),
     archetype!("fallen-log", 0.12, 0.30, 8.0, 120.0),
     archetype!("white-birch", 1.6, 3.4, 30.0, 400.0),
@@ -85,6 +85,14 @@ const ARCHETYPES: [Archetype; 24] = [
     archetype!("barrel-cactus", 0.10, 0.35, 1.0, 30.0),
     archetype!("creosote-shrub", 0.20, 0.60, 1.0, 25.0),
     archetype!("dwarf-shrub", 0.06, 0.18, 0.5, 8.0),
+    // --- P1 (final 7) — cold/coastal/alpine fills + a wetland sedge ---
+    archetype!("cotton-grass", 0.10, 0.24, 0.3, 6.0),       // tundra/bog sedge tuft, drifts
+    archetype!("lichen-boulder", 0.12, 0.50, 2.0, 10.0),    // alpine/moraine boulder
+    archetype!("leaning-palm", 1.8, 4.0, 10.0, 200.0),      // coastal palm
+    archetype!("dune-grass", 0.12, 0.30, 0.3, 6.0),         // beach bunchgrass tussock
+    archetype!("talus-rock", 0.12, 0.55, 1.5, 10.0),        // angular scree boulder
+    archetype!("krummholz-conifer", 0.9, 2.2, 20.0, 300.0), // stunted treeline conifer, mats
+    archetype!("snow-laden-conifer", 2.0, 4.2, 30.0, 400.0), // boreal/subalpine conifer
 ];
 
 // Archetype indices (into ARCHETYPES) used by the biome tables.
@@ -113,6 +121,13 @@ const HOODOO: usize = 20;
 const BARREL: usize = 21;
 const CREOSOTE: usize = 22;
 const DWARF_SHRUB: usize = 23;
+const COTTON_GRASS: usize = 24;
+const LICHEN_BOULDER: usize = 25;
+const LEANING_PALM: usize = 26;
+const DUNE_GRASS: usize = 27;
+const TALUS_ROCK: usize = 28;
+const KRUMMHOLZ: usize = 29;
+const SNOW_CONIFER: usize = 30;
 
 /// One entry in a biome's planting table: which archetype, its relative weight in
 /// the local mix, and a multiplier on the archetype's base height range (so a
@@ -126,19 +141,21 @@ const fn plant(arch: usize, weight: f32, scale: f32) -> Plant {
     Plant { arch, weight, scale }
 }
 
-// Per-biome planting tables (`FLORA_P0_INTEGRATION_PLAN.md` §2, extended with the P1
-// archetypes). Weights are relative within a biome; the granite boulder and the P1
-// rock-outcrop are the cross-biome ground objects. Still standing in until their P1
-// models bake: bunchgrass for dune grass (beach) and for sedge alongside the dwarf
-// shrub (tundra); spruce/fir for krummholz (mountain).
+// Per-biome planting tables (`FLORA_P0_INTEGRATION_PLAN.md` §2, extended with the
+// full P1 archetype set). Weights are relative within a biome; the granite boulder
+// and the P1 rock-outcrop are the cross-biome ground objects. The final P1 models
+// now back what used to be stand-ins: dune-grass (beach), cotton-grass (tundra
+// sedge), krummholz-conifer (mountain treeline) — plus leaning-palm (beach),
+// lichen-boulder (tundra), talus-rock + snow-laden-conifer (mountain), and
+// snow-laden-conifer in the boreal mix.
 const TEMPERATE_FOREST: &[Plant] = &[plant(HARDWOOD, 0.26, 1.0), plant(OAK, 0.18, 1.0), plant(BIRCH, 0.16, 1.0), plant(SPRUCE, 0.10, 1.0), plant(UNDERSTORY, 0.12, 1.0), plant(FALLEN_LOG, 0.06, 1.0), plant(ROCK_OUTCROP, 0.06, 1.0), plant(BOULDER, 0.06, 1.0)];
-const BOREAL_FOREST: &[Plant] = &[plant(SPRUCE, 0.34, 1.0), plant(FIR, 0.26, 1.0), plant(PINE, 0.16, 1.0), plant(BIRCH, 0.08, 0.9), plant(FALLEN_LOG, 0.06, 1.0), plant(ROCK_OUTCROP, 0.05, 1.0), plant(BOULDER, 0.05, 1.0)];
+const BOREAL_FOREST: &[Plant] = &[plant(SPRUCE, 0.26, 1.0), plant(FIR, 0.20, 1.0), plant(SNOW_CONIFER, 0.18, 1.0), plant(PINE, 0.14, 1.0), plant(BIRCH, 0.07, 0.9), plant(FALLEN_LOG, 0.06, 1.0), plant(ROCK_OUTCROP, 0.045, 1.0), plant(BOULDER, 0.045, 1.0)];
 const TROPICAL_FOREST: &[Plant] = &[plant(EMERGENT, 0.28, 1.0), plant(PALM, 0.24, 1.0), plant(TREE_FERN, 0.16, 1.0), plant(BROADLEAF_UNDER, 0.14, 1.0), plant(LIANA, 0.08, 1.0), plant(FALLEN_LOG, 0.05, 1.0), plant(BOULDER, 0.05, 1.0)];
 const GRASSLAND: &[Plant] = &[plant(BUNCHGRASS, 0.52, 1.0), plant(WILDFLOWER, 0.16, 1.0), plant(SAGEBRUSH, 0.12, 1.0), plant(ACACIA, 0.08, 1.0), plant(ROCK_OUTCROP, 0.06, 1.0), plant(BOULDER, 0.06, 1.0)];
 const DESERT: &[Plant] = &[plant(CACTUS, 0.30, 1.0), plant(BARREL, 0.18, 1.0), plant(CREOSOTE, 0.18, 1.0), plant(SAGEBRUSH, 0.10, 0.9), plant(HOODOO, 0.12, 1.0), plant(BOULDER, 0.12, 1.0)];
-const BEACH: &[Plant] = &[plant(PALM, 0.46, 1.0), plant(BUNCHGRASS, 0.34, 0.8), plant(ROCK_OUTCROP, 0.10, 1.0), plant(BOULDER, 0.10, 1.0)];
-const TUNDRA: &[Plant] = &[plant(BUNCHGRASS, 0.40, 0.8), plant(DWARF_SHRUB, 0.26, 1.0), plant(ROCK_OUTCROP, 0.18, 1.0), plant(BOULDER, 0.16, 1.0)];
-const MOUNTAIN: &[Plant] = &[plant(SPRUCE, 0.30, 0.5), plant(FIR, 0.16, 0.5), plant(ROCK_OUTCROP, 0.30, 1.0), plant(BOULDER, 0.24, 1.0)];
+const BEACH: &[Plant] = &[plant(DUNE_GRASS, 0.38, 1.0), plant(PALM, 0.24, 1.0), plant(LEANING_PALM, 0.18, 1.0), plant(ROCK_OUTCROP, 0.10, 1.0), plant(BOULDER, 0.10, 1.0)];
+const TUNDRA: &[Plant] = &[plant(COTTON_GRASS, 0.34, 1.0), plant(DWARF_SHRUB, 0.24, 1.0), plant(LICHEN_BOULDER, 0.16, 1.0), plant(ROCK_OUTCROP, 0.14, 1.0), plant(BOULDER, 0.12, 1.0)];
+const MOUNTAIN: &[Plant] = &[plant(KRUMMHOLZ, 0.18, 1.0), plant(SNOW_CONIFER, 0.12, 0.7), plant(TALUS_ROCK, 0.24, 1.0), plant(ROCK_OUTCROP, 0.24, 1.0), plant(BOULDER, 0.22, 1.0)];
 
 /// Per-biome planting table (`None` for barren ocean/ice/snow — the placer skips them).
 fn biome_plants(biome: Biome) -> Option<&'static [Plant]> {
