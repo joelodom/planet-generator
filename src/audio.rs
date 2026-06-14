@@ -10,7 +10,8 @@
 //! Audio is best-effort: with no output device the app simply runs silent.
 
 use rand::seq::SliceRandom;
-use rand::RngExt;
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 use std::io::Cursor;
 
 /// The playlist. Order here is irrelevant (it's always shuffled). To add a song,
@@ -26,6 +27,18 @@ const TRACKS: &[&[u8]] = &[
     include_bytes!("../assets/soundtrack8.mp3"),
     include_bytes!("../assets/soundtrack9.mp3"),
 ];
+
+/// A shuffled play order of the embedded soundtrack, returned as raw mp3 bytes —
+/// the same "shuffle the playlist, play it through" idea the live player uses
+/// ([`Audio::enqueue_shuffled`]), but **seeded** so a given planet seed always
+/// yields the same soundtrack (matches the repo's derive-everything-from-seed
+/// rule). The headless `--video` recorder muxes these in as background music.
+pub fn shuffled_soundtrack(seed: u64) -> Vec<&'static [u8]> {
+    let mut order: Vec<usize> = (0..TRACKS.len()).collect();
+    let mut rng = StdRng::seed_from_u64(seed);
+    order.shuffle(&mut rng);
+    order.into_iter().map(|i| TRACKS[i]).collect()
+}
 
 /// Holds the audio output alive and drives the playlist. Drop to stop playback.
 pub struct Audio {
@@ -95,8 +108,19 @@ impl Audio {
 
 #[cfg(test)]
 mod tests {
-    use super::TRACKS;
+    use super::{shuffled_soundtrack, TRACKS};
     use rodio::Source;
+
+    #[test]
+    fn shuffled_soundtrack_is_seed_deterministic() {
+        // Same seed → identical play order (the property the video recorder relies on);
+        // different seeds generally differ. Compare by track bytes' identity (ptr).
+        let key = |v: &[&[u8]]| v.iter().map(|b| b.as_ptr() as usize).collect::<Vec<_>>();
+        assert_eq!(key(&shuffled_soundtrack(7)), key(&shuffled_soundtrack(7)));
+        assert_ne!(key(&shuffled_soundtrack(1)), key(&shuffled_soundtrack(2)));
+        // A shuffle is a permutation: every track appears exactly once.
+        assert_eq!(shuffled_soundtrack(7).len(), TRACKS.len());
+    }
 
     #[test]
     fn all_tracks_decode() {

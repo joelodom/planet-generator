@@ -81,6 +81,11 @@ const VIDEO_WIDTH: u32 = 1920;
 const VIDEO_HEIGHT: u32 = 1080;
 /// Default recording framerate.
 const VIDEO_FPS: u32 = 60;
+/// Default detail preset for recording. Video isn't real-time bound, so we record
+/// at high detail regardless of host GPU; "Very High" gives near-Ultra geometry
+/// without Ultra's 24 GB cache budget (which can swap a sub-32 GB host on a long
+/// run). Override with `--video-preset <name>`.
+const VIDEO_PRESET: &str = "Very High";
 /// Per recorded frame, let the chunk streamer load the visible terrain/vegetation
 /// before capture — bounded so a chunk that never meshes can't hang a frame.
 const VIDEO_SETTLE_MAX_MS: u128 = 2000;
@@ -200,6 +205,10 @@ struct VideoOptions {
     fps: u32,
     /// Auto-stop after this many recorded seconds; `None` = run until Ctrl+C.
     max_seconds: Option<u32>,
+    /// Detail preset to record at (defaults to [`VIDEO_PRESET`]).
+    graphics: settings::Graphics,
+    /// Record without the background-music track (`--video-mute`).
+    mute: bool,
 }
 
 /// Parse `--video` and its options, or `None` if not recording. Tolerant of bad
@@ -212,6 +221,9 @@ fn parse_video() -> Option<VideoOptions> {
     let mut path: Option<PathBuf> = None;
     let (mut width, mut height, mut fps) = (VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS);
     let mut max_seconds = None;
+    let mut graphics = settings::Graphics::from_preset(VIDEO_PRESET)
+        .expect("VIDEO_PRESET must name a real preset tier");
+    let mut mute = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -250,6 +262,18 @@ fn parse_video() -> Option<VideoOptions> {
                     }
                 }
             }
+            "--video-preset" => {
+                if let Some(v) = it.next() {
+                    match settings::Graphics::from_preset(v) {
+                        Some(g) => graphics = g,
+                        None => eprintln!(
+                            "warning: unknown --video-preset '{v}', using {VIDEO_PRESET} (choices: {})",
+                            settings::Graphics::preset_names().join(", ")
+                        ),
+                    }
+                }
+            }
+            "--video-mute" => mute = true,
             _ => {}
         }
     }
@@ -257,7 +281,7 @@ fn parse_video() -> Option<VideoOptions> {
     width = (width & !1).max(2);
     height = (height & !1).max(2);
     fps = fps.max(1);
-    Some(VideoOptions { path: path.unwrap_or_else(default_video_path), width, height, fps, max_seconds })
+    Some(VideoOptions { path: path.unwrap_or_else(default_video_path), width, height, fps, max_seconds, graphics, mute })
 }
 
 /// Where `--video` writes by default: the shared drop point on macOS (reachable from
@@ -287,14 +311,21 @@ fn run_video(seed: u64, planet: Arc<Planet>, units: units::Units, opts: VideoOpt
         ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst)).context("installing Ctrl+C handler")?;
     }
 
+    // Background music: the same shuffled-playlist idea as the live app, but seeded
+    // from the planet seed so a given world always gets the same soundtrack. Muxed
+    // in by the encoder; `--video-mute` records silent.
+    let soundtrack = if opts.mute { Vec::new() } else { audio::shuffled_soundtrack(seed) };
+
     // Start ffmpeg FIRST so a missing/broken encoder fails fast, before any GPU work.
-    let mut encoder = video::VideoEncoder::start(&opts.path, w, h, fps).context("starting the video encoder")?;
+    let mut encoder =
+        video::VideoEncoder::start(&opts.path, w, h, fps, &soundtrack).context("starting the video encoder")?;
 
     // Headless renderer + streamer — mirrors App::resumed, minus window and audio.
-    // Video isn't real-time bound, so always record at maximum detail regardless of
-    // the host GPU: the live frame rate doesn't matter (we encode a fixed timestep),
-    // and per-frame settling lets the streamer fully resolve each Ultra frame.
-    let graphics = settings::Graphics::ultra();
+    // Video isn't real-time bound, so we record at a high preset regardless of the
+    // host GPU: the live frame rate doesn't matter (we encode a fixed timestep), and
+    // per-frame settling lets the streamer fully resolve each frame. The preset is
+    // chosen by --video-preset (default VIDEO_PRESET).
+    let graphics = opts.graphics;
     let mesh_cfg = mesh::MeshConfig::new(graphics.mesh_res, graphics.veg_min_level, graphics.veg_density);
     let flora = &planet.flora;
     let mut renderer = pollster::block_on(Renderer::new_offscreen(w, h, flora.meshes(), flora.textures())).context("creating the headless renderer")?;
@@ -319,7 +350,11 @@ fn run_video(seed: u64, planet: Arc<Planet>, units: units::Units, opts: VideoOpt
         Some(s) => println!("  stopping after {s}s (Ctrl+C to stop sooner)"),
         None => println!("  press Ctrl+C to stop and finalize the file"),
     }
-    info!(w, h, fps, detail = graphics.preset, path = %opts.path.display(), seconds = ?opts.max_seconds, "video recording started");
+    match soundtrack.len() {
+        0 => println!("  audio: muted"),
+        n => println!("  audio: {n} shuffled tracks (seeded from world)"),
+    }
+    info!(w, h, fps, detail = graphics.preset, tracks = soundtrack.len(), path = %opts.path.display(), seconds = ?opts.max_seconds, "video recording started");
 
     let mut frame_idx: u64 = 0;
     let mut sim_time = 0.0f32;

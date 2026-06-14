@@ -119,13 +119,19 @@ impl Default for Graphics {
 }
 
 impl Graphics {
-    /// The maximum-detail preset (a 5090 pushed to its limit). Offline video
-    /// recording isn't real-time bound, so it can afford the highest LOD/mesh/veg
-    /// settings regardless of the host GPU — [`crate::run_video`] uses this.
-    pub fn ultra() -> Self {
+    /// Build the named detail preset, or `None` if the name isn't a known tier.
+    /// Matching is insensitive to case and to spaces/hyphens, so `--video-preset`
+    /// accepts `"Very High"`, `very-high`, or `veryhigh` alike.
+    pub fn from_preset(name: &str) -> Option<Self> {
+        let idx = PRESETS.iter().position(|p| preset_key(p.0) == preset_key(name))?;
         let mut g = Graphics::default();
-        g.apply_preset(PRESETS.len() - 1); // Ultra is the last (highest) tier
-        g
+        g.apply_preset(idx);
+        Some(g)
+    }
+
+    /// The preset tier names, lowest → highest — for `--video-preset` help/errors.
+    pub fn preset_names() -> Vec<&'static str> {
+        PRESETS.iter().map(|p| p.0).collect()
     }
 
     /// Resident-geometry budget in bytes — the renderer evicts cached chunks to keep
@@ -256,6 +262,12 @@ fn frac_u32_inv(v: u32, lo: u32, hi: u32) -> f32 {
 
 fn round1(v: f32) -> f32 {
     (v * 10.0).round() / 10.0
+}
+
+/// Normalize a preset name for tolerant matching: drop non-alphanumerics (spaces,
+/// hyphens) and lowercase, so `"Very High"` == `very-high` == `veryhigh`.
+fn preset_key(name: &str) -> String {
+    name.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
 }
 
 fn step_u32(v: u32, dir: i32, step: u32, lo: u32, hi: u32) -> u32 {
