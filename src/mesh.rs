@@ -456,7 +456,9 @@ fn biome_coverage(biome: Biome) -> f32 {
         Biome::Mountain => 0.30,
         Biome::Beach => 0.30,
         Biome::Desert => 0.25,
-        _ => 0.0,
+        Biome::Snow => 0.15,     // a few snow-capped/dark forms scattered on white
+        Biome::PolarIce => 0.06, // near-barren — the rare ice block or stranded boulder
+        Biome::Ocean => 0.0,     // sea floor — barren
     }
 }
 

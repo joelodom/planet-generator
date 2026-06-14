@@ -21,9 +21,9 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
 /// Max archetype slots any one biome lists — sizes the per-attempt presence scratch
-/// array in `mesh::place_vegetation`. The table peaks at 8 (temperate forest), now
-/// that the P1 archetypes have landed.
-pub const SPECIES_PER_BIOME: usize = 8;
+/// array in `mesh::place_vegetation`. The table peaks at 11 (temperate/boreal forest)
+/// now that the full P0+P1+P2 set has landed; 12 leaves a little headroom.
+pub const SPECIES_PER_BIOME: usize = 12;
 
 /// Render units per kilometre (1 unit = `METERS_PER_UNIT` m).
 const UNITS_PER_KM: f32 = 1000.0 / METERS_PER_UNIT;
@@ -53,12 +53,12 @@ macro_rules! archetype {
     };
 }
 
-/// The archetypes (9 P0 + 22 P1). **Index = mesh index = texture-load order**; the
-/// biome tables and [`models::load`] both key off this order. P0 heights/clustering
-/// per `flora-revamp/FLORA_P0_INTEGRATION_PLAN.md` §3; the P1 rows follow the same
-/// scheme — rock/deadwood sit low and scatter broadly, trees are tall and tightly
-/// clustered, shrubs/forbs are small.
-const ARCHETYPES: [Archetype; 31] = [
+/// The archetypes (9 P0 + 22 P1 + 20 P2 = 51). **Index = mesh index = texture-load
+/// order**; the biome tables and [`models::load`] both key off this order. P0
+/// heights/clustering per `flora-revamp/FLORA_P0_INTEGRATION_PLAN.md` §3; the P1/P2
+/// rows follow the same scheme — rock/deadwood sit low and scatter broadly, trees are
+/// tall and tightly clustered, shrubs/forbs/cushions are small.
+const ARCHETYPES: [Archetype; 51] = [
     // --- P0 ---
     archetype!("granite-boulder", 0.10, 0.45, 2.0, 8.0),
     archetype!("broadleaf-hardwood", 1.8, 3.6, 30.0, 400.0),
@@ -93,6 +93,27 @@ const ARCHETYPES: [Archetype; 31] = [
     archetype!("talus-rock", 0.12, 0.55, 1.5, 10.0),        // angular scree boulder
     archetype!("krummholz-conifer", 0.9, 2.2, 20.0, 300.0), // stunted treeline conifer, mats
     archetype!("snow-laden-conifer", 2.0, 4.2, 30.0, 400.0), // boreal/subalpine conifer
+    // --- P2 (20) — sparse fills, understory, deadwood, and the snow/ice biomes ---
+    archetype!("standing-dead-snag", 1.2, 2.8, 8.0, 150.0),  // standing deadwood, forest/boreal
+    archetype!("fern", 0.20, 0.50, 1.0, 20.0),               // damp shaded forest floor
+    archetype!("woodland-wildflower", 0.08, 0.22, 0.5, 12.0), // forest clearings/edges
+    archetype!("juniper-scrub", 0.18, 0.45, 2.0, 40.0),      // low sprawling boreal conifer
+    archetype!("moss-rock", 0.12, 0.50, 2.0, 10.0),          // mossy boulder, damp boreal floor
+    archetype!("buttress-root-tree", 3.0, 5.5, 30.0, 400.0), // tropical buttress-root giant
+    archetype!("bromeliad", 0.15, 0.40, 1.0, 30.0),          // tropical rosette epiphyte
+    archetype!("grassland-rock", 0.12, 0.45, 2.0, 12.0),     // low sun-bleached plains rock
+    archetype!("agave-rosette", 0.25, 0.70, 2.0, 40.0),      // desert sword-leaf rosette
+    archetype!("dead-bush", 0.15, 0.40, 1.0, 25.0),          // leafless desert bush
+    archetype!("cushion-plant", 0.04, 0.12, 0.3, 8.0),       // tundra ground-hugging dome
+    archetype!("driftwood-log", 0.12, 0.35, 5.0, 80.0),      // bleached beach driftwood
+    archetype!("coastal-scrub", 0.20, 0.55, 2.0, 40.0),      // salt-pruned back-beach shrub
+    archetype!("sea-stack", 0.20, 0.80, 3.0, 30.0),          // wet surf-rounded shore rock
+    archetype!("rock-spire", 0.8, 3.0, 3.0, 50.0),           // jagged alpine pinnacle
+    archetype!("alpine-cushion", 0.04, 0.12, 0.3, 8.0),      // tiny cushion among rocks
+    archetype!("snow-boulder", 0.12, 0.50, 2.0, 12.0),       // snow-capped rounded boulder
+    archetype!("snow-snag", 1.0, 2.4, 8.0, 150.0),           // dark dead snag in snow
+    archetype!("ice-hummock", 0.15, 0.60, 2.0, 20.0),        // buckled fractured-ice block
+    archetype!("glacial-erratic", 0.12, 0.55, 3.0, 40.0),    // dark boulder stranded on ice
 ];
 
 // Archetype indices (into ARCHETYPES) used by the biome tables.
@@ -128,6 +149,27 @@ const DUNE_GRASS: usize = 27;
 const TALUS_ROCK: usize = 28;
 const KRUMMHOLZ: usize = 29;
 const SNOW_CONIFER: usize = 30;
+// P2
+const DEAD_SNAG: usize = 31;
+const FERN: usize = 32;
+const WOOD_WILDFLOWER: usize = 33;
+const JUNIPER: usize = 34;
+const MOSS_ROCK: usize = 35;
+const BUTTRESS_TREE: usize = 36;
+const BROMELIAD: usize = 37;
+const GRASS_ROCK: usize = 38;
+const AGAVE: usize = 39;
+const DEAD_BUSH: usize = 40;
+const CUSHION: usize = 41;
+const DRIFTWOOD: usize = 42;
+const COASTAL_SCRUB: usize = 43;
+const SEA_STACK: usize = 44;
+const ROCK_SPIRE: usize = 45;
+const ALPINE_CUSHION: usize = 46;
+const SNOW_BOULDER: usize = 47;
+const SNOW_SNAG: usize = 48;
+const ICE_HUMMOCK: usize = 49;
+const GLACIAL_ERRATIC: usize = 50;
 
 /// One entry in a biome's planting table: which archetype, its relative weight in
 /// the local mix, and a multiplier on the archetype's base height range (so a
@@ -141,21 +183,24 @@ const fn plant(arch: usize, weight: f32, scale: f32) -> Plant {
     Plant { arch, weight, scale }
 }
 
-// Per-biome planting tables (`FLORA_P0_INTEGRATION_PLAN.md` §2, extended with the
-// full P1 archetype set). Weights are relative within a biome; the granite boulder
-// and the P1 rock-outcrop are the cross-biome ground objects. The final P1 models
-// now back what used to be stand-ins: dune-grass (beach), cotton-grass (tundra
-// sedge), krummholz-conifer (mountain treeline) — plus leaning-palm (beach),
-// lichen-boulder (tundra), talus-rock + snow-laden-conifer (mountain), and
-// snow-laden-conifer in the boreal mix.
-const TEMPERATE_FOREST: &[Plant] = &[plant(HARDWOOD, 0.26, 1.0), plant(OAK, 0.18, 1.0), plant(BIRCH, 0.16, 1.0), plant(SPRUCE, 0.10, 1.0), plant(UNDERSTORY, 0.12, 1.0), plant(FALLEN_LOG, 0.06, 1.0), plant(ROCK_OUTCROP, 0.06, 1.0), plant(BOULDER, 0.06, 1.0)];
-const BOREAL_FOREST: &[Plant] = &[plant(SPRUCE, 0.26, 1.0), plant(FIR, 0.20, 1.0), plant(SNOW_CONIFER, 0.18, 1.0), plant(PINE, 0.14, 1.0), plant(BIRCH, 0.07, 0.9), plant(FALLEN_LOG, 0.06, 1.0), plant(ROCK_OUTCROP, 0.045, 1.0), plant(BOULDER, 0.045, 1.0)];
-const TROPICAL_FOREST: &[Plant] = &[plant(EMERGENT, 0.28, 1.0), plant(PALM, 0.24, 1.0), plant(TREE_FERN, 0.16, 1.0), plant(BROADLEAF_UNDER, 0.14, 1.0), plant(LIANA, 0.08, 1.0), plant(FALLEN_LOG, 0.05, 1.0), plant(BOULDER, 0.05, 1.0)];
-const GRASSLAND: &[Plant] = &[plant(BUNCHGRASS, 0.52, 1.0), plant(WILDFLOWER, 0.16, 1.0), plant(SAGEBRUSH, 0.12, 1.0), plant(ACACIA, 0.08, 1.0), plant(ROCK_OUTCROP, 0.06, 1.0), plant(BOULDER, 0.06, 1.0)];
-const DESERT: &[Plant] = &[plant(CACTUS, 0.30, 1.0), plant(BARREL, 0.18, 1.0), plant(CREOSOTE, 0.18, 1.0), plant(SAGEBRUSH, 0.10, 0.9), plant(HOODOO, 0.12, 1.0), plant(BOULDER, 0.12, 1.0)];
-const BEACH: &[Plant] = &[plant(DUNE_GRASS, 0.38, 1.0), plant(PALM, 0.24, 1.0), plant(LEANING_PALM, 0.18, 1.0), plant(ROCK_OUTCROP, 0.10, 1.0), plant(BOULDER, 0.10, 1.0)];
-const TUNDRA: &[Plant] = &[plant(COTTON_GRASS, 0.34, 1.0), plant(DWARF_SHRUB, 0.24, 1.0), plant(LICHEN_BOULDER, 0.16, 1.0), plant(ROCK_OUTCROP, 0.14, 1.0), plant(BOULDER, 0.12, 1.0)];
-const MOUNTAIN: &[Plant] = &[plant(KRUMMHOLZ, 0.18, 1.0), plant(SNOW_CONIFER, 0.12, 0.7), plant(TALUS_ROCK, 0.24, 1.0), plant(ROCK_OUTCROP, 0.24, 1.0), plant(BOULDER, 0.22, 1.0)];
+// Per-biome planting tables. Weights are relative *within* a biome — they set the
+// mix, not the absolute count; `mesh::biome_coverage` gates how dense each biome is
+// (lush forest vs. sparse snowfield). The granite boulder + rock-outcrop are the
+// cross-biome ground objects; most biomes also carry a tinted boulder variant
+// (moss/lichen/grassland/sea/snow/glacial). The full P0+P1+P2 set is wired here,
+// including the once-barren Snow and Polar Ice biomes (kept sparse via biome_coverage).
+const TEMPERATE_FOREST: &[Plant] = &[plant(HARDWOOD, 0.19, 1.0), plant(OAK, 0.14, 1.0), plant(BIRCH, 0.12, 1.0), plant(UNDERSTORY, 0.11, 1.0), plant(FERN, 0.10, 1.0), plant(SPRUCE, 0.07, 1.0), plant(WOOD_WILDFLOWER, 0.06, 1.0), plant(FALLEN_LOG, 0.05, 1.0), plant(DEAD_SNAG, 0.05, 1.0), plant(ROCK_OUTCROP, 0.055, 1.0), plant(BOULDER, 0.055, 1.0)];
+const BOREAL_FOREST: &[Plant] = &[plant(SPRUCE, 0.22, 1.0), plant(FIR, 0.17, 1.0), plant(SNOW_CONIFER, 0.13, 1.0), plant(PINE, 0.11, 1.0), plant(JUNIPER, 0.08, 1.0), plant(BIRCH, 0.06, 0.9), plant(MOSS_ROCK, 0.05, 1.0), plant(FALLEN_LOG, 0.05, 1.0), plant(DEAD_SNAG, 0.05, 1.0), plant(ROCK_OUTCROP, 0.04, 1.0), plant(BOULDER, 0.04, 1.0)];
+const TROPICAL_FOREST: &[Plant] = &[plant(EMERGENT, 0.20, 1.0), plant(PALM, 0.17, 1.0), plant(BUTTRESS_TREE, 0.14, 1.0), plant(TREE_FERN, 0.13, 1.0), plant(BROADLEAF_UNDER, 0.12, 1.0), plant(BROMELIAD, 0.08, 1.0), plant(LIANA, 0.07, 1.0), plant(FALLEN_LOG, 0.05, 1.0), plant(BOULDER, 0.04, 1.0)];
+const GRASSLAND: &[Plant] = &[plant(BUNCHGRASS, 0.50, 1.0), plant(WILDFLOWER, 0.15, 1.0), plant(SAGEBRUSH, 0.11, 1.0), plant(ACACIA, 0.08, 1.0), plant(GRASS_ROCK, 0.06, 1.0), plant(ROCK_OUTCROP, 0.05, 1.0), plant(BOULDER, 0.05, 1.0)];
+const DESERT: &[Plant] = &[plant(CACTUS, 0.24, 1.0), plant(BARREL, 0.15, 1.0), plant(AGAVE, 0.13, 1.0), plant(CREOSOTE, 0.13, 1.0), plant(HOODOO, 0.10, 1.0), plant(DEAD_BUSH, 0.09, 1.0), plant(SAGEBRUSH, 0.08, 0.9), plant(BOULDER, 0.08, 1.0)];
+const BEACH: &[Plant] = &[plant(DUNE_GRASS, 0.32, 1.0), plant(PALM, 0.16, 1.0), plant(LEANING_PALM, 0.14, 1.0), plant(COASTAL_SCRUB, 0.12, 1.0), plant(DRIFTWOOD, 0.08, 1.0), plant(SEA_STACK, 0.08, 1.0), plant(ROCK_OUTCROP, 0.05, 1.0), plant(BOULDER, 0.05, 1.0)];
+const TUNDRA: &[Plant] = &[plant(COTTON_GRASS, 0.30, 1.0), plant(DWARF_SHRUB, 0.22, 1.0), plant(CUSHION, 0.16, 1.0), plant(LICHEN_BOULDER, 0.13, 1.0), plant(ROCK_OUTCROP, 0.10, 1.0), plant(BOULDER, 0.09, 1.0)];
+const MOUNTAIN: &[Plant] = &[plant(TALUS_ROCK, 0.22, 1.0), plant(KRUMMHOLZ, 0.16, 1.0), plant(ROCK_OUTCROP, 0.16, 1.0), plant(ROCK_SPIRE, 0.14, 1.0), plant(BOULDER, 0.14, 1.0), plant(SNOW_CONIFER, 0.10, 0.7), plant(ALPINE_CUSHION, 0.08, 1.0)];
+// Snow & Polar Ice were barren until the P2 set; kept sparse by biome_coverage so they
+// read as a few capped/dark forms scattered across white, not a packed field.
+const SNOW: &[Plant] = &[plant(SNOW_CONIFER, 0.30, 0.9), plant(SNOW_BOULDER, 0.24, 1.0), plant(SNOW_SNAG, 0.18, 1.0), plant(GLACIAL_ERRATIC, 0.16, 1.0), plant(BOULDER, 0.12, 1.0)];
+const POLAR_ICE: &[Plant] = &[plant(ICE_HUMMOCK, 0.45, 1.0), plant(GLACIAL_ERRATIC, 0.33, 1.0), plant(SNOW_BOULDER, 0.22, 1.0)];
 
 /// Per-biome planting table (`None` for barren ocean/ice/snow — the placer skips them).
 fn biome_plants(biome: Biome) -> Option<&'static [Plant]> {
@@ -168,7 +213,9 @@ fn biome_plants(biome: Biome) -> Option<&'static [Plant]> {
         Biome::Beach => Some(BEACH),
         Biome::Tundra => Some(TUNDRA),
         Biome::Mountain => Some(MOUNTAIN),
-        Biome::Ocean | Biome::PolarIce | Biome::Snow => None,
+        Biome::Snow => Some(SNOW),
+        Biome::PolarIce => Some(POLAR_ICE),
+        Biome::Ocean => None, // sea floor — no above-surface flora
     }
 }
 
@@ -330,7 +377,7 @@ mod tests {
         for biome in BIOMES {
             let ids = flora.biome_species(biome);
             match biome {
-                Biome::Ocean | Biome::PolarIce | Biome::Snow => assert!(ids.is_empty(), "{biome:?} should be barren"),
+                Biome::Ocean => assert!(ids.is_empty(), "{biome:?} should be barren"),
                 _ => {
                     assert!(!ids.is_empty(), "{biome:?} should have species");
                     for &id in ids {
