@@ -101,6 +101,12 @@ pub struct Tour {
     /// Cursor into [`BIOME_TOUR`]: the next biome the tour will seek out. Advances
     /// every biome it tries (found or skipped), so the cycle never stalls.
     biome_cursor: usize,
+    /// Set when the biome cycle wraps past its end; consumed at the next cruise end
+    /// to mark the tour finished (so the last biome is fully cruised first).
+    lap_pending: bool,
+    /// True once a full lap of [`BIOME_TOUR`] has been cruised — the cue for the
+    /// `--video` recorder to play its space-pullback finale.
+    finished: bool,
 
     // Eased segment endpoints (Travel / Descend).
     s_focus: Vec3,
@@ -138,6 +144,13 @@ impl Tour {
         }
     }
 
+    /// True once the tour has cruised one full lap of [`BIOME_TOUR`] — the cue for the
+    /// `--video` recorder to take over with its space-pullback finale and finalize.
+    /// (In the live app the tour just keeps drifting; nothing reads this.)
+    pub fn toured_all_biomes(&self) -> bool {
+        self.finished
+    }
+
     /// Begin a tour from the camera's current view.
     pub fn new(cam: &Camera, planet: &Planet) -> Self {
         let mut tour = Self {
@@ -145,6 +158,8 @@ impl Tour {
             t: 0.0,
             dur: 1.0,
             biome_cursor: 0,
+            lap_pending: false,
+            finished: false,
             s_focus: cam.focus,
             s_dist: cam.distance(),
             s_head: cam.heading(),
@@ -218,7 +233,14 @@ impl Tour {
                 cam.set_view(self.c_focus, self.c_dist, self.c_head, tilt);
 
                 if self.t >= self.dur {
-                    self.begin_travel(self.c_focus, self.c_dist, self.c_head, self.base_tilt, planet);
+                    if self.lap_pending {
+                        // Cruised every biome in the cycle once — hold in this gentle
+                        // drift; the video recorder takes over for the finale (the live
+                        // app ignores `finished`, so it keeps drifting indefinitely).
+                        self.finished = true;
+                    } else {
+                        self.begin_travel(self.c_focus, self.c_dist, self.c_head, self.base_tilt, planet);
+                    }
                 }
             }
         }
@@ -307,6 +329,9 @@ impl Tour {
         for _ in 0..BIOME_TOUR.len() {
             let biome = BIOME_TOUR[self.biome_cursor];
             self.biome_cursor = (self.biome_cursor + 1) % BIOME_TOUR.len();
+            if self.biome_cursor == 0 {
+                self.lap_pending = true; // wrapped — every biome attempted once this lap
+            }
             if let Some(dest) = pick_destination(from, planet, Some(biome)) {
                 tracing::info!(biome = biome.name(), "tour: cruising to next biome");
                 return dest;
@@ -404,6 +429,24 @@ fn rand_sign() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tour_finishes_after_touring_all_biomes() {
+        let planet = Planet::new(12345);
+        let mut cam = Camera::new(&planet, Vec3::new(0.3, 0.4, 0.86).normalize());
+        let mut tour = Tour::new(&cam, &planet);
+        let dt = 1.0 / 30.0;
+        // Cap well above a full lap (~10 biomes × ~70 s) so a bug can't hang the test.
+        let max_steps = 30 * 60 * 30; // 30 minutes of sim
+        let mut steps = 0;
+        while !tour.toured_all_biomes() && steps < max_steps {
+            tour.update(dt, &planet, &mut cam);
+            steps += 1;
+        }
+        assert!(tour.toured_all_biomes(), "tour never reported completion within 30 min of sim");
+        // Not instant: it actually cruised biomes first (guards a premature-finish bug).
+        assert!(steps as f32 * dt > 30.0, "tour finished implausibly fast ({steps} steps)");
+    }
 
     #[test]
     fn tour_stays_smooth_and_cycles_phases() {

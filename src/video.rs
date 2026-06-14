@@ -40,6 +40,13 @@ const FFMPEG_FALLBACK_PATHS: &[&str] = &[
 #[cfg(not(target_os = "macos"))]
 const FFMPEG_FALLBACK_PATHS: &[&str] = &[];
 
+/// An audio fade-out window applied to the muxed soundtrack (the tour finale fades
+/// the music to silence as the video fades to black). Times are in output seconds.
+pub struct AudioFadeOut {
+    pub start_secs: f32,
+    pub dur_secs: f32,
+}
+
 /// A handle to a running ffmpeg encode. Feed it [`VideoEncoder::write_frame`] per
 /// rendered frame, then [`VideoEncoder::finish`] to finalize the file (a `Drop`
 /// backstop finalizes too, so an error path still leaves a playable clip).
@@ -121,8 +128,9 @@ impl VideoEncoder {
     }
 
     /// Close ffmpeg's stdin, let the video finalize, then (if a soundtrack was
-    /// staged) mux the music in. Returns the path to the finished file.
-    pub fn finish(mut self) -> anyhow::Result<PathBuf> {
+    /// staged) mux the music in. `audio_fade`, when set, fades the music out over a
+    /// window at the end (the finale). Returns the path to the finished file.
+    pub fn finish(mut self, audio_fade: Option<AudioFadeOut>) -> anyhow::Result<PathBuf> {
         // Dropping stdin closes the pipe → ffmpeg reads EOF and writes the trailer.
         self.stdin.take();
         let status = self.child.wait().context("waiting for ffmpeg to finish")?;
@@ -131,7 +139,7 @@ impl VideoEncoder {
             return Err(anyhow!("ffmpeg exited unsuccessfully ({status})"));
         }
         if let Some(audio) = self.audio.take() {
-            if let Err(e) = self.mux_audio(&audio) {
+            if let Err(e) = self.mux_audio(&audio, audio_fade.as_ref()) {
                 // Best-effort music: keep the silent video so a recording is never lost.
                 tracing::warn!(error = %format!("{e:#}"), "video: muxing music failed; saving silent video");
                 let saved = std::fs::rename(&self.video_path, &self.final_path)
@@ -147,8 +155,9 @@ impl VideoEncoder {
 
     /// Second pass: copy the silent video and add the looped soundtrack, trimmed to
     /// the video's length. Both inputs are files here, so the audio can't outrun the
-    /// video and the interleave buffer stays bounded (the live pipe couldn't).
-    fn mux_audio(&self, audio: &StagedAudio) -> anyhow::Result<()> {
+    /// video and the interleave buffer stays bounded (the live pipe couldn't). With
+    /// `fade`, an `afade=out` tapers the music to silence over the finale window.
+    fn mux_audio(&self, audio: &StagedAudio, fade: Option<&AudioFadeOut>) -> anyhow::Result<()> {
         let mut cmd = Command::new(&self.program);
         cmd.args(["-hide_banner", "-loglevel", "error", "-y"])
             .arg("-i").arg(&self.video_path) // input 0: the silent video
@@ -159,9 +168,13 @@ impl VideoEncoder {
                 "-map", "0:v:0", "-map", "1:a:0",
                 "-c:v", "copy", // no re-encode of the video — fast
                 "-c:a", "aac", "-b:a", AUDIO_BITRATE,
-                "-shortest",
-                "-movflags", "+faststart",
-            ])
+            ]);
+        if let Some(f) = fade {
+            // Fade the (re-encoded) music out over the finale; clamp to sane values.
+            let filter = format!("afade=t=out:st={:.3}:d={:.3}", f.start_secs.max(0.0), f.dur_secs.max(0.01));
+            cmd.arg("-af").arg(filter);
+        }
+        cmd.args(["-shortest", "-movflags", "+faststart"])
             .arg(&self.final_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

@@ -94,6 +94,21 @@ const VIDEO_SETTLE_SLEEP_MS: u64 = 15;
 /// line at each phase change).
 const VIDEO_LOG_EVERY_SECONDS: u64 = 5;
 
+// --- Tour finale: once every biome has been toured, pull back to a full-globe view
+// from space, rotate slowly, then fade video + audio out and finalize. ---
+/// Eye distance above the surface for the finale space view (× PLANET_RADIUS) — the
+/// full-globe framing, matching the camera's opening view (START_DISTANCE_FACTOR).
+const FINALE_SPACE_DISTANCE_FACTOR: f32 = 2.2;
+/// Ease the camera from the low cruise out to the space view over this long.
+const FINALE_PULLBACK_SECONDS: f32 = 4.0;
+/// Slow spin in space at full brightness (includes the pull-back ease at its start).
+const FINALE_ROTATE_SECONDS: f32 = 10.0;
+/// Then fade the video to black and the audio to silence over this long, still
+/// rotating. The audio fade is applied by the encoder's mux pass over this window.
+const FINALE_FADE_SECONDS: f32 = 10.0;
+/// Planet spin rate during the finale (rad/s about the pole) — slow and calm.
+const FINALE_ROTATE_RATE: f32 = 0.06;
+
 fn main() -> anyhow::Result<()> {
     if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
         println!(
@@ -359,6 +374,7 @@ fn run_video(seed: u64, planet: Arc<Planet>, units: units::Units, opts: VideoOpt
     let mut frame_idx: u64 = 0;
     let mut sim_time = 0.0f32;
     let mut last_phase = "";
+    let mut toured = false; // set when the tour has cruised every biome → play the finale
     loop {
         if stop.load(Ordering::SeqCst) {
             println!("\nCtrl+C received — finalizing…");
@@ -375,45 +391,12 @@ fn run_video(seed: u64, planet: Arc<Planet>, units: units::Units, opts: VideoOpt
         tour.update(dt, &planet, &mut camera);
         sim_time += dt;
 
-        // Let the streamer load the visible terrain/veg before we capture (bounded).
-        let cam_pos = camera.position(&planet);
-        let settle = Instant::now();
-        let sel = loop {
-            for (key, cpu) in streamer.poll() {
-                renderer.upload_chunk(key, cpu);
-            }
-            let sel = lod::select(&planet, cam_pos, graphics.split_factor, &|k| renderer.has_chunk(k));
-            if sel.want.is_empty() || settle.elapsed().as_millis() >= VIDEO_SETTLE_MAX_MS {
-                break sel;
-            }
-            for key in &sel.want {
-                streamer.request(*key);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(VIDEO_SETTLE_SLEEP_MS));
-        };
-
-        let keep: std::collections::HashSet<_> = sel.draw.iter().copied().collect();
-        renderer.evict(&keep, graphics.mem_budget_bytes());
-
-        // Per-frame uniforms — identical to App::frame's globals.
-        let (view_proj, _view, pos) = camera.view_proj(&planet);
-        let inv = view_proj.inverse();
-        let globals = Globals {
-            view_proj: view_proj.to_cols_array_2d(),
-            inv_view_proj: inv.to_cols_array_2d(),
-            camera_pos: [pos.x, pos.y, pos.z, sim_time],
-            sun_dir: [planet.sun_dir.x, planet.sun_dir.y, planet.sun_dir.z, SUN_AMBIENT],
-            params: [camera.fog_density(), planet::PLANET_RADIUS, planet::SEA_LEVEL, camera.altitude()],
-            atmosphere: [planet.atmosphere.x, planet.atmosphere.y, planet.atmosphere.z, (seed % 997) as f32],
-        };
-        renderer.update_globals(&globals);
-
-        let rgba = renderer.render_to_rgba(&sel.draw);
+        let rgba = capture_frame(&mut renderer, &mut streamer, &planet, &camera, &graphics, seed, sim_time);
         encoder.write_frame(&rgba).context("piping a frame to ffmpeg")?;
         frame_idx += 1;
 
         // Progress on stdout: a line at each phase change, plus a periodic heartbeat,
-        // so the user can gauge the tour and decide when to Ctrl+C.
+        // so the user can follow the tour and decide when to Ctrl+C.
         let phase = tour.phase_label();
         let heartbeat = frame_idx.is_multiple_of(fps as u64 * VIDEO_LOG_EVERY_SECONDS);
         if phase != last_phase || heartbeat {
@@ -425,12 +408,131 @@ fn run_video(seed: u64, planet: Arc<Planet>, units: units::Units, opts: VideoOpt
             );
             last_phase = phase;
         }
+
+        // Once the tour has cruised every biome in its cycle, stop and run the finale.
+        if tour.toured_all_biomes() {
+            toured = true;
+            break;
+        }
     }
 
-    let path = encoder.finish().context("finalizing the video")?;
+    // --- Finale: pull back to the whole planet from space, rotate it slowly, then
+    // fade the video to black (and the audio to silence). Only when the tour finished
+    // on its own — a Ctrl+C or a --video-seconds cap mid-tour just finalizes as-is.
+    if toured && !stop.load(Ordering::SeqCst) {
+        println!("\n  tour complete — finale: pulling back to the whole planet");
+        info!("video finale started");
+        let (f0, d0, t0, h0) = (camera.focus, camera.distance(), camera.tilt(), camera.heading());
+        let space_dist = FINALE_SPACE_DISTANCE_FACTOR * planet::PLANET_RADIUS;
+        let finale_frames = ((FINALE_ROTATE_SECONDS + FINALE_FADE_SECONDS) * fps as f32).round() as u64;
+        for i in 0..finale_frames {
+            if stop.load(Ordering::SeqCst) {
+                println!("\nCtrl+C received — finalizing…");
+                break;
+            }
+            if let Some(mf) = max_frames
+                && frame_idx >= mf
+            {
+                break;
+            }
+            let ft = i as f32 * dt; // seconds into the finale
+            // Pull back: ease the focus distance out to the space view and the tilt up
+            // to top-down (exponential zoom feels natural across the scale change).
+            let p = planet::smoothstep(0.0, 1.0, (ft / FINALE_PULLBACK_SECONDS).min(1.0));
+            let dist = d0 * (space_dist / d0).powf(p);
+            let tilt = t0 * (1.0 - p);
+            // Slow, continuous spin of the globe about its axis: rotate the sub-camera
+            // point around +Y; the eye sits straight above it and orbits with it.
+            let focus = glam::Quat::from_axis_angle(Vec3::Y, FINALE_ROTATE_RATE * ft) * f0;
+            camera.set_view(focus, dist, h0, tilt);
+            sim_time += dt;
+
+            let mut rgba = capture_frame(&mut renderer, &mut streamer, &planet, &camera, &graphics, seed, sim_time);
+            // Fade to black over the last FINALE_FADE_SECONDS, still rotating.
+            let fade_t = ft - FINALE_ROTATE_SECONDS;
+            if fade_t > 0.0 {
+                fade_to_black(&mut rgba, 1.0 - fade_t / FINALE_FADE_SECONDS);
+            }
+            encoder.write_frame(&rgba).context("piping a finale frame to ffmpeg")?;
+            frame_idx += 1;
+
+            if frame_idx.is_multiple_of(fps as u64 * VIDEO_LOG_EVERY_SECONDS) {
+                let stage = if fade_t > 0.0 { "fading" } else { "rotating" };
+                println!(
+                    "  [{sim_time:>6.1}s] Finale  {stage:<8}  ({frame_idx} frames)",
+                );
+            }
+        }
+    }
+
+    // Fade the music out under the finale's video fade (same trailing window).
+    let audio_fade = (toured && !soundtrack.is_empty()).then(|| video::AudioFadeOut {
+        start_secs: (sim_time - FINALE_FADE_SECONDS).max(0.0),
+        dur_secs: FINALE_FADE_SECONDS,
+    });
+    let path = encoder.finish(audio_fade).context("finalizing the video")?;
     println!("video written: {}", path.display());
     info!(path = %path.display(), frames = frame_idx, seconds = round1(sim_time), "video finalized");
     Ok(())
+}
+
+/// Settle the streamer for the camera's current view (bounded by VIDEO_SETTLE_MAX_MS),
+/// update the per-frame globals, and render one frame to RGBA — the shared per-frame
+/// capture for both the tour and the finale in [`run_video`].
+fn capture_frame(
+    renderer: &mut Renderer,
+    streamer: &mut Streamer,
+    planet: &Planet,
+    camera: &Camera,
+    graphics: &settings::Graphics,
+    seed: u64,
+    sim_time: f32,
+) -> Vec<u8> {
+    // Let the streamer load the visible terrain/veg before we capture (bounded so a
+    // chunk that never meshes can't hang a frame).
+    let cam_pos = camera.position(planet);
+    let settle = Instant::now();
+    let sel = loop {
+        for (key, cpu) in streamer.poll() {
+            renderer.upload_chunk(key, cpu);
+        }
+        let sel = lod::select(planet, cam_pos, graphics.split_factor, &|k| renderer.has_chunk(k));
+        if sel.want.is_empty() || settle.elapsed().as_millis() >= VIDEO_SETTLE_MAX_MS {
+            break sel;
+        }
+        for key in &sel.want {
+            streamer.request(*key);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(VIDEO_SETTLE_SLEEP_MS));
+    };
+
+    let keep: std::collections::HashSet<_> = sel.draw.iter().copied().collect();
+    renderer.evict(&keep, graphics.mem_budget_bytes());
+
+    // Per-frame uniforms — identical to App::frame's globals.
+    let (view_proj, _view, pos) = camera.view_proj(planet);
+    let inv = view_proj.inverse();
+    let globals = Globals {
+        view_proj: view_proj.to_cols_array_2d(),
+        inv_view_proj: inv.to_cols_array_2d(),
+        camera_pos: [pos.x, pos.y, pos.z, sim_time],
+        sun_dir: [planet.sun_dir.x, planet.sun_dir.y, planet.sun_dir.z, SUN_AMBIENT],
+        params: [camera.fog_density(), planet::PLANET_RADIUS, planet::SEA_LEVEL, camera.altitude()],
+        atmosphere: [planet.atmosphere.x, planet.atmosphere.y, planet.atmosphere.z, (seed % 997) as f32],
+    };
+    renderer.update_globals(&globals);
+    renderer.render_to_rgba(&sel.draw)
+}
+
+/// Scale a frame's RGB toward black by `brightness` (1 = unchanged, 0 = black),
+/// leaving alpha. Used for the finale fade-out.
+fn fade_to_black(rgba: &mut [u8], brightness: f32) {
+    let b = brightness.clamp(0.0, 1.0);
+    for px in rgba.chunks_exact_mut(4) {
+        px[0] = (px[0] as f32 * b) as u8;
+        px[1] = (px[1] as f32 * b) as u8;
+        px[2] = (px[2] as f32 * b) as u8;
+    }
 }
 
 struct App {
