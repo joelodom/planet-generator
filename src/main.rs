@@ -82,10 +82,10 @@ const VIDEO_HEIGHT: u32 = 1080;
 /// Default recording framerate.
 const VIDEO_FPS: u32 = 60;
 /// Default detail preset for recording. Video isn't real-time bound, so we record
-/// at high detail regardless of host GPU; "Very High" gives near-Ultra geometry
-/// without Ultra's 24 GB cache budget (which can swap a sub-32 GB host on a long
-/// run). Override with `--video-preset <name>`.
-const VIDEO_PRESET: &str = "Very High";
+/// at high detail regardless of host GPU; "High" keeps geometry crisp with an 8 GB
+/// cache budget that stays well clear of swap on common (16/18 GB) hosts. Override
+/// with `--video-preset <name>` (e.g. `--video-preset "Very High"`).
+const VIDEO_PRESET: &str = "High";
 /// Per recorded frame, let the chunk streamer load the visible terrain/vegetation
 /// before capture — bounded so a chunk that never meshes can't hang a frame.
 const VIDEO_SETTLE_MAX_MS: u128 = 2000;
